@@ -1,0 +1,49 @@
+[package]
+name = "stagelint"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Run linters and formatters on staged git files"
+repository = "https://github.com/abemedia/stagelint"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+command-group = { version = "5", features = ["with-tokio"] }
+ctrlc = "3"
+gix = {
+  version = "0.85",
+  default-features = false,
+  features = [
+    "max-performance",
+    "merge",
+    "sha1",
+    "sha256",
+    "status",
+    "tree-editor"
+  ]
+}
+globset = "0.4"
+indexmap = { version = "2", features = ["serde"] }
+json5 = "1"
+serde = { version = "1", features = ["derive"] }
+shell-words = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "process", "rt", "sync"] }
+tokio-util = "0.7"
+yaml_serde = "0.10"
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3.27.0"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[profile.release]
+opt-level = "z"
+strip = true
+lto = true
+panic = "abort"
+codegen-units = 1

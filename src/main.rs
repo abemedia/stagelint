@@ -1,12 +1,10 @@
 mod cli;
 mod config;
-mod index;
 mod lockfile;
 mod merge;
-mod restorer;
 mod runner;
-mod stash;
 mod status;
+mod workflow;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -57,27 +55,14 @@ fn run(opts: &Opts) -> Result<()> {
         move || c.cancel()
     })?;
 
-    let stash_oid = stash::save(&repo, &workdir, &status, stash_tracked, stash_untracked)?;
-    let absent_staged: Vec<String> = status
-        .staged
-        .intersection(&status.missing)
-        .cloned()
-        .collect();
-    let mut restorer =
-        restorer::Restorer::new(&repo, &workdir, stash_oid, stash_tracked, absent_staged);
+    let mut workflow =
+        workflow::Workflow::new(&repo, &workdir, status, stash_tracked, stash_untracked)?;
 
     if let Err(e) = runner.run() {
         bail!(e);
     }
 
-    let merge_bases = index::update(&repo, &workdir, &status.staged, &status.dirty)?;
-
-    restorer.restore()?;
-    apply_merges(&repo, &workdir, opts.quiet, &merge_bases)?;
-
-    if let Some(oid) = stash_oid {
-        stash::remove(&repo, oid)?;
-    }
+    workflow.finish(opts.quiet)?;
 
     Ok(())
 }
@@ -139,58 +124,6 @@ fn build_runner(
     }
 
     Ok(r)
-}
-
-fn apply_merges(
-    repo: &gix::Repository,
-    workdir: &Path,
-    quiet: bool,
-    merge_bases: &[index::MergeBase],
-) -> Result<()> {
-    let threshold = index::big_file_threshold(repo);
-
-    for mb in merge_bases {
-        let file_path = workdir.join(&mb.path);
-        if !file_path.exists() {
-            continue;
-        }
-
-        let file_size = file_path.metadata().map_or(0, |m| m.len());
-        if file_size > threshold {
-            if !quiet {
-                eprintln!(
-                    "stagelint: warning: could not apply formatting to working tree for \
-                     {}: file exceeds core.bigFileThreshold - staged content is \
-                     formatted, working tree unchanged",
-                    mb.path
-                );
-            }
-            continue;
-        }
-
-        let base = repo
-            .find_object(mb.base_oid)
-            .map_err(|e| anyhow!("failed to read base blob for {}: {e}", mb.path))?;
-        let after = repo
-            .find_object(mb.after_oid)
-            .map_err(|e| anyhow!("failed to read after blob for {}: {e}", mb.path))?;
-        let working = fs::read(&file_path)?;
-
-        match merge::three_way_merge(workdir, &mb.path, &working, &base.data, &after.data) {
-            Ok(()) => {}
-            Err(merge::Error::AutoResolved) => {
-                if !quiet {
-                    eprintln!(
-                        "stagelint: warning: could not apply all formatting changes to {}",
-                        mb.path
-                    );
-                }
-            }
-            Err(e) => bail!("failed to merge {}: {e}", mb.path),
-        }
-    }
-
-    Ok(())
 }
 
 fn init(force: bool) -> Result<()> {

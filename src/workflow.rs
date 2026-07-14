@@ -1,25 +1,20 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use gix::bstr::ByteSlice;
-use gix::index::entry::Stage;
+use gix::index::entry::{self, Stage};
+use gix::index::{fs::Metadata, write};
 use gix::objs::Commit;
 use gix::objs::tree::{EntryKind, EntryMode};
 use gix::refs::Target;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::{Id, ObjectId, Repository};
 
-use crate::index::open_index;
 use crate::lockfile::LockFile;
+use crate::merge;
 use crate::status::WorktreeStatus;
-
-/// A file captured for stashing: its repo-relative path, blob OID, and tree entry mode.
-struct StashEntry {
-    path: String,
-    oid: ObjectId,
-    mode: EntryMode,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -39,6 +34,8 @@ pub enum Error {
     RefDelete(#[source] gix::reference::edit::Error),
     #[error("failed to read index")]
     IndexRead(#[source] gix::index::file::init::Error),
+    #[error("failed to write index")]
+    IndexWrite(#[source] gix::index::file::write::Error),
     #[error("failed to read object")]
     ObjectFind(#[source] gix::object::find::existing::Error),
     #[error("failed to diff trees")]
@@ -83,38 +80,51 @@ pub enum Error {
         #[source]
         source: gix::object::find::existing::Error,
     },
+    #[error("failed to merge {path}")]
+    Merge {
+        path: String,
+        #[source]
+        source: merge::Error,
+    },
 }
 
-/// Collect files to stash, create the stash commit, and hide stashed files.
-/// Returns the stash commit OID, or `None` if nothing needed stashing.
-pub fn save(
-    repo: &Repository,
-    workdir: &Path,
-    status: &WorktreeStatus,
+/// Owns the git state around one formatting run: stash the working changes so the formatter
+/// sees only staged content, capture its output into the index, restore the working tree, and
+/// drop the backup stash.
+///
+/// Constructing it performs the stash. If a later step fails before `restore` runs - a linter
+/// failure, or a mid-way hide failure during construction - `Drop` rolls the working tree back.
+/// Once `restore` has run, any failure leaves the backup stash in place for recovery.
+#[must_use]
+pub struct Workflow<'a> {
+    repo: &'a Repository,
+    workdir: &'a Path,
+    status: WorktreeStatus,
     stash_tracked: bool,
-    stash_untracked: bool,
-) -> Result<Option<ObjectId>, Error> {
-    // Read working-tree content into the ODB before hide_stashed_files overwrites it
-    // with the indexed version. Once hidden, the unstaged changes are gone from disk.
-    let mut stash_entries: Vec<StashEntry> = Vec::new();
-    let mut untracked_entries: Vec<StashEntry> = Vec::new();
+    oid: Option<ObjectId>,
+    absent: Vec<String>,
+    attempted: bool, // restore() was called; prevents Drop from retrying on failure
+}
 
-    // Always stash partially-staged files (those in both staged and dirty)
-    for path in &status.staged {
-        if status.dirty.contains(path) {
-            let (oid, mode) = read_blob(repo, workdir, path)?;
-            stash_entries.push(StashEntry {
-                path: path.clone(),
-                oid,
-                mode,
-            });
-        }
-    }
+impl<'a> Workflow<'a> {
+    /// Stash and hide the working-tree changes.
+    ///
+    /// `Self` is built only once the stash commit exists, so an earlier failure cannot trigger
+    /// `Drop`'s rollback; a hide failure afterwards rolls back on drop.
+    pub fn new(
+        repo: &'a Repository,
+        workdir: &'a Path,
+        status: WorktreeStatus,
+        stash_tracked: bool,
+        stash_untracked: bool,
+    ) -> Result<Self, Error> {
+        // Read working-tree content into the ODB before hiding overwrites it with the indexed version.
+        let mut stash_entries: Vec<StashEntry> = Vec::new();
+        let mut untracked_entries: Vec<StashEntry> = Vec::new();
 
-    // Additionally stash dirty tracked files if requested (dirty \ staged)
-    if stash_tracked {
-        for path in &status.dirty {
-            if !status.staged.contains(path) {
+        // Always stash partially-staged files.
+        for path in &status.staged {
+            if status.dirty.contains(path) {
                 let (oid, mode) = read_blob(repo, workdir, path)?;
                 stash_entries.push(StashEntry {
                     path: path.clone(),
@@ -123,141 +133,150 @@ pub fn save(
                 });
             }
         }
-    }
 
-    if stash_untracked {
-        for path in &status.untracked {
-            let (oid, mode) = read_blob(repo, workdir, path)?;
-            untracked_entries.push(StashEntry {
-                path: path.clone(),
-                oid,
-                mode,
-            });
+        // Additionally stash dirty tracked files if requested.
+        if stash_tracked {
+            for path in &status.dirty {
+                if !status.staged.contains(path) {
+                    let (oid, mode) = read_blob(repo, workdir, path)?;
+                    stash_entries.push(StashEntry {
+                        path: path.clone(),
+                        oid,
+                        mode,
+                    });
+                }
+            }
         }
-    }
 
-    // Staged files gone from the worktree: materialize indexed content to format, delete on restore.
-    let staged_absent: Vec<String> = status
-        .staged
-        .intersection(&status.missing)
-        .cloned()
-        .collect();
-
-    if stash_entries.is_empty() && untracked_entries.is_empty() && staged_absent.is_empty() {
-        return Ok(None);
-    }
-
-    let commit_oid = create_stash_commit(repo, &stash_entries, &untracked_entries, &staged_absent)?;
-    hide_stashed_files(
-        repo,
-        workdir,
-        &stash_entries,
-        &untracked_entries,
-        &staged_absent,
-    )?;
-
-    Ok(Some(commit_oid))
-}
-
-/// Remove our stash entry from the reflog and update/delete refs/stash.
-pub fn remove(repo: &Repository, oid: ObjectId) -> Result<(), Error> {
-    let reflog_path = repo.common_dir().join("logs/refs/stash");
-    if !reflog_path.exists() {
-        return Ok(());
-    }
-    let mut reflog_lock = LockFile::acquire(&reflog_path)?;
-    let reflog_file = match fs::File::open(&reflog_path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => {
-            return Err(Error::FileRead {
-                path: reflog_path,
-                source: e,
-            });
+        if stash_untracked {
+            for path in &status.untracked {
+                let (oid, mode) = read_blob(repo, workdir, path)?;
+                untracked_entries.push(StashEntry {
+                    path: path.clone(),
+                    oid,
+                    mode,
+                });
+            }
         }
-    };
 
-    let our_hex = oid.to_hex().to_string();
-    let mut last_hex = None;
+        // Staged files gone from the worktree: materialize indexed content to format, delete on restore.
+        let absent: Vec<String> = status
+            .staged
+            .intersection(&status.missing)
+            .cloned()
+            .collect();
 
-    // Stream reflog into the lock file, skipping our entry.
-    // Each line: "<old_oid> <new_oid> <signature>\t<message>"
-    for line in BufReader::new(reflog_file).lines() {
-        let line = line.map_err(|e| Error::FileRead {
-            path: reflog_path.clone(),
-            source: e,
-        })?;
-        if line.is_empty() {
-            continue;
+        let oid = if stash_entries.is_empty() && untracked_entries.is_empty() && absent.is_empty() {
+            None
+        } else {
+            Some(create_stash_commit(
+                repo,
+                &stash_entries,
+                &untracked_entries,
+                &absent,
+            )?)
+        };
+
+        let workflow = Self {
+            repo,
+            workdir,
+            status,
+            stash_tracked,
+            oid,
+            absent,
+            attempted: false,
+        };
+        if workflow.oid.is_some() {
+            hide_stashed_files(
+                repo,
+                workdir,
+                &stash_entries,
+                &untracked_entries,
+                &workflow.absent,
+            )?;
         }
-        let new_hex = line.split(' ').nth(1);
-        if new_hex != Some(our_hex.as_str()) {
-            writeln!(reflog_lock, "{line}").map_err(|e| Error::FileWrite {
-                path: reflog_lock.path().to_path_buf(),
+        Ok(workflow)
+    }
+
+    /// Finish the run: capture the formatter's output into the index, restore the working tree,
+    /// apply the formatting to it, and drop the backup stash.
+    pub fn finish(&mut self, quiet: bool) -> Result<(), Error> {
+        let merge_bases = update(
+            self.repo,
+            self.workdir,
+            &self.status.staged,
+            &self.status.dirty,
+        )?;
+        self.restore()?;
+        apply_merges(self.repo, self.workdir, quiet, &merge_bases)?;
+        self.cleanup()
+    }
+
+    /// Restore the working tree, revert formatter side-effects on clean tracked files, and refresh
+    /// index stats so restored files don't appear dirty.
+    ///
+    /// If stash restore fails, subsequent steps are skipped (they depend on knowing which files
+    /// were restored). The stash ref is left intact for `git stash pop` recovery.
+    fn restore(&mut self) -> Result<(), Error> {
+        self.attempted = true;
+
+        let paths = if let Some(oid) = self.oid {
+            restore_stashed(self.repo, self.workdir, oid)?
+        } else {
+            Vec::new()
+        };
+
+        // Undo the materialization: these files must return to their deleted worktree state.
+        for path in &self.absent {
+            let file_path = self.workdir.join(path);
+            remove_if_exists(&file_path).map_err(|e| Error::FileDelete {
+                path: file_path,
                 source: e,
             })?;
-            last_hex = new_hex.map(str::to_owned);
         }
+
+        if self.stash_tracked {
+            revert_clean_tracked(self.repo, self.workdir, &paths)?;
+        }
+
+        if self.oid.is_some() {
+            refresh_stat(self.repo, self.workdir, &paths)?;
+        }
+
+        Ok(())
     }
 
-    if let Some(hex) = last_hex {
-        let ref_path = repo.common_dir().join("refs/stash");
-        let mut ref_lock = LockFile::acquire(&ref_path)?;
-        ref_lock
-            .write_all(format!("{hex}\n").as_bytes())
-            .map_err(|e| Error::FileWrite {
-                path: ref_lock.path().to_path_buf(),
-                source: e,
-            })?;
-        ref_lock.commit()?;
-        reflog_lock.commit()?;
-    } else {
-        // No remaining entries: delete the ref and reflog entirely.
-        if let Ok(r) = repo.find_reference("refs/stash") {
-            r.delete().map_err(Error::RefDelete)?;
+    /// Drop the backup stash now that the run has succeeded.
+    fn cleanup(&self) -> Result<(), Error> {
+        if let Some(oid) = self.oid {
+            remove_stash_ref(self.repo, oid)?;
         }
-        fs::remove_file(&reflog_path).ok();
+        Ok(())
     }
-
-    Ok(())
 }
 
-/// Restore stashed files to the working tree.
-///
-/// Restores dirty tracked files by comparing the stash commit tree against HEAD,
-/// deletes files in HEAD but absent from the stash tree (worktree deletions, e.g., rename
-/// sources), then restores untracked files from parent[2]'s tree.
-///
-/// Returns the paths of all files written, for `index::refresh_stat`.
-pub fn restore(
-    repo: &Repository,
-    workdir: &Path,
-    stash_oid: ObjectId,
-) -> Result<Vec<String>, Error> {
-    let use_symlinks = repo
-        .config_snapshot()
-        .boolean("core.symlinks")
-        .unwrap_or(cfg!(unix));
-
-    let stash_obj = repo.find_object(stash_oid).map_err(Error::ObjectFind)?;
-    let stash_commit = stash_obj.into_commit();
-    let parents: Vec<ObjectId> = stash_commit.parent_ids().map(Id::detach).collect();
-    let stash_tree_oid = stash_commit
-        .tree_id()
-        .map_err(|e| Error::TreeDecode(e.into()))?
-        .detach();
-
-    // Stash parents: [HEAD, index, untracked?], or [untracked?] on an empty repo (>=2 means HEAD+index).
-    let has_head = parents.len() >= 2;
-    let head_oid = has_head.then(|| parents[0]);
-    let mut restored = restore_stash_files(repo, workdir, head_oid, stash_tree_oid, use_symlinks)?;
-
-    let untracked_idx = if has_head { 2 } else { 0 };
-    if let Some(&untracked_oid) = parents.get(untracked_idx) {
-        restore_untracked_files(repo, workdir, untracked_oid, &mut restored, use_symlinks)?;
+impl Drop for Workflow<'_> {
+    fn drop(&mut self) {
+        // Once restore has run, any failure after it keeps the stash ref for recovery.
+        if self.attempted {
+            return;
+        }
+        if let Err(e) = self.restore() {
+            eprintln!("stagelint: warning: {:#}", anyhow::Error::new(e));
+        } else if let Err(e) = self.cleanup() {
+            eprintln!(
+                "stagelint: warning: failed to drop stash ref: {:#}",
+                anyhow::Error::new(e)
+            );
+        }
     }
+}
 
-    Ok(restored)
+/// A file captured for stashing.
+struct StashEntry {
+    path: String,
+    oid: ObjectId,
+    mode: EntryMode,
 }
 
 /// Read a file's content into the ODB and return its OID + tree entry mode.
@@ -393,7 +412,7 @@ fn create_stash_commit(
         parents.push(index_commit_oid);
     }
 
-    // parent[2]: untracked commit (only when untracked files exist)
+    // parent[2]: untracked commit
     if !untracked_entries.is_empty() {
         let mut editor = repo.empty_tree().edit().map_err(Error::TreeEditInit)?;
         for entry in untracked_entries {
@@ -531,6 +550,47 @@ fn hide_stashed_files(
     Ok(())
 }
 
+/// Restore stashed files to the working tree.
+///
+/// Restores dirty tracked files by comparing the stash commit tree against HEAD,
+/// deletes files in HEAD but absent from the stash tree (worktree deletions and rename
+/// sources), then restores untracked files from parent[2]'s tree.
+///
+/// Absent staged files ride the stash tree for crash recovery, so this rewrites them to
+/// disk; the caller must delete them again.
+///
+/// Returns the paths of all files written, for `refresh_stat`.
+fn restore_stashed(
+    repo: &Repository,
+    workdir: &Path,
+    stash_oid: ObjectId,
+) -> Result<Vec<String>, Error> {
+    let use_symlinks = repo
+        .config_snapshot()
+        .boolean("core.symlinks")
+        .unwrap_or(cfg!(unix));
+
+    let stash_obj = repo.find_object(stash_oid).map_err(Error::ObjectFind)?;
+    let stash_commit = stash_obj.into_commit();
+    let parents: Vec<ObjectId> = stash_commit.parent_ids().map(Id::detach).collect();
+    let stash_tree_oid = stash_commit
+        .tree_id()
+        .map_err(|e| Error::TreeDecode(e.into()))?
+        .detach();
+
+    // Stash parents: [HEAD, index, untracked?], or [untracked?] on an empty repo (>=2 means HEAD+index).
+    let has_head = parents.len() >= 2;
+    let head_oid = has_head.then(|| parents[0]);
+    let mut restored = restore_stash_files(repo, workdir, head_oid, stash_tree_oid, use_symlinks)?;
+
+    let untracked_idx = if has_head { 2 } else { 0 };
+    if let Some(&untracked_oid) = parents.get(untracked_idx) {
+        restore_untracked_files(repo, workdir, untracked_oid, &mut restored, use_symlinks)?;
+    }
+
+    Ok(restored)
+}
+
 /// Restore stash tree files that differ from HEAD to the working tree.
 ///
 /// Diffs HEAD tree -> stash tree: modified/added entries are restored to disk,
@@ -654,6 +714,333 @@ fn restore_untracked_files(
         restored.push(path.to_owned());
     }
     Ok(())
+}
+
+/// Remove our stash entry from the reflog and update/delete refs/stash.
+fn remove_stash_ref(repo: &Repository, oid: ObjectId) -> Result<(), Error> {
+    let reflog_path = repo.common_dir().join("logs/refs/stash");
+    if !reflog_path.exists() {
+        return Ok(());
+    }
+    let mut reflog_lock = LockFile::acquire(&reflog_path)?;
+    let reflog_file = match fs::File::open(&reflog_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(Error::FileRead {
+                path: reflog_path,
+                source: e,
+            });
+        }
+    };
+
+    let our_hex = oid.to_hex().to_string();
+    let mut last_hex = None;
+
+    // Stream reflog into the lock file, skipping our entry.
+    // Each line: "<old_oid> <new_oid> <signature>\t<message>"
+    for line in BufReader::new(reflog_file).lines() {
+        let line = line.map_err(|e| Error::FileRead {
+            path: reflog_path.clone(),
+            source: e,
+        })?;
+        if line.is_empty() {
+            continue;
+        }
+        let new_hex = line.split(' ').nth(1);
+        if new_hex != Some(our_hex.as_str()) {
+            writeln!(reflog_lock, "{line}").map_err(|e| Error::FileWrite {
+                path: reflog_lock.path().to_path_buf(),
+                source: e,
+            })?;
+            last_hex = new_hex.map(str::to_owned);
+        }
+    }
+
+    if let Some(hex) = last_hex {
+        let ref_path = repo.common_dir().join("refs/stash");
+        let mut ref_lock = LockFile::acquire(&ref_path)?;
+        ref_lock
+            .write_all(format!("{hex}\n").as_bytes())
+            .map_err(|e| Error::FileWrite {
+                path: ref_lock.path().to_path_buf(),
+                source: e,
+            })?;
+        ref_lock.commit()?;
+        reflog_lock.commit()?;
+    } else {
+        // No remaining entries: delete the ref and reflog entirely.
+        if let Ok(r) = repo.find_reference("refs/stash") {
+            r.delete().map_err(Error::RefDelete)?;
+        }
+        fs::remove_file(&reflog_path).ok();
+    }
+
+    Ok(())
+}
+
+/// A partially-staged file that the formatter changed.
+struct MergeBase {
+    path: String,
+    /// Original staged content before formatting.
+    base_oid: ObjectId,
+    /// Index content after formatting.
+    after_oid: ObjectId,
+}
+
+/// Single-pass: detect formatter changes, update index OIDs in place, return merge bases.
+///
+/// For each staged file: checks index stat first (skip if reliably clean), then streams
+/// to ODB. If the OID changed, updates the entry in place. If also partially staged,
+/// records a `MergeBase`. Writes the index once at the end.
+fn update(
+    repo: &Repository,
+    workdir: &Path,
+    staged: &BTreeSet<String>,
+    dirty: &BTreeSet<String>,
+) -> Result<Vec<MergeBase>, Error> {
+    let mut index = open_index(repo).map_err(Error::IndexRead)?;
+    let mut merge_bases = Vec::new();
+    let mut changed = false;
+
+    for path in staged {
+        let file_path = workdir.join(path);
+        if !file_path.exists() {
+            continue;
+        }
+
+        let bpath = path.as_bytes().as_bstr();
+        let Some(pos) = index.entry_index_by_path_and_stage(bpath, Stage::Unconflicted) else {
+            continue;
+        };
+
+        if stat_is_clean(
+            &file_path,
+            &index.entries()[pos].stat,
+            index.timestamp().seconds(),
+        ) {
+            continue;
+        }
+
+        let original_oid = index.entries()[pos].id;
+
+        let file = fs::File::open(&file_path).map_err(|e| Error::FileRead {
+            path: file_path.clone(),
+            source: e,
+        })?;
+        let new_oid = repo
+            .write_blob_stream(file)
+            .map_err(|e| Error::BlobWrite {
+                path: path.to_owned(),
+                source: e,
+            })?
+            .detach();
+
+        if new_oid != original_oid {
+            if dirty.contains(path) {
+                merge_bases.push(MergeBase {
+                    path: path.clone(),
+                    base_oid: original_oid,
+                    after_oid: new_oid,
+                });
+            }
+            let entry = &mut index.entries_mut()[pos];
+            entry.id = new_oid;
+            if let Some(stat) = Metadata::from_path_no_follow(&file_path)
+                .ok()
+                .and_then(|m| entry::Stat::from_fs(&m).ok())
+            {
+                entry.stat = stat;
+            }
+            changed = true;
+        }
+    }
+
+    if changed {
+        index
+            .write(write::Options::default())
+            .map_err(Error::IndexWrite)?;
+    }
+
+    Ok(merge_bases)
+}
+
+/// Apply the captured formatting to the restored working tree via three-way merge.
+fn apply_merges(
+    repo: &Repository,
+    workdir: &Path,
+    quiet: bool,
+    merge_bases: &[MergeBase],
+) -> Result<(), Error> {
+    let threshold = big_file_threshold(repo);
+
+    for mb in merge_bases {
+        let file_path = workdir.join(&mb.path);
+        if !file_path.exists() {
+            continue;
+        }
+
+        let file_size = file_path.metadata().map_or(0, |m| m.len());
+        if file_size > threshold {
+            if !quiet {
+                eprintln!(
+                    "stagelint: warning: could not apply formatting to working tree for \
+                     {}: file exceeds core.bigFileThreshold - staged content is \
+                     formatted, working tree unchanged",
+                    mb.path
+                );
+            }
+            continue;
+        }
+
+        let base = repo.find_object(mb.base_oid).map_err(|e| Error::BlobRead {
+            path: mb.path.clone(),
+            source: e,
+        })?;
+        let after = repo
+            .find_object(mb.after_oid)
+            .map_err(|e| Error::BlobRead {
+                path: mb.path.clone(),
+                source: e,
+            })?;
+        let working = fs::read(&file_path).map_err(|e| Error::FileRead {
+            path: file_path.clone(),
+            source: e,
+        })?;
+
+        match merge::three_way_merge(workdir, &mb.path, &working, &base.data, &after.data) {
+            Ok(()) => {}
+            Err(merge::Error::AutoResolved) => {
+                if !quiet {
+                    eprintln!(
+                        "stagelint: warning: could not apply all formatting changes to {}",
+                        mb.path
+                    );
+                }
+            }
+            Err(e) => {
+                return Err(Error::Merge {
+                    path: mb.path.clone(),
+                    source: e,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns `core.bigFileThreshold` in bytes (default 512 MiB).
+fn big_file_threshold(repo: &Repository) -> u64 {
+    repo.config_snapshot()
+        .integer("core.bigFileThreshold")
+        .and_then(|v| u64::try_from(v).ok())
+        .unwrap_or(512 * 1024 * 1024)
+}
+
+/// Revert tracked files that a formatter modified as a side-effect (not staged, but changed on disk).
+/// Skips any paths in `already_restored`.
+fn revert_clean_tracked(
+    repo: &Repository,
+    workdir: &Path,
+    already_restored: &[String],
+) -> Result<(), Error> {
+    let index = open_index(repo).map_err(Error::IndexRead)?;
+    let skip: std::collections::HashSet<&str> =
+        already_restored.iter().map(String::as_str).collect();
+
+    for entry in index.entries() {
+        let Ok(path) = std::str::from_utf8(entry.path(&index)) else {
+            continue;
+        };
+        if skip.contains(path) {
+            continue;
+        }
+
+        // Symlinks: indexed data is the target path, not file content. std::fs::read follows
+        // the symlink and would compare/overwrite the target file - skip them entirely.
+        if matches!(entry.mode, entry::Mode::SYMLINK | entry::Mode::COMMIT) {
+            continue;
+        }
+
+        let file_path = workdir.join(path);
+        if !file_path.exists() {
+            continue;
+        }
+
+        if stat_is_clean(&file_path, &entry.stat, index.timestamp().seconds()) {
+            continue;
+        }
+
+        let current = fs::read(&file_path).map_err(|e| Error::FileRead {
+            path: file_path.clone(),
+            source: e,
+        })?;
+        let indexed = repo.find_object(entry.id).map_err(Error::ObjectFind)?;
+        if current != indexed.data {
+            fs::write(&file_path, &indexed.data).map_err(|e| Error::FileWrite {
+                path: file_path,
+                source: e,
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Re-stat restored files and update their index entries so `git status`
+/// doesn't flag them as dirty after we overwrote them.
+fn refresh_stat(repo: &Repository, workdir: &Path, paths: &[String]) -> Result<(), Error> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    let mut index = open_index(repo).map_err(Error::IndexRead)?;
+    let mut changed = false;
+
+    for path in paths {
+        let bpath = path.as_bytes().as_bstr();
+        let Some(pos) = index.entry_index_by_path_and_stage(bpath, Stage::Unconflicted) else {
+            continue;
+        };
+        let file_path = workdir.join(path);
+        let Ok(meta) = Metadata::from_path_no_follow(&file_path) else {
+            continue;
+        };
+        let entry = &mut index.entries_mut()[pos];
+        let Ok(stat) = entry::Stat::from_fs(&meta) else {
+            continue;
+        };
+        entry.stat = stat;
+        changed = true;
+    }
+
+    if changed {
+        index
+            .write(write::Options::default())
+            .map_err(Error::IndexWrite)?;
+    }
+
+    Ok(())
+}
+
+/// Returns `true` when the on-disk stat matches `entry_stat` and can be
+/// trusted. Requires mtime to predate `index_write_secs` to guard against
+/// the racily-clean case on coarse-grained filesystems (HFS+ 1-second mtime).
+fn stat_is_clean(path: &Path, entry_stat: &entry::Stat, index_write_secs: i64) -> bool {
+    Metadata::from_path_no_follow(path)
+        .ok()
+        .and_then(|m| entry::Stat::from_fs(&m).ok())
+        .is_some_and(|s| s == *entry_stat && i64::from(entry_stat.mtime.secs) < index_write_secs)
+}
+
+fn open_index(repo: &Repository) -> Result<gix::index::File, gix::index::file::init::Error> {
+    gix::index::File::at(
+        repo.index_path(),
+        repo.object_hash(),
+        false,
+        gix::index::decode::Options::default(),
+    )
 }
 
 #[cfg(unix)]

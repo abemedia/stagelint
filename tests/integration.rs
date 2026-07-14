@@ -474,6 +474,32 @@ fn stash_tracked_noop_when_clean() {
     );
 }
 
+/// A stash-creation failure must leave the working tree untouched.
+#[test]
+fn stash_failure_leaves_worktree_untouched() {
+    let repo = TestRepo::new(&json!({"*.txt": "true"}));
+
+    repo.write_file("dirty.txt", "v0\n");
+    repo.git(&["add", "dirty.txt"]);
+    repo.git(&["commit", "-m", "add dirty"]);
+    repo.write_file("dirty.txt", "v0\nunstaged edits\n");
+
+    repo.write_file("staged.txt", "staged\n");
+    repo.git(&["add", "staged.txt"]);
+
+    // No committer identity: create_stash_commit fails before a stash exists.
+    repo.git(&["config", "--unset", "user.email"]);
+    repo.git(&["config", "--unset", "user.name"]);
+
+    assert_failure(repo.stagelint(&["--stash", "tracked"]));
+
+    assert_eq!(
+        repo.read_file("dirty.txt"),
+        "v0\nunstaged edits\n",
+        "unstaged edits must survive a failed stash"
+    );
+}
+
 /// Stash handles files in nested subdirectories correctly.
 #[test]
 fn stash_handles_subdirectories() {

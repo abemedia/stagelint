@@ -6,13 +6,13 @@ use std::path::{Path, PathBuf};
 use gix::bstr::ByteSlice;
 use gix::index::entry::{self, Stage};
 use gix::index::{fs::Metadata, write};
+use gix::lock::acquire::Fail;
 use gix::objs::Commit;
 use gix::objs::tree::{EntryKind, EntryMode};
 use gix::refs::Target;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::{Id, ObjectId, Repository};
 
-use crate::lockfile::LockFile;
 use crate::merge;
 use crate::status::WorktreeStatus;
 
@@ -61,7 +61,7 @@ pub enum Error {
         source: std::io::Error,
     },
     #[error(transparent)]
-    Lock(#[from] crate::lockfile::Error),
+    Lock(#[from] gix::lock::acquire::Error),
     #[error("failed to delete {path}")]
     FileDelete {
         path: PathBuf,
@@ -722,7 +722,8 @@ fn remove_stash_ref(repo: &Repository, oid: ObjectId) -> Result<(), Error> {
     if !reflog_path.exists() {
         return Ok(());
     }
-    let mut reflog_lock = LockFile::acquire(&reflog_path)?;
+    let mut reflog_lock =
+        gix::lock::File::acquire_to_update_resource(&reflog_path, Fail::Immediately, None)?;
     let reflog_file = match fs::File::open(&reflog_path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -750,7 +751,7 @@ fn remove_stash_ref(repo: &Repository, oid: ObjectId) -> Result<(), Error> {
         let new_hex = line.split(' ').nth(1);
         if new_hex != Some(our_hex.as_str()) {
             writeln!(reflog_lock, "{line}").map_err(|e| Error::FileWrite {
-                path: reflog_lock.path().to_path_buf(),
+                path: reflog_lock.lock_path().to_path_buf(),
                 source: e,
             })?;
             last_hex = new_hex.map(str::to_owned);
@@ -759,15 +760,22 @@ fn remove_stash_ref(repo: &Repository, oid: ObjectId) -> Result<(), Error> {
 
     if let Some(hex) = last_hex {
         let ref_path = repo.common_dir().join("refs/stash");
-        let mut ref_lock = LockFile::acquire(&ref_path)?;
+        let mut ref_lock =
+            gix::lock::File::acquire_to_update_resource(&ref_path, Fail::Immediately, None)?;
         ref_lock
             .write_all(format!("{hex}\n").as_bytes())
             .map_err(|e| Error::FileWrite {
-                path: ref_lock.path().to_path_buf(),
+                path: ref_lock.lock_path().to_path_buf(),
                 source: e,
             })?;
-        ref_lock.commit()?;
-        reflog_lock.commit()?;
+        ref_lock.commit().map_err(|e| Error::FileWrite {
+            path: ref_path,
+            source: e.error,
+        })?;
+        reflog_lock.commit().map_err(|e| Error::FileWrite {
+            path: reflog_path,
+            source: e.error,
+        })?;
     } else {
         // No remaining entries: delete the ref and reflog entirely.
         if let Ok(r) = repo.find_reference("refs/stash") {

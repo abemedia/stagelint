@@ -1,6 +1,5 @@
 mod cli;
 mod config;
-mod lockfile;
 mod merge;
 mod runner;
 mod status;

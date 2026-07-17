@@ -159,12 +159,16 @@ impl<'a> Workflow<'a> {
             }
         }
 
-        // Staged files gone from the worktree: materialize indexed content to format, delete on restore.
-        let absent: Vec<String> = status
-            .staged
-            .intersection(&status.missing)
-            .cloned()
-            .collect();
+        // The formatter needs staged files on disk; tracked stashing also hides unstaged deletions.
+        let absent: Vec<String> = if stash_tracked {
+            status.missing.iter().cloned().collect()
+        } else {
+            status
+                .staged
+                .intersection(&status.missing)
+                .cloned()
+                .collect()
+        };
 
         let oid = if stash_entries.is_empty() && untracked_entries.is_empty() && absent.is_empty() {
             None

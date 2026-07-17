@@ -70,8 +70,15 @@ pub fn collect(repo: &gix::Repository, include_untracked: bool) -> Result<Worktr
             }
             status::Item::IndexWorktree(iw_item) => match iw_item {
                 status::index_worktree::Item::Modification {
-                    rela_path, status, ..
+                    entry,
+                    rela_path,
+                    status,
+                    ..
                 } => {
+                    // Submodules have no file content to stash or restore.
+                    if entry.mode == Mode::COMMIT {
+                        continue;
+                    }
                     let path = rela_path.to_str().map_err(|_| Error::NonUtf8Path)?;
                     // A removed path can't be read from disk, so track it as absent, not dirty.
                     if matches!(status, EntryStatus::Change(Change::Removed)) {

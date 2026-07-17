@@ -455,6 +455,30 @@ fn stash_tracked_restores_non_staged_files() {
     );
 }
 
+/// `--stash tracked` hides an unstaged deletion: present during the run, deleted again after.
+#[test]
+fn stash_tracked_hides_unstaged_deletion() {
+    let repo = TestRepo::new(&json!({"*.txt": "sh -c 'test -e victim.txt' _"}));
+
+    repo.write_file("victim.txt", "tracked\n");
+    repo.git(&["add", "victim.txt"]);
+    repo.git(&["commit", "-m", "add victim"]);
+
+    repo.write_file("staged.txt", "staged\n");
+    repo.git(&["add", "staged.txt"]);
+
+    fs::remove_file(repo.root.join("victim.txt")).expect("delete victim");
+
+    assert_success(repo.stagelint(&["--stash", "tracked"]));
+
+    assert!(
+        !repo.root.join("victim.txt").exists(),
+        "deletion should be restored after the run"
+    );
+    assert_eq!(repo.git(&["show", ":victim.txt"]), "tracked\n");
+    assert!(repo.git(&["stash", "list"]).is_empty());
+}
+
 /// `--stash tracked` with no dirty files: succeeds and leaves no stash entries.
 #[test]
 fn stash_tracked_noop_when_clean() {
@@ -1014,6 +1038,53 @@ fn submodule_not_linted() {
     ]);
 
     assert_success(repo.stagelint(&[]));
+}
+
+/// A submodule with new commits is not stashed: a gitlink has no file content to hide.
+#[test]
+fn dirty_submodule_not_stashed() {
+    let subrepo = TestRepo::empty();
+    subrepo.write_file("README.md", "# Sub\n");
+    subrepo.git(&["add", "README.md"]);
+    subrepo.git(&["commit", "-m", "initial"]);
+
+    let repo = TestRepo::new(&json!({"*.txt": "true"}));
+    let subrepo_str = subrepo.root.to_str().expect("path");
+    repo.git(&[
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "--force",
+        subrepo_str,
+        "vendor",
+    ]);
+    repo.git(&["commit", "-m", "add submodule"]);
+
+    // Advance the submodule so its gitlink no longer matches the index.
+    repo.git(&[
+        "-C",
+        "vendor",
+        "-c",
+        "user.email=test@test.com",
+        "-c",
+        "user.name=Test",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "advance",
+    ]);
+
+    repo.write_file("staged.txt", "hello\n");
+    repo.git(&["add", "staged.txt"]);
+
+    assert_success(repo.stagelint(&["--stash", "tracked"]));
+
+    let status = repo.git(&["status", "--short"]);
+    assert!(
+        status.contains("M vendor"),
+        "submodule should remain dirty and untouched, got: {status}"
+    );
 }
 
 // Runner

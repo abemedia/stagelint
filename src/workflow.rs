@@ -103,7 +103,8 @@ pub struct Workflow<'a> {
     stash_tracked: bool,
     oid: Option<ObjectId>,
     absent: Vec<String>,
-    attempted: bool, // restore() was called; prevents Drop from retrying on failure
+    hidden: BTreeSet<String>, // dirty paths hidden from the run; all restore rewrites on success
+    attempted: bool,          // restore() was called; prevents Drop from retrying on failure
 }
 
 impl<'a> Workflow<'a> {
@@ -118,33 +119,22 @@ impl<'a> Workflow<'a> {
         stash_tracked: bool,
         stash_untracked: bool,
     ) -> Result<Self, Error> {
-        // Read working-tree content into the ODB before hiding overwrites it with the indexed version.
-        let mut stash_entries: Vec<StashEntry> = Vec::new();
+        // Read working-tree content into the ODB before hiding overwrites it with the indexed
+        // version. Every dirty file is captured so the stash snapshots the full worktree;
+        // only the scope-selected subset is hidden from the run.
+        let mut captured: Vec<StashEntry> = Vec::new();
         let mut untracked_entries: Vec<StashEntry> = Vec::new();
+        let mut hidden: BTreeSet<String> = BTreeSet::new();
 
-        // Always stash partially-staged files.
-        for path in &status.staged {
-            if status.dirty.contains(path) {
-                let (oid, mode) = read_blob(repo, workdir, path)?;
-                stash_entries.push(StashEntry {
-                    path: path.clone(),
-                    oid,
-                    mode,
-                });
-            }
-        }
-
-        // Additionally stash dirty tracked files if requested.
-        if stash_tracked {
-            for path in &status.dirty {
-                if !status.staged.contains(path) {
-                    let (oid, mode) = read_blob(repo, workdir, path)?;
-                    stash_entries.push(StashEntry {
-                        path: path.clone(),
-                        oid,
-                        mode,
-                    });
-                }
+        for path in &status.dirty {
+            let (oid, mode) = read_blob(repo, workdir, path)?;
+            captured.push(StashEntry {
+                path: path.clone(),
+                oid,
+                mode,
+            });
+            if stash_tracked || status.staged.contains(path) {
+                hidden.insert(path.clone());
             }
         }
 
@@ -170,14 +160,14 @@ impl<'a> Workflow<'a> {
                 .collect()
         };
 
-        let oid = if stash_entries.is_empty() && untracked_entries.is_empty() && absent.is_empty() {
+        let oid = if captured.is_empty() && untracked_entries.is_empty() && absent.is_empty() {
             None
         } else {
             Some(create_stash_commit(
                 repo,
-                &stash_entries,
+                &captured,
                 &untracked_entries,
-                &absent,
+                &status.missing,
             )?)
         };
 
@@ -188,13 +178,14 @@ impl<'a> Workflow<'a> {
             stash_tracked,
             oid,
             absent,
+            hidden,
             attempted: false,
         };
         if workflow.oid.is_some() {
             hide_stashed_files(
                 repo,
                 workdir,
-                &stash_entries,
+                &workflow.hidden,
                 &untracked_entries,
                 &workflow.absent,
             )?;
@@ -211,7 +202,7 @@ impl<'a> Workflow<'a> {
             &self.status.staged,
             &self.status.dirty,
         )?;
-        self.restore()?;
+        self.restore(false)?;
         apply_merges(self.repo, self.workdir, quiet, &merge_bases)?;
         self.cleanup()
     }
@@ -221,11 +212,11 @@ impl<'a> Workflow<'a> {
     ///
     /// If stash restore fails, subsequent steps are skipped (they depend on knowing which files
     /// were restored). The stash ref is left intact for `git stash pop` recovery.
-    fn restore(&mut self) -> Result<(), Error> {
+    fn restore(&mut self, rollback: bool) -> Result<(), Error> {
         self.attempted = true;
 
         let paths = if let Some(oid) = self.oid {
-            restore_stashed(self.repo, self.workdir, oid)?
+            restore_stashed(self.repo, self.workdir, oid, &self.hidden, rollback)?
         } else {
             Vec::new()
         };
@@ -239,8 +230,12 @@ impl<'a> Workflow<'a> {
             })?;
         }
 
-        if self.stash_tracked {
-            revert_clean_tracked(self.repo, self.workdir, &paths)?;
+        // Rolling back also reverts side-effects in scopes that leave dirty files in place.
+        if self.stash_tracked || rollback {
+            let mut skip = paths.clone();
+            skip.extend(self.status.dirty.iter().cloned());
+            skip.extend(self.status.missing.iter().cloned());
+            revert_clean_tracked(self.repo, self.workdir, &skip)?;
         }
 
         if self.oid.is_some() {
@@ -265,7 +260,7 @@ impl Drop for Workflow<'_> {
         if self.attempted {
             return;
         }
-        if let Err(e) = self.restore() {
+        if let Err(e) = self.restore(true) {
             eprintln!("stagelint: warning: {:#}", anyhow::Error::new(e));
         } else if let Err(e) = self.cleanup() {
             eprintln!(
@@ -338,9 +333,9 @@ fn read_blob(
 /// Build the stash commit and write refs/stash (if HEAD exists).
 fn create_stash_commit(
     repo: &Repository,
-    stash_entries: &[StashEntry],
+    captured: &[StashEntry],
     untracked_entries: &[StashEntry],
-    staged_absent: &[String],
+    missing: &BTreeSet<String>,
 ) -> Result<ObjectId, Error> {
     let committer = repo
         .committer()
@@ -351,20 +346,20 @@ fn create_stash_commit(
 
     let head = repo.head_commit().ok();
 
-    // Build stash tree: HEAD tree (or empty tree) with stashed tracked files overlaid.
+    // Build the w_tree: HEAD overlaid with every dirty file and all worktree deletions.
     let base_tree = match &head {
         Some(commit) => commit.tree().map_err(Error::TreeDecode)?,
         None => repo.empty_tree(),
     };
     let index = open_index(repo).map_err(Error::IndexRead)?;
     let mut editor = base_tree.edit().map_err(Error::TreeEditInit)?;
-    for entry in stash_entries {
+    for entry in captured {
         editor
             .upsert(entry.path.as_str(), entry.mode.kind(), entry.oid)
             .map_err(Error::TreeEdit)?;
     }
     // Mirror git's w_tree so git stash pop can recover after a crash.
-    for path in staged_absent {
+    for path in missing {
         if base_tree
             .lookup_entry_by_path(Path::new(path))
             .map_err(Error::ObjectFind)?
@@ -481,13 +476,13 @@ fn write_commit(
 }
 
 /// Replace stashed files with their correct on-disk representation.
-/// For tracked files: write indexed blob content.
+/// For hidden tracked files: write indexed blob content.
 /// For untracked files: delete them so they're absent during formatting.
 /// For absent staged files: write indexed content so the formatter can process them.
 fn hide_stashed_files(
     repo: &Repository,
     workdir: &Path,
-    stash_entries: &[StashEntry],
+    hidden: &BTreeSet<String>,
     untracked_entries: &[StashEntry],
     staged_absent: &[String],
 ) -> Result<(), Error> {
@@ -497,14 +492,13 @@ fn hide_stashed_files(
         .unwrap_or(cfg!(unix));
     let index = open_index(repo).map_err(Error::IndexRead)?;
 
-    for entry in stash_entries {
-        let path = entry.path.as_str();
+    for path in hidden {
         let bpath = path.as_bytes().as_bstr();
         let Some(entry) = index.entry_by_path_and_stage(bpath, Stage::Unconflicted) else {
             continue;
         };
         let blob = repo.find_object(entry.id).map_err(|e| Error::BlobRead {
-            path: path.to_owned(),
+            path: path.clone(),
             source: e,
         })?;
         let file_path = workdir.join(path);
@@ -554,20 +548,22 @@ fn hide_stashed_files(
     Ok(())
 }
 
-/// Restore stashed files to the working tree.
+/// Restore stashed files to the working tree by diffing the stash tree against HEAD.
 ///
-/// Restores dirty tracked files by comparing the stash commit tree against HEAD,
-/// deletes files in HEAD but absent from the stash tree (worktree deletions and rename
-/// sources), then restores untracked files from parent[2]'s tree.
+/// On success only hidden paths are rewritten, so formatter side-effects survive; on
+/// rollback every path is, returning dirty files to their pre-run bytes. Deletions
+/// recorded in the tree are re-applied on disk either way.
 ///
 /// Absent staged files ride the stash tree for crash recovery, so this rewrites them to
 /// disk; the caller must delete them again.
 ///
-/// Returns the paths of all files written, for `refresh_stat`.
+/// Returns the hidden paths that were written, for `refresh_stat`.
 fn restore_stashed(
     repo: &Repository,
     workdir: &Path,
     stash_oid: ObjectId,
+    hidden: &BTreeSet<String>,
+    rollback: bool,
 ) -> Result<Vec<String>, Error> {
     let use_symlinks = repo
         .config_snapshot()
@@ -585,7 +581,15 @@ fn restore_stashed(
     // Stash parents: [HEAD, index, untracked?], or [untracked?] on an empty repo (>=2 means HEAD+index).
     let has_head = parents.len() >= 2;
     let head_oid = has_head.then(|| parents[0]);
-    let mut restored = restore_stash_files(repo, workdir, head_oid, stash_tree_oid, use_symlinks)?;
+    let mut restored = restore_stash_files(
+        repo,
+        workdir,
+        head_oid,
+        stash_tree_oid,
+        hidden,
+        rollback,
+        use_symlinks,
+    )?;
 
     let untracked_idx = if has_head { 2 } else { 0 };
     if let Some(&untracked_oid) = parents.get(untracked_idx) {
@@ -596,14 +600,13 @@ fn restore_stashed(
 }
 
 /// Restore stash tree files that differ from HEAD to the working tree.
-///
-/// Diffs HEAD tree -> stash tree: modified/added entries are restored to disk,
-/// deleted entries (rename sources) are removed from disk.
 fn restore_stash_files(
     repo: &Repository,
     workdir: &Path,
     head_oid: Option<ObjectId>,
     stash_tree_oid: ObjectId,
+    hidden: &BTreeSet<String>,
+    rollback: bool,
     use_symlinks: bool,
 ) -> Result<Vec<String>, Error> {
     let head_tree = if let Some(oid) = head_oid {
@@ -651,6 +654,12 @@ fn restore_stash_files(
                         return Ok(std::ops::ControlFlow::Continue(()));
                     }
                     let path = location.to_str().map_err(|_| Error::NonUtf8Path)?;
+                    // Unhidden paths carry pre-run bytes for rollback only; on success the
+                    // formatter's side-effects win.
+                    let is_hidden = hidden.contains(path);
+                    if !rollback && !is_hidden {
+                        return Ok(std::ops::ControlFlow::Continue(()));
+                    }
                     let blob = repo.find_object(id.detach()).map_err(Error::ObjectFind)?;
                     let file_path = workdir.join(path);
                     write_to_workdir(&file_path, &blob.data, entry_mode, use_symlinks).map_err(
@@ -659,7 +668,10 @@ fn restore_stash_files(
                             source: e,
                         },
                     )?;
-                    restored.push(path.to_owned());
+                    // Only hidden paths feed refresh_stat: unhidden ones still differ from the index.
+                    if is_hidden {
+                        restored.push(path.to_owned());
+                    }
                 }
                 Change::Deletion { location, .. } => {
                     let path = location.to_str().map_err(|_| Error::NonUtf8Path)?;
@@ -977,6 +989,18 @@ fn revert_clean_tracked(
 
         let file_path = workdir.join(path);
         if !file_path.exists() {
+            // Deleted as a side-effect: user deletions are excluded via `already_restored`.
+            let indexed = repo.find_object(entry.id).map_err(Error::ObjectFind)?;
+            let mode = entry
+                .mode
+                .to_tree_entry_mode()
+                .unwrap_or(EntryKind::Blob.into());
+            write_to_workdir(&file_path, &indexed.data, mode, false).map_err(|e| {
+                Error::FileWrite {
+                    path: file_path,
+                    source: e,
+                }
+            })?;
             continue;
         }
 

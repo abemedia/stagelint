@@ -45,6 +45,84 @@ fn linter_failure_reverts_modifications() {
     assert_eq!(repo.git(&["show", ":file.txt"]), "staged\n");
 }
 
+/// A failing run rolls back every formatter side-effect while leaving the user's changes alone.
+#[test]
+fn failure_rolls_back_all_side_effects() {
+    let repo = TestRepo::new(&json!({
+        "*.txt": [
+            "sh -c 'echo SIDE EFFECT > clean_modified.txt; rm clean_deleted.txt dirty_deleted.txt; echo JUNK >> dirty_modified.txt' _",
+            "false"
+        ]
+    }));
+
+    repo.write_file("clean_modified.txt", "clean\n");
+    repo.write_file("clean_deleted.txt", "content\n");
+    repo.write_file("dirty_modified.txt", "v0\n");
+    repo.write_file("dirty_deleted.txt", "v0\n");
+    repo.write_file("user_dirty.txt", "v0\n");
+    repo.write_file("user_deleted.txt", "gone\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "add files"]);
+    repo.write_file("dirty_modified.txt", "v0\nedits\n");
+    repo.write_file("dirty_deleted.txt", "v0\nedits\n");
+    repo.write_file("user_dirty.txt", "v0\nuser edits\n");
+    fs::remove_file(repo.root.join("user_deleted.txt")).expect("delete user file");
+
+    repo.write_file("staged.txt", "staged\n");
+    repo.git(&["add", "staged.txt"]);
+
+    assert_failure(repo.stagelint(&[]));
+
+    assert_eq!(
+        repo.read_file("clean_modified.txt"),
+        "clean\n",
+        "side-effect on a clean tracked file should be reverted"
+    );
+    assert_eq!(
+        repo.read_file("clean_deleted.txt"),
+        "content\n",
+        "clean tracked file deleted by the formatter should be restored"
+    );
+    assert_eq!(
+        repo.read_file("dirty_modified.txt"),
+        "v0\nedits\n",
+        "contaminated dirty file should return to its pre-run bytes"
+    );
+    assert_eq!(
+        repo.read_file("dirty_deleted.txt"),
+        "v0\nedits\n",
+        "unstaged edits must survive a formatter deleting the file"
+    );
+    assert_eq!(repo.read_file("user_dirty.txt"), "v0\nuser edits\n");
+    assert!(
+        !repo.root.join("user_deleted.txt").exists(),
+        "the user's own deletion must not be resurrected"
+    );
+}
+
+/// A successful run leaves unrelated dirty files dirty, in content and in `git status`.
+#[test]
+fn success_preserves_dirty_file_status() {
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+
+    repo.write_file("dirty.txt", "v0\n");
+    repo.git(&["add", "dirty.txt"]);
+    repo.git(&["commit", "-m", "add dirty"]);
+    repo.write_file("dirty.txt", "v0\nedits\n");
+
+    repo.write_file("staged.txt", "hello\n");
+    repo.git(&["add", "staged.txt"]);
+
+    assert_success(repo.stagelint(&[]));
+
+    assert_eq!(repo.read_file("dirty.txt"), "v0\nedits\n");
+    let status = repo.git(&["status", "--short"]);
+    assert!(
+        status.contains(" M dirty.txt"),
+        "dirty file should still show as modified, got: {status}"
+    );
+}
+
 /// Running stagelint twice in sequence leaves clean state each time.
 #[test]
 fn sequential_runs_leave_clean_state() {
@@ -1953,4 +2031,46 @@ fn crash_staged_deletion_recoverable() {
     repo.git(&["stash", "pop"]);
 
     assert_eq!(repo.read_file("gone.txt"), "content\n");
+}
+
+/// The stash snapshots the full worktree: dirty edits and deletions survive a crash.
+#[test]
+fn crash_recovery_restores_dirty_state() {
+    let repo = TestRepo::new(&json!({"*.txt": sentinel(1)}));
+
+    repo.write_file("dirty.txt", "v0\n");
+    repo.write_file("user_deleted.txt", "gone\n");
+    repo.git(&["add", "dirty.txt", "user_deleted.txt"]);
+    repo.git(&["commit", "-m", "add files"]);
+    repo.write_file("dirty.txt", "v0\nedits\n");
+    fs::remove_file(repo.root.join("user_deleted.txt")).expect("delete user file");
+
+    repo.write_file("partial.txt", "staged\n");
+    repo.git(&["add", "partial.txt"]);
+    repo.write_file("partial.txt", "staged\nunstaged\n");
+
+    let mut child = repo.stagelint(&[]);
+    assert!(repo.wait_sentinel(1, Duration::from_secs(10)));
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    assert_eq!(
+        repo.git(&["show", "stash@{0}:dirty.txt"]),
+        "v0\nedits\n",
+        "stash tree should snapshot dirty content"
+    );
+    assert!(
+        !repo
+            .git_cmd(&["show", "stash@{0}:user_deleted.txt"])
+            .status
+            .success(),
+        "stash tree should record the user's deletion"
+    );
+
+    repo.git(&["reset", "--hard", "HEAD"]);
+    repo.git(&["stash", "pop"]);
+
+    assert_eq!(repo.read_file("dirty.txt"), "v0\nedits\n");
+    assert!(!repo.root.join("user_deleted.txt").exists());
+    assert_eq!(repo.read_file("partial.txt"), "staged\nunstaged\n");
 }

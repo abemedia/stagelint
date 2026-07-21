@@ -216,7 +216,13 @@ impl<'a> Workflow<'a> {
         self.attempted = true;
 
         let paths = if let Some(oid) = self.oid {
-            restore_stashed(self.repo, self.workdir, oid, &self.hidden, rollback)?
+            // Rollback returns every dirty file to its pre-run bytes; success only unhides.
+            let manifest = if rollback {
+                &self.status.dirty
+            } else {
+                &self.hidden
+            };
+            restore_stashed(self.repo, self.workdir, oid, manifest, &self.hidden)?
         } else {
             Vec::new()
         };
@@ -548,22 +554,17 @@ fn hide_stashed_files(
     Ok(())
 }
 
-/// Restore stashed files to the working tree by diffing the stash tree against HEAD.
+/// Restore stashed files to the working tree.
 ///
-/// On success only hidden paths are rewritten, so formatter side-effects survive; on
-/// rollback every path is, returning dirty files to their pre-run bytes. Deletions
-/// recorded in the tree are re-applied on disk either way.
-///
-/// Absent staged files ride the stash tree for crash recovery, so this rewrites them to
-/// disk; the caller must delete them again.
+/// Restored by name rather than by diff: content matching HEAD must still be unhidden.
 ///
 /// Returns the hidden paths that were written, for `refresh_stat`.
 fn restore_stashed(
     repo: &Repository,
     workdir: &Path,
     stash_oid: ObjectId,
+    manifest: &BTreeSet<String>,
     hidden: &BTreeSet<String>,
-    rollback: bool,
 ) -> Result<Vec<String>, Error> {
     let use_symlinks = repo
         .config_snapshot()
@@ -580,14 +581,12 @@ fn restore_stashed(
 
     // Stash parents: [HEAD, index, untracked?], or [untracked?] on an empty repo (>=2 means HEAD+index).
     let has_head = parents.len() >= 2;
-    let head_oid = has_head.then(|| parents[0]);
     let mut restored = restore_stash_files(
         repo,
         workdir,
-        head_oid,
         stash_tree_oid,
+        manifest,
         hidden,
-        rollback,
         use_symlinks,
     )?;
 
@@ -603,89 +602,41 @@ fn restore_stashed(
 fn restore_stash_files(
     repo: &Repository,
     workdir: &Path,
-    head_oid: Option<ObjectId>,
     stash_tree_oid: ObjectId,
+    manifest: &BTreeSet<String>,
     hidden: &BTreeSet<String>,
-    rollback: bool,
     use_symlinks: bool,
 ) -> Result<Vec<String>, Error> {
-    let head_tree = if let Some(oid) = head_oid {
-        let tree_oid = repo
-            .find_object(oid)
-            .map_err(Error::ObjectFind)?
-            .into_commit()
-            .tree_id()
-            .map_err(|e| Error::TreeDecode(e.into()))?
-            .detach();
-        repo.find_object(tree_oid)
-            .map_err(Error::ObjectFind)?
-            .into_tree()
-    } else {
-        repo.empty_tree()
-    };
     let stash_tree = repo
         .find_object(stash_tree_oid)
         .map_err(Error::ObjectFind)?
         .into_tree();
 
     let mut restored = Vec::new();
-    head_tree
-        .changes()
-        .map_err(|e| Error::TreeDiff(Box::new(e)))?
-        .options(|o| {
-            o.track_rewrites(None);
-        })
-        .for_each_to_obtain_tree(&stash_tree, |change| -> Result<_, Error> {
-            use gix::object::tree::diff::Change;
-            match change {
-                Change::Modification {
-                    location,
-                    entry_mode,
-                    id,
-                    ..
-                }
-                | Change::Addition {
-                    location,
-                    entry_mode,
-                    id,
-                    ..
-                } => {
-                    if entry_mode.is_tree() {
-                        return Ok(std::ops::ControlFlow::Continue(()));
-                    }
-                    let path = location.to_str().map_err(|_| Error::NonUtf8Path)?;
-                    // Unhidden paths carry pre-run bytes for rollback only; on success the
-                    // formatter's side-effects win.
-                    let is_hidden = hidden.contains(path);
-                    if !rollback && !is_hidden {
-                        return Ok(std::ops::ControlFlow::Continue(()));
-                    }
-                    let blob = repo.find_object(id.detach()).map_err(Error::ObjectFind)?;
-                    let file_path = workdir.join(path);
-                    write_to_workdir(&file_path, &blob.data, entry_mode, use_symlinks).map_err(
-                        |e| Error::FileWrite {
-                            path: file_path,
-                            source: e,
-                        },
-                    )?;
-                    // Only hidden paths feed refresh_stat: unhidden ones still differ from the index.
-                    if is_hidden {
-                        restored.push(path.to_owned());
-                    }
-                }
-                Change::Deletion { location, .. } => {
-                    let path = location.to_str().map_err(|_| Error::NonUtf8Path)?;
-                    let file_path = workdir.join(path);
-                    remove_if_exists(&file_path).map_err(|e| Error::FileDelete {
-                        path: file_path,
-                        source: e,
-                    })?;
-                }
-                Change::Rewrite { .. } => {}
+    for path in manifest {
+        let Some(entry) = stash_tree
+            .lookup_entry_by_path(Path::new(path))
+            .map_err(Error::ObjectFind)?
+        else {
+            continue;
+        };
+        let mode = entry.mode();
+        if mode.is_tree() {
+            continue;
+        }
+        let blob = repo.find_object(entry.id()).map_err(Error::ObjectFind)?;
+        let file_path = workdir.join(path);
+        write_to_workdir(&file_path, &blob.data, mode, use_symlinks).map_err(|e| {
+            Error::FileWrite {
+                path: file_path,
+                source: e,
             }
-            Ok(std::ops::ControlFlow::Continue(()))
-        })
-        .map_err(|e| Error::TreeDiff(Box::new(e)))?;
+        })?;
+        // Only hidden paths feed refresh_stat: other manifest paths still differ from the index.
+        if hidden.contains(path) {
+            restored.push(path.clone());
+        }
+    }
 
     Ok(restored)
 }
@@ -900,11 +851,15 @@ fn apply_merges(
 
     for mb in merge_bases {
         let file_path = workdir.join(&mb.path);
-        if !file_path.exists() {
+        // Only merge regular files; anything else would read and write through symlinks.
+        let Ok(meta) = file_path.symlink_metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
             continue;
         }
 
-        let file_size = file_path.metadata().map_or(0, |m| m.len());
+        let file_size = meta.len();
         if file_size > threshold {
             if !quiet {
                 eprintln!(

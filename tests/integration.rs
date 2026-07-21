@@ -887,6 +887,29 @@ fn partial_stage_pass_filenames_false() {
     assert_eq!(repo.git(&["show", ":hello.txt"]), "HELLO WORLD\n");
 }
 
+/// A hidden file whose worktree content equals HEAD is still restored after the run.
+#[test]
+fn partial_stage_restores_head_identical_content() {
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+
+    repo.write_file("file.txt", "v1\n");
+    repo.git(&["add", "file.txt"]);
+    repo.git(&["commit", "-m", "add file"]);
+    repo.write_file("file.txt", "v2\n");
+    repo.git(&["add", "file.txt"]);
+    // Worktree back to the committed content: still dirty against the index.
+    repo.write_file("file.txt", "v1\n");
+
+    assert_success(repo.stagelint(&[]));
+
+    assert_eq!(repo.git(&["show", ":file.txt"]), "V2\n");
+    assert_eq!(
+        repo.read_file("file.txt"),
+        "v1\n",
+        "worktree content matching HEAD must still be restored"
+    );
+}
+
 /// When formatter and working tree edit the same line, the working tree wins.
 #[test]
 fn partial_stage_conflict_workdir_wins() {
@@ -1568,6 +1591,41 @@ fn symlink_entry_not_linted() {
     repo.git(&["add", "link.txt"]);
 
     assert_success(repo.stagelint(&[]));
+}
+
+/// The merge-back never writes through a symlink that replaced a partially-staged file.
+#[test]
+fn merge_does_not_write_through_symlink() {
+    if !file_symlinks_supported() {
+        return;
+    }
+
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+    repo.git(&["config", "core.symlinks", "true"]);
+
+    // The target matches the merge base, so the formatting would merge cleanly onto it.
+    repo.write_file("victim.txt", "hello\n");
+    repo.git(&["add", "victim.txt"]);
+    repo.git(&["commit", "-m", "add victim"]);
+
+    repo.write_file("file.txt", "hello\n");
+    repo.git(&["add", "file.txt"]);
+    // Unstaged type change: the worktree copy becomes a symlink.
+    fs::remove_file(repo.root.join("file.txt")).expect("remove file");
+    symlink_file("victim.txt", &repo.root.join("file.txt")).expect("create symlink");
+
+    assert_success(repo.stagelint(&[]));
+
+    assert_eq!(
+        repo.read_file("victim.txt"),
+        "hello\n",
+        "the symlink target must not be overwritten by the merge"
+    );
+    let meta = fs::symlink_metadata(repo.root.join("file.txt")).expect("lstat");
+    assert!(
+        meta.file_type().is_symlink(),
+        "the type change should be preserved"
+    );
 }
 
 /// A mode-120000 entry stored as plain text (`core.symlinks=false`) is not passed to the linter.

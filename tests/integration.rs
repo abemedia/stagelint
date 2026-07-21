@@ -16,7 +16,7 @@ fn no_staged_files_succeeds() {
     assert_success(repo.stagelint(&[]));
 }
 
-/// The formatter's output is committed to the index and working tree.
+/// The linter's output is committed to the index and working tree.
 #[test]
 fn formats_staged_file() {
     let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
@@ -30,27 +30,12 @@ fn formats_staged_file() {
     assert_eq!(repo.read_file("hello.txt"), "HELLO WORLD\n");
 }
 
-/// A failing linter that also modifies files: both index and working tree are restored.
-#[test]
-fn linter_failure_reverts_modifications() {
-    let repo = TestRepo::new(&json!({"*.txt": [UPPERCASE, "false"]}));
-
-    repo.write_file("file.txt", "staged\n");
-    repo.git(&["add", "file.txt"]);
-    repo.write_file("file.txt", "working tree\n");
-
-    assert_failure(repo.stagelint(&[]));
-
-    assert_eq!(repo.read_file("file.txt"), "working tree\n");
-    assert_eq!(repo.git(&["show", ":file.txt"]), "staged\n");
-}
-
-/// A failing run rolls back every formatter side-effect while leaving the user's changes alone.
+/// A failing run rolls back every linter side-effect while leaving the user's changes alone.
 #[test]
 fn failure_rolls_back_all_side_effects() {
     let repo = TestRepo::new(&json!({
         "*.txt": [
-            "sh -c 'echo SIDE EFFECT > clean_modified.txt; rm clean_deleted.txt dirty_deleted.txt; echo JUNK >> dirty_modified.txt' _",
+            "sh -c 'echo SIDE EFFECT > clean_modified.txt; rm clean_deleted.txt dirty_deleted.txt; echo JUNK >> dirty_modified.txt'",
             "false"
         ]
     }));
@@ -81,7 +66,7 @@ fn failure_rolls_back_all_side_effects() {
     assert_eq!(
         repo.read_file("clean_deleted.txt"),
         "content\n",
-        "clean tracked file deleted by the formatter should be restored"
+        "clean tracked file deleted by the linter should be restored"
     );
     assert_eq!(
         repo.read_file("dirty_modified.txt"),
@@ -91,12 +76,50 @@ fn failure_rolls_back_all_side_effects() {
     assert_eq!(
         repo.read_file("dirty_deleted.txt"),
         "v0\nedits\n",
-        "unstaged edits must survive a formatter deleting the file"
+        "unstaged edits must survive the linter deleting the file"
     );
     assert_eq!(repo.read_file("user_dirty.txt"), "v0\nuser edits\n");
     assert!(
         !repo.root.join("user_deleted.txt").exists(),
         "the user's own deletion must not be resurrected"
+    );
+}
+
+/// A linter that modifies a file that is not staged: the change must not reach the index.
+#[test]
+fn unstaged_file_changes_not_indexed() {
+    let repo = TestRepo::new(&json!({
+        "*.txt": "sh -c 'for f in *.txt; do echo MODIFIED > \"$f\"; done'"
+    }));
+
+    repo.write_file("staged.txt", "original\n");
+    repo.git(&["add", "staged.txt"]);
+    repo.write_file("unstaged.txt", "should not change in index\n");
+
+    assert_success(repo.stagelint(&[]));
+
+    assert_eq!(repo.git(&["show", ":staged.txt"]), "MODIFIED\n");
+
+    let ls = repo.git(&["ls-files", "unstaged.txt"]);
+    assert!(
+        ls.is_empty(),
+        "unstaged.txt should not be committed to the index, got: {ls}"
+    );
+}
+
+/// A linter that deletes the file it was given: stagelint must not panic or crash.
+#[test]
+fn linter_deletes_staged_file() {
+    let repo = TestRepo::new(&json!({"*.txt": "sh -c 'rm \"$@\"' _"}));
+
+    repo.write_file("doomed.txt", "goodbye\n");
+    repo.git(&["add", "doomed.txt"]);
+
+    let output = repo.stagelint(&[]).wait_with_output().expect("wait");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("panicked"),
+        "stagelint panicked: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -173,6 +196,11 @@ fn fails_outside_git_repo() {
 
     let output = Command::new(stagelint_exe())
         .current_dir(non_git_dir.path())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            non_git_dir.path().join("no-global-config"),
+        )
         .output()
         .expect("run stagelint");
 
@@ -295,7 +323,7 @@ fn ctrl_c_restores_repo() {
 
     let mut child = repo.stagelint(&[]);
 
-    assert!(repo.wait_sentinel(1, Duration::from_secs(10)),);
+    assert!(repo.wait_sentinel(1, Duration::from_secs(10)));
 
     assert_eq!(
         repo.read_file("file.txt"),
@@ -308,7 +336,7 @@ fn ctrl_c_restores_repo() {
         .status()
         .expect("send SIGINT");
 
-    let status = child.wait().expect("wait for stagelint");
+    let status = child.wait().unwrap();
     assert_eq!(
         status.code(),
         Some(1),
@@ -327,28 +355,98 @@ fn ctrl_c_restores_repo() {
 
 // Stash
 
-/// Default stash (tracked mode) hides unstaged hunks during formatting and restores them after.
+/// On linter failure, index and working tree are restored and the stash ref is dropped.
 #[test]
-fn stash_default_hides_unstaged_changes() {
-    let repo = TestRepo::new(&json!({"*.txt": replace("line2", "FORMATTED")}));
+fn linter_failure_restores_state_and_drops_stash() {
+    let repo = TestRepo::new(&json!({"*.txt": "false"}));
 
-    repo.write_file("file.txt", "line1\nline2\nline3\n");
+    repo.write_file("file.txt", "staged\n");
     repo.git(&["add", "file.txt"]);
-    repo.write_file("file.txt", "line1\nline2\nline3\nextra unstaged\n");
+    repo.write_file("file.txt", "working tree\n");
 
-    assert_success(repo.stagelint(&[]));
+    assert_failure(repo.stagelint(&[]));
 
-    assert_eq!(
-        repo.git(&["show", ":file.txt"]),
-        "line1\nFORMATTED\nline3\n"
-    );
-    assert_eq!(
-        repo.read_file("file.txt"),
-        "line1\nFORMATTED\nline3\nextra unstaged\n"
+    assert_eq!(repo.read_file("file.txt"), "working tree\n");
+    assert_eq!(repo.git(&["show", ":file.txt"]), "staged\n");
+
+    let stash_list = repo.git(&["stash", "list"]);
+    assert!(
+        !stash_list.contains("stagelint"),
+        "stash ref should be dropped after failure: {stash_list}"
     );
 }
 
-/// `--stash untracked` hides untracked files so the formatter cannot see them.
+/// `--stash tracked` hides an unstaged deletion: present during the run, deleted again after.
+#[test]
+fn stash_tracked_hides_unstaged_deletion() {
+    let repo = TestRepo::new(&json!({"*.txt": "sh -c 'test -e victim.txt'"}));
+
+    repo.write_file("victim.txt", "tracked\n");
+    repo.git(&["add", "victim.txt"]);
+    repo.git(&["commit", "-m", "add victim"]);
+
+    repo.write_file("staged.txt", "staged\n");
+    repo.git(&["add", "staged.txt"]);
+
+    fs::remove_file(repo.root.join("victim.txt")).expect("delete victim");
+
+    assert_success(repo.stagelint(&["--stash", "tracked"]));
+
+    assert!(
+        !repo.root.join("victim.txt").exists(),
+        "deletion should be restored after the run"
+    );
+    assert_eq!(repo.git(&["show", ":victim.txt"]), "tracked\n");
+    assert!(repo.git(&["stash", "list"]).is_empty());
+}
+
+/// `--stash tracked` with no dirty files: succeeds and leaves no stash entries.
+#[test]
+fn stash_tracked_noop_when_clean() {
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+
+    repo.write_file("hello.txt", "hello\n");
+    repo.git(&["add", "hello.txt"]);
+
+    assert_success(repo.stagelint(&["--stash", "tracked"]));
+
+    assert_eq!(repo.git(&["show", ":hello.txt"]), "HELLO\n");
+
+    let stash_list = repo.git(&["stash", "list"]);
+    assert!(
+        stash_list.is_empty(),
+        "no stash entries should exist, got: {stash_list}"
+    );
+}
+
+/// `--stash tracked` restores clean files the linter touched, leaving only the partial file dirty.
+#[test]
+fn stash_tracked_restores_clean_files() {
+    let repo = TestRepo::new(&json!({
+        "*.txt": "sh -c 'for f in *.txt; do tr a-z A-Z < \"$f\" > \"$f.tmp\" && mv \"$f.tmp\" \"$f\"; done'"
+    }));
+
+    // A committed file the linter will touch as a side effect.
+    repo.write_file("committed.txt", "hello\n");
+    repo.git(&["add", "committed.txt"]);
+    repo.git(&["commit", "-m", "add committed"]);
+
+    // A partially staged file: exercises the stash save/restore path.
+    repo.write_file("partial.txt", "world\n");
+    repo.git(&["add", "partial.txt"]);
+    repo.write_file("partial.txt", "world\nextra unstaged\n");
+
+    assert_success(repo.stagelint(&["--stash", "tracked"]));
+
+    assert_eq!(repo.read_file("committed.txt"), "hello\n");
+    let diff = repo.git(&["diff", "--name-only"]);
+    assert_eq!(
+        diff, "partial.txt\n",
+        "only the partially-staged file should be dirty, got: {diff:?}"
+    );
+}
+
+/// `--stash untracked` hides untracked files so the linter cannot see them.
 #[test]
 fn stash_untracked_hides_untracked_files() {
     let repo = TestRepo::new(&json!({
@@ -364,7 +462,7 @@ fn stash_untracked_hides_untracked_files() {
     let manifest = repo.read_file("manifest.txt");
     assert!(
         !manifest.contains("untracked.txt"),
-        "untracked file should be hidden during formatting, manifest: {manifest}"
+        "untracked file should be hidden during the run, manifest: {manifest}"
     );
     assert_eq!(repo.read_file("untracked.txt"), "untracked content\n");
 }
@@ -419,7 +517,7 @@ fn stash_untracked_hides_rename_destination() {
     let manifest = repo.read_file("manifest.txt");
     assert!(
         !manifest.contains("new.txt"),
-        "rename destination should be hidden during formatting, manifest: {manifest}"
+        "rename destination should be hidden during the run, manifest: {manifest}"
     );
 
     assert_eq!(repo.read_file("new.txt"), "original content\n");
@@ -429,55 +527,7 @@ fn stash_untracked_hides_rename_destination() {
     );
 }
 
-/// A successful run leaves no committed file dirty; only the partially-staged file stays dirty.
-#[test]
-fn restore_does_not_dirty_index() {
-    let repo = TestRepo::new(&json!({
-        "*.txt": "sh -c 'for f in *.txt; do tr a-z A-Z < \"$f\" > \"$f.tmp\" && mv \"$f.tmp\" \"$f\"; done' "
-    }));
-
-    // A committed file the formatter will touch as a side effect.
-    repo.write_file("committed.txt", "hello\n");
-    repo.git(&["add", "committed.txt"]);
-    repo.git(&["commit", "-m", "add committed"]);
-
-    // A partially staged file: exercises the stash save/restore path.
-    repo.write_file("partial.txt", "world\n");
-    repo.git(&["add", "partial.txt"]);
-    repo.write_file("partial.txt", "world\nextra unstaged\n");
-
-    assert_success(repo.stagelint(&["--stash", "tracked"]));
-
-    // committed.txt restored (not dirty); only partial.txt stays dirty.
-    let diff = repo.git(&["diff", "--name-only"]);
-    assert_eq!(
-        diff, "partial.txt\n",
-        "only the partially-staged file should be dirty, got: {diff:?}"
-    );
-}
-
-/// On linter failure, the stash ref is dropped after the working tree is restored.
-#[test]
-fn stash_ref_dropped_after_linter_failure() {
-    let repo = TestRepo::new(&json!({"*.txt": "false"}));
-
-    repo.write_file("file.txt", "staged\n");
-    repo.git(&["add", "file.txt"]);
-    repo.write_file("file.txt", "working tree\n");
-
-    assert_failure(repo.stagelint(&[]));
-
-    assert_eq!(repo.read_file("file.txt"), "working tree\n");
-    assert_eq!(repo.git(&["show", ":file.txt"]), "staged\n");
-
-    let stash_list = repo.git(&["stash", "list"]);
-    assert!(
-        !stash_list.contains("stagelint"),
-        "stash ref should be dropped after failure: {stash_list}"
-    );
-}
-
-/// `--stash all` hides dirty tracked and untracked files from the formatter.
+/// `--stash all` hides dirty tracked and untracked files from the linter.
 #[test]
 fn stash_all_hides_dirty_and_untracked() {
     let repo = TestRepo::new(&json!({
@@ -508,72 +558,6 @@ fn stash_all_hides_dirty_and_untracked() {
 
     assert_eq!(repo.read_file("tracked.txt"), "dirty tracked\n");
     assert_eq!(repo.read_file("untracked.txt"), "untracked content\n");
-}
-
-/// `--stash tracked` hides clean tracked files that the formatter touches, then restores them.
-#[test]
-fn stash_tracked_restores_non_staged_files() {
-    let repo = TestRepo::new(&json!({
-        "*.txt": "sh -c 'for f in *.txt; do echo MODIFIED > \"$f\"; done' "
-    }));
-
-    repo.write_file("tracked.txt", "original tracked\n");
-    repo.git(&["add", "tracked.txt"]);
-    repo.git(&["commit", "-m", "add tracked"]);
-
-    repo.write_file("staged.txt", "staged content\n");
-    repo.git(&["add", "staged.txt"]);
-
-    assert_success(repo.stagelint(&["--stash", "tracked"]));
-
-    assert_eq!(
-        repo.read_file("tracked.txt"),
-        "original tracked\n",
-        "non-staged tracked file should be restored with --stash tracked"
-    );
-}
-
-/// `--stash tracked` hides an unstaged deletion: present during the run, deleted again after.
-#[test]
-fn stash_tracked_hides_unstaged_deletion() {
-    let repo = TestRepo::new(&json!({"*.txt": "sh -c 'test -e victim.txt' _"}));
-
-    repo.write_file("victim.txt", "tracked\n");
-    repo.git(&["add", "victim.txt"]);
-    repo.git(&["commit", "-m", "add victim"]);
-
-    repo.write_file("staged.txt", "staged\n");
-    repo.git(&["add", "staged.txt"]);
-
-    fs::remove_file(repo.root.join("victim.txt")).expect("delete victim");
-
-    assert_success(repo.stagelint(&["--stash", "tracked"]));
-
-    assert!(
-        !repo.root.join("victim.txt").exists(),
-        "deletion should be restored after the run"
-    );
-    assert_eq!(repo.git(&["show", ":victim.txt"]), "tracked\n");
-    assert!(repo.git(&["stash", "list"]).is_empty());
-}
-
-/// `--stash tracked` with no dirty files: succeeds and leaves no stash entries.
-#[test]
-fn stash_tracked_noop_when_clean() {
-    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
-
-    repo.write_file("hello.txt", "hello\n");
-    repo.git(&["add", "hello.txt"]);
-
-    assert_success(repo.stagelint(&["--stash", "tracked"]));
-
-    assert_eq!(repo.git(&["show", ":hello.txt"]), "HELLO\n");
-
-    let stash_list = repo.git(&["stash", "list"]);
-    assert!(
-        stash_list.is_empty(),
-        "no stash entries should exist, got: {stash_list}"
-    );
 }
 
 /// A stash-creation failure must leave the working tree untouched.
@@ -743,7 +727,7 @@ fn survives_mid_run_stash_ref_drop() {
     assert_eq!(repo.read_file("hello.txt"), "HELLO\ngoodbye\n");
 }
 
-/// A stdout closed mid-run must not abort cleanup: the stash is dropped and the unstaged change survives.
+/// A closed stdout must not abort cleanup: the stash is dropped and the unstaged change survives.
 #[cfg(unix)]
 #[test]
 fn closed_stdout_does_not_leak_stash() {
@@ -755,7 +739,7 @@ fn closed_stdout_does_not_leak_stash() {
 
     let mut child = repo.stagelint(&[]);
     drop(child.stdout.take()); // close stdout so the linter output hits a broken pipe
-    assert!(child.wait().expect("wait").success());
+    assert!(child.wait().unwrap().success());
 
     assert_eq!(repo.read_file("file.txt"), "v2\n");
     assert!(repo.git(&["stash", "list"]).is_empty());
@@ -817,21 +801,6 @@ fn partial_stage_linter_modifies() {
     assert_eq!(repo.git(&["show", ":file.txt"]), "HELLO\n");
 
     assert_eq!(repo.read_file("file.txt"), "HELLO\nextra line\n");
-}
-
-/// Partially staged file: linter fails; index and working tree are both restored.
-#[test]
-fn partial_stage_failure_restores() {
-    let repo = TestRepo::new(&json!({"*.txt": "false"}));
-
-    repo.write_file("file.txt", "line1\nline2\n");
-    repo.git(&["add", "file.txt"]);
-    repo.write_file("file.txt", "modified_line1\nline2\n");
-
-    assert_failure(repo.stagelint(&[]));
-
-    assert_eq!(repo.git(&["show", ":file.txt"]), "line1\nline2\n");
-    assert_eq!(repo.read_file("file.txt"), "modified_line1\nline2\n");
 }
 
 /// Partially staged file: linter modifies then fails; state is still fully restored.
@@ -910,14 +879,14 @@ fn partial_stage_restores_head_identical_content() {
     );
 }
 
-/// When formatter and working tree edit the same line, the working tree wins.
+/// When the linter and working tree edit the same line, the working tree wins.
 #[test]
 fn partial_stage_conflict_workdir_wins() {
     let repo = TestRepo::new(&json!({"*.txt": replace("line1", "REPLACED")}));
 
     repo.write_file("file.txt", "line1\nline2\n");
     repo.git(&["add", "file.txt"]);
-    // Working tree also changes line1 - conflicts with the formatter's replacement.
+    // Working tree also changes line1 - conflicts with the linter's replacement.
     repo.write_file("file.txt", "modified_line1\nline2\n");
 
     assert_success(repo.stagelint(&[]));
@@ -925,6 +894,8 @@ fn partial_stage_conflict_workdir_wins() {
     assert_eq!(repo.git(&["show", ":file.txt"]), "REPLACED\nline2\n");
     assert_eq!(repo.read_file("file.txt"), "modified_line1\nline2\n");
 }
+
+// Mid-merge
 
 /// Runs correctly mid-merge: conflict resolved and staged, `MERGE_HEAD` still set.
 #[test]
@@ -996,80 +967,120 @@ fn merge_conflict_linter_failure_restores() {
     repo.git(&["rev-parse", "--verify", "MERGE_HEAD"]);
 }
 
-/// A staged file deleted from the worktree: its staged content is formatted, the deletion stays.
+// Renames and deletions
+
+/// Unstaged rename (no `git mv`): the old index entry is formatted, the rename preserved.
 #[test]
-fn staged_file_deleted_from_worktree_formats_staged_version() {
+fn unstaged_rename_preserved() {
     let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
 
-    repo.write_file("gone.txt", "content\n");
-    repo.git(&["add", "gone.txt"]);
-    fs::remove_file(repo.root.join("gone.txt")).expect("delete gone");
+    repo.write_file("old.txt", "original\n");
+    repo.git(&["add", "old.txt"]);
+    repo.git(&["commit", "-m", "add old.txt"]);
+
+    repo.write_file("old.txt", "hello world\n");
+    repo.git(&["add", "old.txt"]);
+
+    repo.rename_file("old.txt", "new.txt");
 
     assert_success(repo.stagelint(&[]));
 
-    assert_eq!(repo.git(&["show", ":gone.txt"]), "CONTENT\n");
+    assert_eq!(repo.git(&["show", ":old.txt"]), "HELLO WORLD\n");
+
     assert!(
-        !repo.root.join("gone.txt").exists(),
-        "staged deletion should remain absent from the worktree"
+        !repo.root.join("old.txt").exists(),
+        "old.txt should be absent after restore"
+    );
+    assert!(
+        repo.root.join("new.txt").exists(),
+        "new.txt should still exist"
+    );
+    assert!(
+        repo.git(&["stash", "list"]).is_empty(),
+        "stash should be cleaned up"
     );
 }
 
-// Index
-
-/// A formatter that modifies a file that is not staged: the change must not reach the index.
+/// Unstaged rename with failing linter: the rename state is preserved even on failure.
 #[test]
-fn unstaged_file_changes_not_indexed() {
-    let repo = TestRepo::new(&json!({
-        "*.txt": "sh -c 'for f in *.txt; do echo MODIFIED > \"$f\"; done' "
-    }));
+fn unstaged_rename_failure_preserved() {
+    let repo = TestRepo::new(&json!({"*.txt": "false"}));
 
-    repo.write_file("staged.txt", "original\n");
-    repo.git(&["add", "staged.txt"]);
-    repo.write_file("unstaged.txt", "should not change in index\n");
+    repo.write_file("old.txt", "original\n");
+    repo.git(&["add", "old.txt"]);
+    repo.git(&["commit", "-m", "add old.txt"]);
+
+    repo.write_file("old.txt", "hello world\n");
+    repo.git(&["add", "old.txt"]);
+
+    repo.rename_file("old.txt", "new.txt");
+
+    assert_failure(repo.stagelint(&[]));
+
+    assert_eq!(repo.git(&["show", ":old.txt"]), "hello world\n");
+    assert!(
+        !repo.root.join("old.txt").exists(),
+        "old.txt should remain absent after failure restore"
+    );
+    assert!(
+        repo.root.join("new.txt").exists(),
+        "new.txt should still exist after failure"
+    );
+    assert!(
+        repo.git(&["stash", "list"]).is_empty(),
+        "stash should be cleaned up after failure"
+    );
+}
+
+/// `git mv` rename: the new path is formatted and unstaged edits merge correctly.
+#[test]
+fn git_mv_formats_new_path() {
+    let repo = TestRepo::new(&json!({"*.txt": replace("line2", "FORMATTED")}));
+
+    repo.write_file("old.txt", "line1\nline2\nline3\n");
+    repo.git(&["add", "old.txt"]);
+    repo.git(&["commit", "-m", "add old.txt"]);
+
+    repo.git(&["mv", "old.txt", "new.txt"]);
+    repo.write_file("new.txt", "line1\nline2\nline3\nextra unstaged\n");
 
     assert_success(repo.stagelint(&[]));
 
-    assert_eq!(repo.git(&["show", ":staged.txt"]), "MODIFIED\n");
+    assert_eq!(repo.git(&["show", ":new.txt"]), "line1\nFORMATTED\nline3\n");
+    assert_eq!(
+        repo.read_file("new.txt"),
+        "line1\nFORMATTED\nline3\nextra unstaged\n"
+    );
 
-    let ls = repo.git(&["ls-files", "unstaged.txt"]);
+    let ls_old = repo.git(&["ls-files", "old.txt"]);
+    assert!(ls_old.is_empty(), "old.txt should not be in index");
     assert!(
-        ls.is_empty(),
-        "unstaged.txt should not be committed to the index, got: {ls}"
+        !repo.root.join("old.txt").exists(),
+        "old.txt should not exist on disk"
     );
 }
 
-/// A formatter that deletes the file it was given: stagelint must not panic or crash.
+/// Staged deletions are not passed to the linter; the file remains deleted after the run.
 #[test]
-fn formatter_deletes_staged_file() {
-    let repo = TestRepo::new(&json!({"*.txt": "sh -c 'rm \"$@\"' _"}));
+fn staged_delete_skipped() {
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
 
-    repo.write_file("doomed.txt", "goodbye\n");
-    repo.git(&["add", "doomed.txt"]);
+    repo.write_file("keep.txt", "hello\n");
+    repo.write_file("delete-me.txt", "content\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "add files"]);
 
-    // Either error or skip gracefully - must not panic.
-    let output = repo.stagelint(&[]).wait_with_output().expect("wait");
-    assert!(
-        !String::from_utf8_lossy(&output.stderr).contains("panicked"),
-        "stagelint panicked: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
+    repo.git(&["rm", "delete-me.txt"]);
+    repo.write_file("keep.txt", "hello updated\n");
+    repo.git(&["add", "keep.txt"]);
 
-/// A staged-deleted file is not resurrected after a successful run.
-#[test]
-fn staged_delete_not_resurrected() {
-    let repo = TestRepo::new(&json!({"*.txt": "true"}));
-    repo.write_file("to-delete.txt", "delete me\n");
-    repo.git(&["add", "to-delete.txt"]);
-    repo.git(&["commit", "-m", "add file to delete"]);
-    repo.git(&["rm", "to-delete.txt"]);
-    repo.write_file("other.txt", "content\n");
-    repo.git(&["add", "other.txt"]);
     assert_success(repo.stagelint(&[]));
-    assert!(
-        !repo.root.join("to-delete.txt").exists(),
-        "to-delete.txt should remain absent after successful run"
-    );
+
+    assert_eq!(repo.git(&["show", ":keep.txt"]), "HELLO UPDATED\n");
+
+    assert!(!repo.root.join("delete-me.txt").exists());
+    let ls = repo.git(&["ls-files", "delete-me.txt"]);
+    assert!(ls.is_empty(), "delete-me.txt should not be in index");
 }
 
 /// A staged-deleted file is not resurrected when the linter fails.
@@ -1089,102 +1100,21 @@ fn staged_delete_not_resurrected_on_failure() {
     );
 }
 
-/// A staged rename (old -> new): the old path must not reappear after a successful run.
+/// A staged file deleted from the worktree: its staged content is formatted, the deletion stays.
 #[test]
-fn staged_rename_old_path_absent() {
-    let repo = TestRepo::new(&json!({"*.txt": "true"}));
+fn staged_file_deleted_from_worktree_formats_staged_version() {
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
 
-    repo.write_file("old-name.txt", "content\n");
-    repo.git(&["add", "old-name.txt"]);
-    repo.git(&["commit", "-m", "add old-name"]);
-
-    repo.git(&["mv", "old-name.txt", "new-name.txt"]);
-
-    repo.write_file("trigger.txt", "trigger\n");
-    repo.git(&["add", "trigger.txt"]);
+    repo.write_file("gone.txt", "content\n");
+    repo.git(&["add", "gone.txt"]);
+    fs::remove_file(repo.root.join("gone.txt")).expect("delete gone");
 
     assert_success(repo.stagelint(&[]));
 
+    assert_eq!(repo.git(&["show", ":gone.txt"]), "CONTENT\n");
     assert!(
-        !repo.root.join("old-name.txt").exists(),
-        "old-name.txt should remain absent after stagelint"
-    );
-    assert!(
-        repo.root.join("new-name.txt").exists(),
-        "new-name.txt should exist after stagelint"
-    );
-}
-
-/// Submodule entries (mode 160000) are not passed to the linter.
-#[test]
-fn submodule_not_linted() {
-    let subrepo = TestRepo::empty();
-    subrepo.write_file("README.md", "# Sub\n");
-    subrepo.git(&["add", "README.md"]);
-    subrepo.git(&["commit", "-m", "initial"]);
-
-    let repo = TestRepo::new(&json!({"*.txt": "false"}));
-
-    let subrepo_str = subrepo.root.to_str().expect("path");
-
-    // Submodule named to match *.txt; its mode-160000 entry would reach the linter if not filtered.
-    repo.git(&[
-        "-c",
-        "protocol.file.allow=always",
-        "submodule",
-        "add",
-        "--force",
-        subrepo_str,
-        "submodule.txt",
-    ]);
-
-    assert_success(repo.stagelint(&[]));
-}
-
-/// A submodule with new commits is not stashed: a gitlink has no file content to hide.
-#[test]
-fn dirty_submodule_not_stashed() {
-    let subrepo = TestRepo::empty();
-    subrepo.write_file("README.md", "# Sub\n");
-    subrepo.git(&["add", "README.md"]);
-    subrepo.git(&["commit", "-m", "initial"]);
-
-    let repo = TestRepo::new(&json!({"*.txt": "true"}));
-    let subrepo_str = subrepo.root.to_str().expect("path");
-    repo.git(&[
-        "-c",
-        "protocol.file.allow=always",
-        "submodule",
-        "add",
-        "--force",
-        subrepo_str,
-        "vendor",
-    ]);
-    repo.git(&["commit", "-m", "add submodule"]);
-
-    // Advance the submodule so its gitlink no longer matches the index.
-    repo.git(&[
-        "-C",
-        "vendor",
-        "-c",
-        "user.email=test@test.com",
-        "-c",
-        "user.name=Test",
-        "commit",
-        "--allow-empty",
-        "-m",
-        "advance",
-    ]);
-
-    repo.write_file("staged.txt", "hello\n");
-    repo.git(&["add", "staged.txt"]);
-
-    assert_success(repo.stagelint(&["--stash", "tracked"]));
-
-    let status = repo.git(&["status", "--short"]);
-    assert!(
-        status.contains("M vendor"),
-        "submodule should remain dirty and untouched, got: {status}"
+        !repo.root.join("gone.txt").exists(),
+        "staged deletion should remain absent from the worktree"
     );
 }
 
@@ -1412,120 +1342,79 @@ fn overlapping_globs_run_in_declaration_order() {
     assert_eq!(repo.git(&["show", ":a.txt"]), "3\n");
 }
 
-// Status
+// Submodules
 
-/// On-disk rename (no `git mv`): the old index entry is formatted, the rename preserved.
+/// Submodule entries (mode 160000) are not passed to the linter.
 #[test]
-fn staged_rename_preserved() {
-    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+fn submodule_not_linted() {
+    let subrepo = TestRepo::empty();
+    subrepo.write_file("README.md", "# Sub\n");
+    subrepo.git(&["add", "README.md"]);
+    subrepo.git(&["commit", "-m", "initial"]);
 
-    repo.write_file("old.txt", "original\n");
-    repo.git(&["add", "old.txt"]);
-    repo.git(&["commit", "-m", "add old.txt"]);
-
-    repo.write_file("old.txt", "hello world\n");
-    repo.git(&["add", "old.txt"]);
-
-    repo.rename_file("old.txt", "new.txt");
-
-    assert_success(repo.stagelint(&[]));
-
-    assert_eq!(repo.git(&["show", ":old.txt"]), "HELLO WORLD\n");
-
-    assert!(
-        !repo.root.join("old.txt").exists(),
-        "old.txt should be absent after restore"
-    );
-    assert!(
-        repo.root.join("new.txt").exists(),
-        "new.txt should still exist"
-    );
-    assert!(
-        repo.git(&["stash", "list"]).is_empty(),
-        "stash should be cleaned up"
-    );
-}
-
-/// Staged rename with failing linter: the rename state is preserved even on failure.
-#[test]
-fn staged_rename_failure_preserved() {
     let repo = TestRepo::new(&json!({"*.txt": "false"}));
 
-    repo.write_file("old.txt", "original\n");
-    repo.git(&["add", "old.txt"]);
-    repo.git(&["commit", "-m", "add old.txt"]);
+    let subrepo_str = subrepo.root.to_str().expect("path");
 
-    repo.write_file("old.txt", "hello world\n");
-    repo.git(&["add", "old.txt"]);
-
-    repo.rename_file("old.txt", "new.txt");
-
-    assert_failure(repo.stagelint(&[]));
-
-    assert_eq!(repo.git(&["show", ":old.txt"]), "hello world\n");
-    assert!(
-        !repo.root.join("old.txt").exists(),
-        "old.txt should remain absent after failure restore"
-    );
-    assert!(
-        repo.root.join("new.txt").exists(),
-        "new.txt should still exist after failure"
-    );
-    assert!(
-        repo.git(&["stash", "list"]).is_empty(),
-        "stash should be cleaned up after failure"
-    );
-}
-
-/// `git mv` rename: the new path is formatted and unstaged edits merge correctly.
-#[test]
-fn git_mv_formats_new_path() {
-    let repo = TestRepo::new(&json!({"*.txt": replace("line2", "FORMATTED")}));
-
-    repo.write_file("old.txt", "line1\nline2\nline3\n");
-    repo.git(&["add", "old.txt"]);
-    repo.git(&["commit", "-m", "add old.txt"]);
-
-    repo.git(&["mv", "old.txt", "new.txt"]);
-    repo.write_file("new.txt", "line1\nline2\nline3\nextra unstaged\n");
+    // Submodule named to match *.txt; its mode-160000 entry would reach the linter if not filtered.
+    repo.git(&[
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "--force",
+        subrepo_str,
+        "submodule.txt",
+    ]);
 
     assert_success(repo.stagelint(&[]));
-
-    assert_eq!(repo.git(&["show", ":new.txt"]), "line1\nFORMATTED\nline3\n");
-    assert_eq!(
-        repo.read_file("new.txt"),
-        "line1\nFORMATTED\nline3\nextra unstaged\n"
-    );
-
-    let ls_old = repo.git(&["ls-files", "old.txt"]);
-    assert!(ls_old.is_empty(), "old.txt should not be in index");
-    assert!(
-        !repo.root.join("old.txt").exists(),
-        "old.txt should not exist on disk"
-    );
 }
 
-/// Staged deletions are not passed to the linter; the file remains deleted after the run.
+/// A submodule with new commits is not stashed: a gitlink has no file content to hide.
 #[test]
-fn staged_delete_skipped() {
-    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+fn dirty_submodule_not_stashed() {
+    let subrepo = TestRepo::empty();
+    subrepo.write_file("README.md", "# Sub\n");
+    subrepo.git(&["add", "README.md"]);
+    subrepo.git(&["commit", "-m", "initial"]);
 
-    repo.write_file("keep.txt", "hello\n");
-    repo.write_file("delete-me.txt", "content\n");
-    repo.git(&["add", "."]);
-    repo.git(&["commit", "-m", "add files"]);
+    let repo = TestRepo::new(&json!({"*.txt": "true"}));
+    let subrepo_str = subrepo.root.to_str().expect("path");
+    repo.git(&[
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "--force",
+        subrepo_str,
+        "vendor",
+    ]);
+    repo.git(&["commit", "-m", "add submodule"]);
 
-    repo.git(&["rm", "delete-me.txt"]);
-    repo.write_file("keep.txt", "hello updated\n");
-    repo.git(&["add", "keep.txt"]);
+    // Advance the submodule so its gitlink no longer matches the index.
+    repo.git(&[
+        "-C",
+        "vendor",
+        "-c",
+        "user.email=test@test.com",
+        "-c",
+        "user.name=Test",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "advance",
+    ]);
 
-    assert_success(repo.stagelint(&[]));
+    repo.write_file("staged.txt", "hello\n");
+    repo.git(&["add", "staged.txt"]);
 
-    assert_eq!(repo.git(&["show", ":keep.txt"]), "HELLO UPDATED\n");
+    assert_success(repo.stagelint(&["--stash", "tracked"]));
 
-    assert!(!repo.root.join("delete-me.txt").exists());
-    let ls = repo.git(&["ls-files", "delete-me.txt"]);
-    assert!(ls.is_empty(), "delete-me.txt should not be in index");
+    let status = repo.git(&["status", "--short"]);
+    assert!(
+        status.contains("M vendor"),
+        "submodule should remain dirty and untouched, got: {status}"
+    );
 }
 
 // Symlinks
@@ -1603,7 +1492,7 @@ fn merge_does_not_write_through_symlink() {
     let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
     repo.git(&["config", "core.symlinks", "true"]);
 
-    // The target matches the merge base, so the formatting would merge cleanly onto it.
+    // The target matches the merge base, so the linter's change would merge cleanly onto it.
     repo.write_file("victim.txt", "hello\n");
     repo.git(&["add", "victim.txt"]);
     repo.git(&["commit", "-m", "add victim"]);
@@ -1628,106 +1517,9 @@ fn merge_does_not_write_through_symlink() {
     );
 }
 
-/// A mode-120000 entry stored as plain text (`core.symlinks=false`) is not passed to the linter.
-#[test]
-fn symlink_entry_not_linted_symlinks_disabled() {
-    let repo = TestRepo::new(&json!({"*.txt": "false"}));
-
-    repo.write_file("link.txt", "target.txt");
-    let hash = repo.git(&["hash-object", "-w", "link.txt"]);
-    let hash = hash.trim();
-    repo.git(&[
-        "update-index",
-        "--add",
-        "--cacheinfo",
-        &format!("120000,{hash},link.txt"),
-    ]);
-
-    assert_success(repo.stagelint(&[]));
-}
-
-/// With `core.symlinks=false`, a dirty mode-120000 entry is stashed and restored as plain text.
-#[test]
-fn stash_restores_symlink_entry_symlinks_disabled() {
-    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
-    repo.git(&["config", "core.symlinks", "false"]);
-
-    // Commit a mode-120000 entry backed by a text file (as git writes with core.symlinks=false).
-    repo.write_file("link.txt", "target_a.txt");
-    let hash = repo.git(&["hash-object", "-w", "link.txt"]);
-    repo.git(&[
-        "update-index",
-        "--add",
-        "--cacheinfo",
-        &format!("120000,{},link.txt", hash.trim()),
-    ]);
-    repo.write_file("trigger.txt", "hello\n");
-    repo.git(&["add", "trigger.txt"]);
-    repo.git(&["commit", "-m", "init"]);
-
-    // Modify the "symlink" text file on disk so it is dirty.
-    repo.write_file("link.txt", "target_b.txt");
-
-    // Stage a trigger so stagelint has something to lint.
-    repo.write_file("trigger.txt", "updated\n");
-    repo.git(&["add", "trigger.txt"]);
-
-    assert_success(repo.stagelint(&["--stash", "tracked"]));
-
-    // link.txt should be restored as a plain text file, not a real symlink.
-    let meta = fs::symlink_metadata(repo.root.join("link.txt")).unwrap();
-    assert!(
-        !meta.file_type().is_symlink(),
-        "link.txt should be a plain text file with core.symlinks=false"
-    );
-    assert_eq!(repo.read_file("link.txt"), "target_b.txt");
-}
-
-/// With `core.symlinks=false`, a partially staged mode-120000 entry preserves workdir and index.
-#[test]
-fn partial_staged_symlink_entry_symlinks_disabled() {
-    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
-    repo.git(&["config", "core.symlinks", "false"]);
-
-    // Commit a mode-120000 entry backed by a plain text file (target_a).
-    repo.write_file("link.txt", "target_a.txt");
-    let hash = repo.git(&["hash-object", "-w", "link.txt"]);
-    repo.git(&[
-        "update-index",
-        "--add",
-        "--cacheinfo",
-        &format!("120000,{},link.txt", hash.trim()),
-    ]);
-    repo.write_file("trigger.txt", "hello\n");
-    repo.git(&["add", "trigger.txt"]);
-    repo.git(&["commit", "-m", "init"]);
-
-    // Stage trigger.txt so stagelint has something to lint.
-    repo.write_file("trigger.txt", "updated\n");
-    repo.git(&["add", "trigger.txt"]);
-
-    // Partially stage link.txt: index = target_b, workdir = target_c (both plain text files).
-    repo.write_file("link.txt", "target_b.txt");
-    repo.git(&["add", "link.txt"]);
-    repo.write_file("link.txt", "target_c.txt");
-
-    assert_success(repo.stagelint(&[]));
-
-    // Workdir should be restored to target_c (3-way merge preserves workdir).
-    let meta = fs::symlink_metadata(repo.root.join("link.txt")).unwrap();
-    assert!(
-        !meta.file_type().is_symlink(),
-        "link.txt should remain a plain text file with core.symlinks=false"
-    );
-    assert_eq!(repo.read_file("link.txt"), "target_c.txt");
-
-    // Index should keep the staged version (target_b).
-    assert_eq!(repo.git(&["show", ":link.txt"]), "target_b.txt");
-}
-
 /// Partially staged file symlink (`core.symlinks=true`): stash restores the real symlink.
 #[test]
-fn partial_staged_file_symlink() {
+fn partial_stage_file_symlink() {
     if !file_symlinks_supported() {
         return;
     }
@@ -1768,7 +1560,7 @@ fn partial_staged_file_symlink() {
 
 /// Partially staged directory symlink (`core.symlinks=true`): stash restores the real symlink.
 #[test]
-fn partial_staged_dir_symlink() {
+fn partial_stage_dir_symlink() {
     if !dir_symlinks_supported() {
         return;
     }
@@ -1818,11 +1610,105 @@ fn partial_staged_dir_symlink() {
     assert_eq!(indexed, "dir_b");
 }
 
+/// A mode-120000 entry stored as plain text (`core.symlinks=false`) is not passed to the linter.
+#[test]
+fn symlink_entry_not_linted_symlinks_disabled() {
+    let repo = TestRepo::new(&json!({"*.txt": "false"}));
+
+    repo.write_file("link.txt", "target.txt");
+    let hash = repo.git(&["hash-object", "-w", "link.txt"]);
+    let hash = hash.trim();
+    repo.git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("120000,{hash},link.txt"),
+    ]);
+
+    assert_success(repo.stagelint(&[]));
+}
+
+/// With `core.symlinks=false`, a dirty mode-120000 entry is stashed and restored as plain text.
+#[test]
+fn stash_restores_symlink_entry_symlinks_disabled() {
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+    repo.git(&["config", "core.symlinks", "false"]);
+
+    // Commit a mode-120000 entry backed by a text file (as git writes with core.symlinks=false).
+    repo.write_file("link.txt", "target_a.txt");
+    let hash = repo.git(&["hash-object", "-w", "link.txt"]);
+    repo.git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("120000,{},link.txt", hash.trim()),
+    ]);
+    repo.write_file("trigger.txt", "hello\n");
+    repo.git(&["add", "trigger.txt"]);
+    repo.git(&["commit", "-m", "init"]);
+
+    // Modify the "symlink" text file on disk so it is dirty.
+    repo.write_file("link.txt", "target_b.txt");
+
+    // Stage a trigger so stagelint has something to lint.
+    repo.write_file("trigger.txt", "updated\n");
+    repo.git(&["add", "trigger.txt"]);
+
+    assert_success(repo.stagelint(&["--stash", "tracked"]));
+
+    let meta = fs::symlink_metadata(repo.root.join("link.txt")).unwrap();
+    assert!(
+        !meta.file_type().is_symlink(),
+        "link.txt should be a plain text file with core.symlinks=false"
+    );
+    assert_eq!(repo.read_file("link.txt"), "target_b.txt");
+}
+
+/// With `core.symlinks=false`, a partially staged mode-120000 entry preserves workdir and index.
+#[test]
+fn partial_stage_symlink_entry_symlinks_disabled() {
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+    repo.git(&["config", "core.symlinks", "false"]);
+
+    // Commit a mode-120000 entry backed by a plain text file (target_a).
+    repo.write_file("link.txt", "target_a.txt");
+    let hash = repo.git(&["hash-object", "-w", "link.txt"]);
+    repo.git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("120000,{},link.txt", hash.trim()),
+    ]);
+    repo.write_file("trigger.txt", "hello\n");
+    repo.git(&["add", "trigger.txt"]);
+    repo.git(&["commit", "-m", "init"]);
+
+    // Stage trigger.txt so stagelint has something to lint.
+    repo.write_file("trigger.txt", "updated\n");
+    repo.git(&["add", "trigger.txt"]);
+
+    // Partially stage link.txt: index = target_b, workdir = target_c (both plain text files).
+    repo.write_file("link.txt", "target_b.txt");
+    repo.git(&["add", "link.txt"]);
+    repo.write_file("link.txt", "target_c.txt");
+
+    assert_success(repo.stagelint(&[]));
+
+    let meta = fs::symlink_metadata(repo.root.join("link.txt")).unwrap();
+    assert!(
+        !meta.file_type().is_symlink(),
+        "link.txt should remain a plain text file with core.symlinks=false"
+    );
+    assert_eq!(repo.read_file("link.txt"), "target_c.txt");
+
+    assert_eq!(repo.git(&["show", ":link.txt"]), "target_b.txt");
+}
+
 // Init
 
-/// `stagelint init` creates a pre-commit hook that invokes stagelint.
+/// `stagelint init` installs an executable pre-commit hook; re-running leaves it unchanged.
 #[test]
-fn init_creates_pre_commit_hook() {
+fn init_creates_hook_idempotently() {
     let repo = TestRepo::empty();
 
     assert_success(repo.stagelint(&["init"]));
@@ -1845,20 +1731,11 @@ fn init_creates_pre_commit_hook() {
             "hook should be executable, mode: {mode:o}"
         );
     }
-}
-
-/// Running `stagelint init` twice succeeds; the hook is not duplicated.
-#[test]
-fn init_idempotent() {
-    let repo = TestRepo::empty();
-
-    assert_success(repo.stagelint(&["init"]));
-    let first = repo.read_file(".git/hooks/pre-commit");
 
     assert_success(repo.stagelint(&["init"]));
     assert_eq!(
         repo.read_file(".git/hooks/pre-commit"),
-        first,
+        content,
         "second init should leave the hook unchanged"
     );
 
@@ -1866,7 +1743,6 @@ fn init_idempotent() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let hook_path = repo.root.join(".git/hooks/pre-commit");
         fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o644)).unwrap();
         assert_success(repo.stagelint(&["init"]));
         let mode = fs::metadata(&hook_path).unwrap().permissions().mode();
@@ -1919,6 +1795,8 @@ fn init_relative_hookspath_resolves_to_root() {
 
     let output = Command::new(stagelint_exe())
         .current_dir(repo.root.join("sub"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", repo.root.join(".git/no-global-config"))
         .arg("init")
         .output()
         .expect("run stagelint init");
@@ -1934,28 +1812,42 @@ fn init_relative_hookspath_resolves_to_root() {
 
 // Crash recovery
 
-/// Crash during default stash: the stash ref survives for `git stash pop` recovery.
+/// The stash snapshots the full worktree: dirty edits and deletions survive a crash.
 #[test]
-fn crash_default_stash_recoverable() {
+fn crash_dirty_state_recoverable() {
     let repo = TestRepo::new(&json!({"*.txt": sentinel(1)}));
 
-    repo.write_file("file.txt", "staged content\n");
-    repo.git(&["add", "file.txt"]);
-    repo.write_file("file.txt", "working tree content\n");
+    repo.write_file("dirty.txt", "v0\n");
+    repo.write_file("user_deleted.txt", "gone\n");
+    repo.git(&["add", "dirty.txt", "user_deleted.txt"]);
+    repo.git(&["commit", "-m", "add files"]);
+    repo.write_file("dirty.txt", "v0\nedits\n");
+    fs::remove_file(repo.root.join("user_deleted.txt")).expect("delete user file");
+
+    repo.write_file("partial.txt", "staged\n");
+    repo.git(&["add", "partial.txt"]);
+    repo.write_file("partial.txt", "staged\nunstaged\n");
 
     let mut child = repo.stagelint(&[]);
-
     assert!(repo.wait_sentinel(1, Duration::from_secs(10)));
 
+    // A stale index.lock left by the crash must not block recovery.
     repo.write_file(".git/index.lock", "");
 
-    child.kill().expect("kill");
-    child.wait().expect("wait");
+    child.kill().unwrap();
+    child.wait().unwrap();
 
-    let stash_list = repo.git(&["stash", "list"]);
+    assert_eq!(
+        repo.git(&["show", "stash@{0}:dirty.txt"]),
+        "v0\nedits\n",
+        "stash tree should snapshot dirty content"
+    );
     assert!(
-        stash_list.contains("stash@{0}"),
-        "stash ref should exist after crash for recovery: {stash_list}"
+        !repo
+            .git_cmd(&["show", "stash@{0}:user_deleted.txt"])
+            .status
+            .success(),
+        "stash tree should record the user's deletion"
     );
 
     let _ = fs::remove_file(repo.root.join(".git/index.lock"));
@@ -1963,10 +1855,12 @@ fn crash_default_stash_recoverable() {
     repo.git(&["reset", "--hard", "HEAD"]);
     repo.git(&["stash", "pop"]);
 
-    assert_eq!(repo.read_file("file.txt"), "working tree content\n");
+    assert_eq!(repo.read_file("dirty.txt"), "v0\nedits\n");
+    assert!(!repo.root.join("user_deleted.txt").exists());
+    assert_eq!(repo.read_file("partial.txt"), "staged\nunstaged\n");
 }
 
-/// Crash during `--stash tracked`: stash ref survives; `git stash pop` restores dirty tracked files.
+/// Crash during `--stash tracked`: stash ref survives; `git stash pop` restores dirty files.
 #[test]
 fn crash_stash_tracked_recoverable() {
     let repo = TestRepo::new(&json!({"*.txt": sentinel(1)}));
@@ -1981,8 +1875,8 @@ fn crash_stash_tracked_recoverable() {
 
     let mut child = repo.stagelint(&["--stash", "tracked"]);
     assert!(repo.wait_sentinel(1, Duration::from_secs(10)));
-    child.kill().expect("kill");
-    child.wait().expect("wait");
+    child.kill().unwrap();
+    child.wait().unwrap();
 
     let stash_list = repo.git(&["stash", "list"]);
     assert!(
@@ -2032,9 +1926,9 @@ fn crash_stash_untracked_recoverable() {
     assert_eq!(repo.git(&["show", ":staged.txt"]), "content\n");
 }
 
-/// Crash during a staged rename: stash ref survives; recovery restores the on-disk rename state.
+/// Crash during an unstaged rename: stash ref survives; recovery restores the rename state.
 #[test]
-fn crash_staged_rename_recoverable() {
+fn crash_unstaged_rename_recoverable() {
     let repo = TestRepo::new(&json!({"*.txt": sentinel(1)}));
 
     repo.write_file("old.txt", "original\n");
@@ -2066,7 +1960,7 @@ fn crash_staged_rename_recoverable() {
     assert_eq!(repo.read_file("new.txt"), "hello world\n");
 }
 
-/// Crash while formatting a staged-then-deleted new file: recovery restores the staged content.
+/// Crash while linting a staged-then-deleted new file: recovery restores the staged content.
 #[test]
 fn crash_staged_deletion_recoverable() {
     let repo = TestRepo::new(&json!({"*.txt": sentinel(1)}));
@@ -2089,46 +1983,4 @@ fn crash_staged_deletion_recoverable() {
     repo.git(&["stash", "pop"]);
 
     assert_eq!(repo.read_file("gone.txt"), "content\n");
-}
-
-/// The stash snapshots the full worktree: dirty edits and deletions survive a crash.
-#[test]
-fn crash_recovery_restores_dirty_state() {
-    let repo = TestRepo::new(&json!({"*.txt": sentinel(1)}));
-
-    repo.write_file("dirty.txt", "v0\n");
-    repo.write_file("user_deleted.txt", "gone\n");
-    repo.git(&["add", "dirty.txt", "user_deleted.txt"]);
-    repo.git(&["commit", "-m", "add files"]);
-    repo.write_file("dirty.txt", "v0\nedits\n");
-    fs::remove_file(repo.root.join("user_deleted.txt")).expect("delete user file");
-
-    repo.write_file("partial.txt", "staged\n");
-    repo.git(&["add", "partial.txt"]);
-    repo.write_file("partial.txt", "staged\nunstaged\n");
-
-    let mut child = repo.stagelint(&[]);
-    assert!(repo.wait_sentinel(1, Duration::from_secs(10)));
-    child.kill().unwrap();
-    child.wait().unwrap();
-
-    assert_eq!(
-        repo.git(&["show", "stash@{0}:dirty.txt"]),
-        "v0\nedits\n",
-        "stash tree should snapshot dirty content"
-    );
-    assert!(
-        !repo
-            .git_cmd(&["show", "stash@{0}:user_deleted.txt"])
-            .status
-            .success(),
-        "stash tree should record the user's deletion"
-    );
-
-    repo.git(&["reset", "--hard", "HEAD"]);
-    repo.git(&["stash", "pop"]);
-
-    assert_eq!(repo.read_file("dirty.txt"), "v0\nedits\n");
-    assert!(!repo.root.join("user_deleted.txt").exists());
-    assert_eq!(repo.read_file("partial.txt"), "staged\nunstaged\n");
 }

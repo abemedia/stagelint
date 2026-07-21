@@ -66,3 +66,22 @@ fn parse_concurrent(s: &str) -> Result<usize, String> {
             .map_err(|_| format!("expected true, false, or a number, got '{s}'")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_concurrent;
+
+    #[test]
+    fn parse_concurrent_values() {
+        assert_eq!(parse_concurrent("true"), Ok(0));
+        assert_eq!(parse_concurrent("false"), Ok(1));
+        assert_eq!(parse_concurrent("4"), Ok(4));
+        assert_eq!(parse_concurrent("0"), Ok(0));
+    }
+
+    #[test]
+    fn parse_concurrent_invalid() {
+        let err = parse_concurrent("maybe").unwrap_err();
+        assert_eq!(err, "expected true, false, or a number, got 'maybe'");
+    }
+}

@@ -12,7 +12,7 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
-    #[error("some formatting hunks conflicted with unstaged changes")]
+    #[error("some hunks conflicted with unstaged changes")]
     AutoResolved,
     #[error("merge produced unresolved conflicts")]
     Conflict,

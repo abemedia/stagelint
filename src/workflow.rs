@@ -88,11 +88,11 @@ pub enum Error {
     },
 }
 
-/// Owns the git state around one formatting run: stash the working changes so the formatter
-/// sees only staged content, capture its output into the index, restore the working tree, and
-/// drop the backup stash.
+/// Owns the git state around one run: stash the working changes so commands see only staged
+/// content, capture their output into the index, restore the working tree, and drop the backup
+/// stash.
 ///
-/// Constructing it performs the stash. If a later step fails before `restore` runs - a linter
+/// Constructing it performs the stash. If a later step fails before `restore` runs - a command
 /// failure, or a mid-way hide failure during construction - `Drop` rolls the working tree back.
 /// Once `restore` has run, any failure leaves the backup stash in place for recovery.
 #[must_use]
@@ -120,8 +120,8 @@ impl<'a> Workflow<'a> {
         stash_untracked: bool,
     ) -> Result<Self, Error> {
         // Read working-tree content into the ODB before hiding overwrites it with the indexed
-        // version. Every dirty file is captured so the stash snapshots the full worktree;
-        // only the scope-selected subset is hidden from the run.
+        // version. Every dirty file is captured so the stash snapshots the full worktree; only the
+        // scope-selected subset is hidden from the run.
         let mut captured: Vec<StashEntry> = Vec::new();
         let mut untracked_entries: Vec<StashEntry> = Vec::new();
         let mut hidden: BTreeSet<String> = BTreeSet::new();
@@ -149,7 +149,7 @@ impl<'a> Workflow<'a> {
             }
         }
 
-        // The formatter needs staged files on disk; tracked stashing also hides unstaged deletions.
+        // Commands need staged files on disk; tracked stashing also hides unstaged deletions.
         let absent: Vec<String> = if stash_tracked {
             status.missing.iter().cloned().collect()
         } else {
@@ -193,8 +193,8 @@ impl<'a> Workflow<'a> {
         Ok(workflow)
     }
 
-    /// Finish the run: capture the formatter's output into the index, restore the working tree,
-    /// apply the formatting to it, and drop the backup stash.
+    /// Finish the run: capture its output into the index, restore the working tree, apply the
+    /// changes to it, and drop the backup stash.
     pub fn finish(&mut self, quiet: bool) -> Result<(), Error> {
         let merge_bases = update(
             self.repo,
@@ -207,8 +207,8 @@ impl<'a> Workflow<'a> {
         self.cleanup()
     }
 
-    /// Restore the working tree, revert formatter side-effects on clean tracked files, and refresh
-    /// index stats so restored files don't appear dirty.
+    /// Restore the working tree, revert side-effects on clean tracked files, and refresh index
+    /// stats so restored files don't appear dirty.
     ///
     /// If stash restore fails, subsequent steps are skipped (they depend on knowing which files
     /// were restored). The stash ref is left intact for `git stash pop` recovery.
@@ -388,8 +388,8 @@ fn create_stash_commit(
         parents.push(commit.id);
 
         // parent[1]: index commit - tree is the current staged state.
-        // git stash pop uses this as the merge base for staged changes; using HEAD
-        // tree instead would produce wrong 3-way merge results for partially-staged files.
+        // git stash pop uses this as the merge base for staged changes; using HEAD tree instead
+        // would produce wrong 3-way merge results for partially-staged files.
         let index_tree_oid = {
             let mut editor = repo.empty_tree().edit().map_err(Error::TreeEditInit)?;
             for entry in index.entries() {
@@ -483,8 +483,8 @@ fn write_commit(
 
 /// Replace stashed files with their correct on-disk representation.
 /// For hidden tracked files: write indexed blob content.
-/// For untracked files: delete them so they're absent during formatting.
-/// For absent staged files: write indexed content so the formatter can process them.
+/// For untracked files: delete them so they're absent during the run.
+/// For absent staged files: write indexed content so they exist during the run.
 fn hide_stashed_files(
     repo: &Repository,
     workdir: &Path,
@@ -528,7 +528,8 @@ fn hide_stashed_files(
         })?;
     }
 
-    // Recreate absent staged files from indexed content so the formatter can run; restore deletes them.
+    // Recreate absent staged files from indexed content so they exist during the run; restore
+    // deletes them.
     for path in staged_absent {
         let bpath = path.as_bytes().as_bstr();
         let Some(entry) = index.entry_by_path_and_stage(bpath, Stage::Unconflicted) else {
@@ -754,20 +755,20 @@ fn remove_stash_ref(repo: &Repository, oid: ObjectId) -> Result<(), Error> {
     Ok(())
 }
 
-/// A partially-staged file that the formatter changed.
+/// A partially-staged file that changed during the run.
 struct MergeBase {
     path: String,
-    /// Original staged content before formatting.
+    /// Original staged content before the run.
     base_oid: ObjectId,
-    /// Index content after formatting.
+    /// Index content after the run.
     after_oid: ObjectId,
 }
 
-/// Single-pass: detect formatter changes, update index OIDs in place, return merge bases.
+/// Single-pass: detect changes made during the run, update index OIDs in place, return merge bases.
 ///
-/// For each staged file: checks index stat first (skip if reliably clean), then streams
-/// to ODB. If the OID changed, updates the entry in place. If also partially staged,
-/// records a `MergeBase`. Writes the index once at the end.
+/// For each staged file: checks index stat first (skip if reliably clean), then streams to ODB. If
+/// the OID changed, updates the entry in place. If also partially staged, records a `MergeBase`.
+/// Writes the index once at the end.
 fn update(
     repo: &Repository,
     workdir: &Path,
@@ -840,7 +841,7 @@ fn update(
     Ok(merge_bases)
 }
 
-/// Apply the captured formatting to the restored working tree via three-way merge.
+/// Apply the captured changes to the restored working tree via three-way merge.
 fn apply_merges(
     repo: &Repository,
     workdir: &Path,
@@ -863,9 +864,9 @@ fn apply_merges(
         if file_size > threshold {
             if !quiet {
                 eprintln!(
-                    "stagelint: warning: could not apply formatting to working tree for \
-                     {}: file exceeds core.bigFileThreshold - staged content is \
-                     formatted, working tree unchanged",
+                    "stagelint: warning: could not apply changes to working tree for {}: file \
+                     exceeds core.bigFileThreshold - staged content is updated, working tree \
+                     unchanged",
                     mb.path
                 );
             }
@@ -892,7 +893,7 @@ fn apply_merges(
             Err(merge::Error::AutoResolved) => {
                 if !quiet {
                     eprintln!(
-                        "stagelint: warning: could not apply all formatting changes to {}",
+                        "stagelint: warning: could not apply all changes to {}",
                         mb.path
                     );
                 }
@@ -917,7 +918,7 @@ fn big_file_threshold(repo: &Repository) -> u64 {
         .unwrap_or(512 * 1024 * 1024)
 }
 
-/// Revert tracked files that a formatter modified as a side-effect (not staged, but changed on disk).
+/// Revert tracked files modified as a side-effect during the run (not staged, but changed on disk).
 /// Skips any paths in `already_restored`.
 fn revert_clean_tracked(
     repo: &Repository,
@@ -936,8 +937,8 @@ fn revert_clean_tracked(
             continue;
         }
 
-        // Symlinks: indexed data is the target path, not file content. std::fs::read follows
-        // the symlink and would compare/overwrite the target file - skip them entirely.
+        // Symlinks: indexed data is the target path, not file content. std::fs::read follows the
+        // symlink and would compare/overwrite the target file - skip them entirely.
         if matches!(entry.mode, entry::Mode::SYMLINK | entry::Mode::COMMIT) {
             continue;
         }
@@ -979,8 +980,8 @@ fn revert_clean_tracked(
     Ok(())
 }
 
-/// Re-stat restored files and update their index entries so `git status`
-/// doesn't flag them as dirty after we overwrote them.
+/// Re-stat restored files and update their index entries so `git status` doesn't flag them as dirty
+/// after we overwrote them.
 fn refresh_stat(repo: &Repository, workdir: &Path, paths: &[String]) -> Result<(), Error> {
     if paths.is_empty() {
         return Ok(());
@@ -1015,9 +1016,9 @@ fn refresh_stat(repo: &Repository, workdir: &Path, paths: &[String]) -> Result<(
     Ok(())
 }
 
-/// Returns `true` when the on-disk stat matches `entry_stat` and can be
-/// trusted. Requires mtime to predate `index_write_secs` to guard against
-/// the racily-clean case on coarse-grained filesystems (HFS+ 1-second mtime).
+/// Returns `true` when the on-disk stat matches `entry_stat` and can be trusted. Requires mtime to
+/// predate `index_write_secs` to guard against the racily-clean case on coarse-grained filesystems
+/// (HFS+ 1-second mtime).
 fn stat_is_clean(path: &Path, entry_stat: &entry::Stat, index_write_secs: i64) -> bool {
     Metadata::from_path_no_follow(path)
         .ok()

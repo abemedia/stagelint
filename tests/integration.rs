@@ -1177,7 +1177,7 @@ fn default_stops_on_first_error() {
     );
 }
 
-/// `--continue-on-error`: all pipeline steps run despite a failure; exit code still non-zero.
+/// `--continue-on-error`: all commands run despite a failure; exit code still non-zero.
 #[test]
 fn continue_on_error_runs_all_on_failure() {
     let repo = TestRepo::new(&json!({

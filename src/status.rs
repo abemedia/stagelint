@@ -32,18 +32,18 @@ pub fn collect(repo: &gix::Repository, include_untracked: bool) -> Result<Worktr
     let platform = repo
         .status(gix::progress::Discard)
         .map_err(|e| Error::Status(Box::new(e)))?
-        // Enable index->worktree rename detection so that a file deleted from the worktree
-        // as part of a rename is reported as Rewrite rather than silently missing.
-        // Copies are explicitly disabled: a copy source still exists on disk, so there
-        // is nothing to hide or restore, and content-similarity matching could
-        // misclassify a new untracked file as a copy of a tracked one.
+        // Enable index->worktree rename detection so that a file deleted from the worktree as part
+        // of a rename is reported as Rewrite rather than silently missing. Copies are explicitly
+        // disabled: a copy source still exists on disk, so there is nothing to hide or restore, and
+        // content-similarity matching could misclassify a new untracked file as a copy of a tracked
+        // one.
         .index_worktree_rewrites(gix::diff::Rewrites {
             copies: None,
             ..Default::default()
         })
-        // Always walk the directory tree - rename detection requires finding destination
-        // files on disk. The `include_untracked` flag controls whether we populate the
-        // `untracked` set, not whether we do the walk.
+        // Always walk the directory tree - rename detection requires finding destination files on
+        // disk. The `include_untracked` flag controls whether we populate the `untracked` set, not
+        // whether we do the walk.
         .untracked_files(status::UntrackedFiles::Files);
 
     let iter = platform
@@ -107,18 +107,18 @@ pub fn collect(repo: &gix::Repository, include_untracked: bool) -> Result<Worktr
                         "copy detection is disabled; copy should never be true"
                     );
 
-                    // Source path is gone from the worktree. Record it so the formatter
-                    // receives indexed content and the restore step deletes it afterward.
+                    // Source path is gone from the worktree. Record it so the run receives indexed
+                    // content and the restore step deletes it afterward.
                     let src = source
                         .rela_path()
                         .to_str()
                         .map_err(|_| Error::NonUtf8Path)?;
                     missing.insert(src.to_owned());
 
-                    // gix consumes the destination into the Rewrite item rather than
-                    // emitting it as DirectoryContents, so capture it here when
-                    // include_untracked is set (i.e. --stash untracked/all) so it gets
-                    // hidden during linting like any other untracked file.
+                    // gix consumes the destination into the Rewrite item rather than emitting it as
+                    // DirectoryContents, so capture it here when include_untracked is set (i.e.
+                    // --stash untracked/all) so it gets hidden during the run like any other
+                    // untracked file.
                     if include_untracked {
                         let dst = dirwalk_entry
                             .rela_path

@@ -13,6 +13,7 @@ pub struct Commands(Vec<CommandObject>);
 
 impl std::ops::Deref for Commands {
     type Target = [CommandObject];
+
     fn deref(&self) -> &[CommandObject] {
         &self.0
     }

@@ -27,7 +27,7 @@ pub enum Commands {
 /// Run linters and formatters on staged git files.
 #[derive(Args)]
 pub struct Opts {
-    /// Continue running all linters even if one fails, then report all errors together.
+    /// Run all tasks to completion even if one fails, then report all errors together.
     #[arg(long)]
     pub continue_on_error: bool,
 

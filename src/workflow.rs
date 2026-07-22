@@ -398,12 +398,12 @@ fn create_stash_commit(
             .is_some()
         {
             editor.remove(path.as_str()).map_err(Error::TreeEdit)?;
-        } else if let Some(entry) =
-            index.entry_by_path_and_stage(path.as_bytes().as_bstr(), Stage::Unconflicted)
-            && let Some(mode) = entry.mode.to_tree_entry_mode()
+        } else if let Some((id, kind)) = index
+            .entry_by_path_and_stage(path.as_bytes().as_bstr(), Stage::Unconflicted)
+            .and_then(|e| e.mode.to_tree_entry_mode().map(|m| (e.id, m.kind())))
         {
             editor
-                .upsert(path.as_str(), mode.kind(), entry.id)
+                .upsert(path.as_str(), kind, id)
                 .map_err(Error::TreeEdit)?;
         }
     }

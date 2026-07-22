@@ -16,6 +16,8 @@ pub enum Error {
     },
     #[error("empty command")]
     Empty,
+    #[error("failed to create async runtime")]
+    Runtime(#[source] io::Error),
     #[error("{0} task(s) failed")]
     TasksFailed(usize),
     #[error("cancelled")]
@@ -75,7 +77,7 @@ impl Runner {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("failed to create tokio runtime")
+            .map_err(Error::Runtime)?
             .block_on(self.run_async())
     }
 

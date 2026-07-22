@@ -1,19 +1,25 @@
+// The gix errors in `Error` push `Result` sizes past the lint threshold; a CLI never feels it.
+#![allow(clippy::result_large_err)]
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use gix::bstr::ByteSlice;
+use gix::filter::plumbing::driver::apply::Delay;
 use gix::index::entry::{self, Stage};
 use gix::index::{fs::Metadata, write};
 use gix::lock::acquire::Fail;
+use gix::merge::blob::builtin_driver::text::Labels;
+use gix::merge::blob::platform::builtin_merge::Pick;
+use gix::merge::blob::{Resolution, ResourceKind, pipeline::WorktreeRoots};
 use gix::objs::Commit;
 use gix::objs::tree::{EntryKind, EntryMode};
 use gix::refs::Target;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::{Id, ObjectId, Repository};
 
-use crate::merge;
 use crate::status::WorktreeStatus;
 
 #[derive(Debug, thiserror::Error)]
@@ -38,8 +44,8 @@ pub enum Error {
     IndexWrite(#[source] gix::index::file::write::Error),
     #[error("failed to read object")]
     ObjectFind(#[source] gix::object::find::existing::Error),
-    #[error("failed to diff trees")]
-    TreeDiff(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("failed to traverse tree")]
+    TreeTraverse(#[source] gix::traverse::tree::breadthfirst::Error),
     #[error("non-utf8 path in tree")]
     NonUtf8Path,
     #[error("could not determine committer identity; set user.name and user.email in git config")]
@@ -80,11 +86,31 @@ pub enum Error {
         #[source]
         source: gix::object::find::existing::Error,
     },
-    #[error("failed to merge {path}")]
-    Merge {
+    #[error("failed to create the merge resource cache")]
+    MergeResourceCache(#[source] gix::repository::merge_resource_cache::Error),
+    #[error("failed to load merge options")]
+    BlobMergeOptions(#[source] gix::repository::blob_merge_options::Error),
+    #[error("failed to load the command context")]
+    CommandContext(#[source] gix::config::command_context::Error),
+    #[error("failed to create the filter pipeline")]
+    FilterPipeline(#[source] gix::repository::filter::pipeline::Error),
+    #[error("failed to set merge resource for {path}")]
+    MergeResource {
         path: String,
         #[source]
-        source: merge::Error,
+        source: gix::merge::blob::platform::set_resource::Error,
+    },
+    #[error("failed to prepare merge for {path}")]
+    MergePrepare {
+        path: String,
+        #[source]
+        source: gix::merge::blob::platform::prepare_merge::Error,
+    },
+    #[error("failed to convert merge result for {path}")]
+    ConvertToWorktree {
+        path: String,
+        #[source]
+        source: gix::filter::pipeline::convert_to_worktree::Error,
     },
 }
 
@@ -665,7 +691,7 @@ fn restore_untracked_files(
         .traverse()
         .breadthfirst
         .files()
-        .map_err(|e| Error::TreeDiff(Box::new(e)))?
+        .map_err(Error::TreeTraverse)?
     {
         if entry.mode.is_tree() {
             continue;
@@ -842,14 +868,34 @@ fn update(
 }
 
 /// Apply the captured changes to the restored working tree via three-way merge.
+///
+/// Merging honors gitattributes, including merge drivers and binary detection. Changes reach
+/// the worktree only when the merge is clean; otherwise the file is left untouched and only
+/// the commit carries the new content.
 fn apply_merges(
     repo: &Repository,
     workdir: &Path,
     quiet: bool,
     merge_bases: &[MergeBase],
 ) -> Result<(), Error> {
-    let threshold = big_file_threshold(repo);
+    if merge_bases.is_empty() {
+        return Ok(());
+    }
 
+    let threshold = big_file_threshold(repo);
+    let roots = WorktreeRoots {
+        current_root: Some(workdir.to_path_buf()),
+        ..Default::default()
+    };
+    let mut platform = repo
+        .merge_resource_cache(roots)
+        .map_err(Error::MergeResourceCache)?;
+    let options = repo.blob_merge_options().map_err(Error::BlobMergeOptions)?;
+    let context = repo.command_context().map_err(Error::CommandContext)?;
+    let (mut filter, _index) = repo.filter_pipeline(None).map_err(Error::FilterPipeline)?;
+
+    let null = ObjectId::null(repo.object_hash());
+    let mut out = Vec::new();
     for mb in merge_bases {
         let file_path = workdir.join(&mb.path);
         // Only merge regular files; anything else would read and write through symlinks.
@@ -873,40 +919,98 @@ fn apply_merges(
             continue;
         }
 
-        let base = repo.find_object(mb.base_oid).map_err(|e| Error::BlobRead {
-            path: mb.path.clone(),
-            source: e,
-        })?;
-        let after = repo
-            .find_object(mb.after_oid)
-            .map_err(|e| Error::BlobRead {
+        let rela = mb.path.as_bytes().as_bstr();
+        let sides = [
+            (null, ResourceKind::CurrentOrOurs),
+            (mb.base_oid, ResourceKind::CommonAncestorOrBase),
+            (mb.after_oid, ResourceKind::OtherOrTheirs),
+        ];
+        for (id, kind) in sides {
+            platform
+                .set_resource(id, EntryKind::Blob, rela, kind, &repo.objects)
+                .map_err(|e| Error::MergeResource {
+                    path: mb.path.clone(),
+                    source: e,
+                })?;
+        }
+        let prepared = platform
+            .prepare_merge(&repo.objects, options)
+            .map_err(|e| Error::MergePrepare {
                 path: mb.path.clone(),
                 source: e,
             })?;
-        let working = fs::read(&file_path).map_err(|e| Error::FileRead {
-            path: file_path.clone(),
-            source: e,
-        })?;
 
-        match merge::three_way_merge(workdir, &mb.path, &working, &base.data, &after.data) {
-            Ok(()) => {}
-            Err(merge::Error::AutoResolved) => {
+        out.clear();
+        // A failing merge driver counts as a conflict, matching git.
+        let (pick, resolution) = match prepared.merge(&mut out, Labels::default(), &context) {
+            Ok(result) => result,
+            Err(e) => {
                 if !quiet {
                     eprintln!(
-                        "stagelint: warning: could not apply all changes to {}",
+                        "stagelint: warning: could not apply all changes to {}: {:#}",
+                        mb.path,
+                        anyhow::Error::new(e)
+                    );
+                }
+                continue;
+            }
+        };
+        if resolution != Resolution::Complete {
+            if !quiet {
+                eprintln!(
+                    "stagelint: warning: could not apply changes to {}: they conflict with unstaged changes",
+                    mb.path
+                );
+            }
+            continue;
+        }
+        // Ours means the worktree file already holds the result.
+        if matches!(pick, Pick::Ours) {
+            continue;
+        }
+        let merged = match prepared.buffer_by_pick(pick) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => out.as_slice(),
+            Err(()) => {
+                if !quiet {
+                    eprintln!(
+                        "stagelint: warning: could not apply changes to {}: merge result unavailable",
                         mb.path
                     );
                 }
+                continue;
             }
-            Err(e) => {
-                return Err(Error::Merge {
-                    path: mb.path.clone(),
-                    source: e,
-                });
-            }
-        }
+        };
+
+        write_merged(&mut filter, merged, rela, &file_path)?;
     }
 
+    Ok(())
+}
+
+/// Convert a merge result from git form back to worktree form and write it.
+fn write_merged(
+    filter: &mut gix::filter::Pipeline<'_>,
+    merged: &[u8],
+    rela_path: &gix::bstr::BStr,
+    file_path: &Path,
+) -> Result<(), Error> {
+    let mut converted = filter
+        .convert_to_worktree(merged, rela_path, Delay::Forbid)
+        .map_err(|e| Error::ConvertToWorktree {
+            path: rela_path.to_string(),
+            source: e,
+        })?;
+    let write_err = |e: std::io::Error| Error::FileWrite {
+        path: file_path.to_path_buf(),
+        source: e,
+    };
+    if let Some(bytes) = converted.as_bytes() {
+        fs::write(file_path, bytes).map_err(write_err)?;
+    } else if let Some(read) = converted.as_read() {
+        let mut file = fs::File::create(file_path).map_err(write_err)?;
+        std::io::copy(read, &mut file).map_err(write_err)?;
+    }
     Ok(())
 }
 

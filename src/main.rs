@@ -1,6 +1,5 @@
 mod cli;
 mod config;
-mod merge;
 mod runner;
 mod status;
 mod workflow;

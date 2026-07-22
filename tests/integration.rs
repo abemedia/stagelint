@@ -201,6 +201,8 @@ fn fails_outside_git_repo() {
             "GIT_CONFIG_GLOBAL",
             non_git_dir.path().join("no-global-config"),
         )
+        // Discovery must not escape the temp dir and find an enclosing repository.
+        .env("GIT_CEILING_DIRECTORIES", non_git_dir.path())
         .output()
         .expect("run stagelint");
 
@@ -893,6 +895,187 @@ fn partial_stage_conflict_workdir_wins() {
 
     assert_eq!(repo.git(&["show", ":file.txt"]), "REPLACED\nline2\n");
     assert_eq!(repo.read_file("file.txt"), "modified_line1\nline2\n");
+}
+
+/// On conflict, the whole file is left untouched: no partial changes are applied.
+#[test]
+fn partial_stage_conflict_skips_whole_file() {
+    let repo = TestRepo::new(&json!({
+        "*.txt": "sh -c 'for f in \"$@\"; do sed -e s/line1/ONE/ -e s/line9/NINE/ \"$f\" > \"$f.t\" && mv \"$f.t\" \"$f\"; done' _"
+    }));
+
+    let base = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\n";
+    repo.write_file("file.txt", base);
+    repo.git(&["add", "file.txt"]);
+    // The working tree edit conflicts with the line1 hunk but not the line9 hunk.
+    let working = base.replace("line1", "edited_line1");
+    repo.write_file("file.txt", &working);
+
+    let output = assert_success(repo.stagelint(&[]));
+
+    assert_eq!(
+        repo.read_file("file.txt"),
+        working,
+        "a conflicted file must not receive partial changes"
+    );
+    assert!(repo.git(&["show", ":file.txt"]).contains("NINE"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("conflict"),
+        "the skipped file should be warned about"
+    );
+}
+
+/// A `merge=binary` gitattribute prevents text-merging changes into the working tree.
+#[test]
+fn merge_binary_attribute_skips_worktree_merge() {
+    let repo = TestRepo::new(&json!({"*.bin": replace("v1", "v2")}));
+
+    repo.write_file(".gitattributes", "*.bin merge=binary\n");
+    repo.git(&["add", ".gitattributes"]);
+    repo.git(&["commit", "-m", "attrs"]);
+
+    repo.write_file("data.bin", "v1\npayload\n");
+    repo.git(&["add", "data.bin"]);
+    // Non-conflicting worktree edit: a text merge would apply cleanly.
+    repo.write_file("data.bin", "v1\npayload\nextra\n");
+
+    assert_success(repo.stagelint(&[]));
+
+    assert_eq!(repo.git(&["show", ":data.bin"]), "v2\npayload\n");
+    assert_eq!(
+        repo.read_file("data.bin"),
+        "v1\npayload\nextra\n",
+        "merge=binary files must not be text-merged into the worktree"
+    );
+}
+
+/// Binary content is never text-merged, even without a gitattribute.
+#[test]
+fn binary_content_skips_worktree_merge() {
+    let repo = TestRepo::new(&json!({"*.dat": replace("v1", "v2")}));
+
+    let base = b"BIN\x00\nv1\nl3\n";
+    fs::write(repo.root.join("data.dat"), base).expect("write binary");
+    repo.git(&["add", "data.dat"]);
+    let working = b"BIN\x00\nv1\nl3x\n";
+    fs::write(repo.root.join("data.dat"), working).expect("write binary");
+
+    assert_success(repo.stagelint(&[]));
+
+    assert_eq!(
+        fs::read(repo.root.join("data.dat")).expect("read binary"),
+        working,
+        "binary files must not be text-merged into the worktree"
+    );
+    let indexed = repo.git_cmd(&["show", ":data.dat"]);
+    assert!(indexed.status.success());
+    assert!(
+        indexed.stdout.windows(2).any(|w| w == b"v2"),
+        "the staged content should still be formatted"
+    );
+}
+
+/// An `eol=crlf` attribute: the merge result is written in worktree form, not git form.
+#[test]
+fn partial_stage_merge_respects_eol_attribute() {
+    let repo = TestRepo::new(&json!({"*.txt": replace("line2", "FORMATTED")}));
+
+    repo.write_file(".gitattributes", "*.txt text eol=crlf\n");
+    repo.git(&["add", ".gitattributes"]);
+    repo.git(&["commit", "-m", "attrs"]);
+
+    // The index stores LF (clean filter); the worktree keeps CRLF.
+    repo.write_file("file.txt", "line1\r\nline2\r\nline3\r\n");
+    repo.git(&["add", "file.txt"]);
+    repo.write_file("file.txt", "line1\r\nline2\r\nline3\r\nextra\r\n");
+
+    assert_success(repo.stagelint(&[]));
+
+    assert_eq!(
+        repo.git(&["show", ":file.txt"]),
+        "line1\nFORMATTED\nline3\n"
+    );
+    assert_eq!(
+        repo.read_file("file.txt"),
+        "line1\r\nFORMATTED\r\nline3\r\nextra\r\n",
+        "the merge-back must write CRLF"
+    );
+}
+
+/// An external smudge filter converts the merge result to worktree form.
+#[test]
+fn partial_stage_merge_applies_smudge_filter() {
+    let repo = TestRepo::new(&json!({"*.txt": replace("line2", "FORMATTED")}));
+
+    repo.write_file(".gitattributes", "*.txt filter=case\n");
+    repo.git(&["add", ".gitattributes"]);
+    repo.git(&["config", "filter.case.clean", "tr A-Z a-z"]);
+    repo.git(&["config", "filter.case.smudge", "tr a-z A-Z"]);
+    repo.git(&["commit", "-m", "attrs"]);
+
+    // Git form is lowercase, worktree form uppercase.
+    repo.write_file("file.txt", "line1\nline2\nline3\n");
+    repo.git(&["add", "file.txt"]);
+    repo.write_file("file.txt", "LINE1\nLINE2\nLINE3\nEXTRA\n");
+
+    assert_success(repo.stagelint(&[]));
+
+    assert_eq!(
+        repo.git(&["show", ":file.txt"]),
+        "line1\nFORMATTED\nline3\n"
+    );
+    assert_eq!(
+        repo.read_file("file.txt"),
+        "LINE1\nFORMATTED\nLINE3\nEXTRA\n",
+        "the merge-back must pass through the smudge filter"
+    );
+}
+
+/// A failing merge driver counts as a conflict: warn and leave the worktree untouched.
+#[test]
+fn merge_driver_failure_warns_and_skips() {
+    let repo = TestRepo::new(&json!({"*.txt": replace("line2", "FORMATTED")}));
+
+    repo.write_file(".gitattributes", "*.txt merge=broken\n");
+    repo.git(&["add", ".gitattributes"]);
+    repo.git(&["config", "merge.broken.driver", "false"]);
+    repo.git(&["commit", "-m", "attrs"]);
+
+    repo.write_file("file.txt", "line1\nline2\nline3\n");
+    repo.git(&["add", "file.txt"]);
+    repo.write_file("file.txt", "line1\nline2\nline3\nextra\n");
+
+    let output = assert_success(repo.stagelint(&[]));
+
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("could not apply all changes"),
+        "driver failure should be warned about, got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.read_file("file.txt"), "line1\nline2\nline3\nextra\n");
+    assert_eq!(
+        repo.git(&["show", ":file.txt"]),
+        "line1\nFORMATTED\nline3\n"
+    );
+}
+
+/// `--quiet` suppresses merge warnings.
+#[test]
+fn quiet_suppresses_merge_warnings() {
+    let repo = TestRepo::new(&json!({"*.txt": replace("line1", "REPLACED")}));
+
+    repo.write_file("file.txt", "line1\nline2\n");
+    repo.git(&["add", "file.txt"]);
+    // Conflicts with the linter's replacement: warns without --quiet.
+    repo.write_file("file.txt", "modified_line1\nline2\n");
+
+    let output = assert_success(repo.stagelint(&["--quiet"]));
+
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("warning"),
+        "--quiet must suppress warnings, got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 // Mid-merge

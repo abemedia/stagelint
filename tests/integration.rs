@@ -107,7 +107,7 @@ fn unstaged_file_changes_not_indexed() {
     );
 }
 
-/// A linter that deletes the file it was given: stagelint must not panic or crash.
+/// A linter that deletes the file it was given: the deletion is staged, as `git add` would.
 #[test]
 fn linter_deletes_staged_file() {
     let repo = TestRepo::new(&json!({"*.txt": "sh -c 'rm \"$@\"' _"}));
@@ -115,11 +115,139 @@ fn linter_deletes_staged_file() {
     repo.write_file("doomed.txt", "goodbye\n");
     repo.git(&["add", "doomed.txt"]);
 
-    let output = repo.stagelint(&[]).wait_with_output().expect("wait");
+    assert_success(repo.stagelint(&[]));
+
+    let show = repo.git_cmd(&["show", ":doomed.txt"]);
     assert!(
-        !String::from_utf8_lossy(&output.stderr).contains("panicked"),
-        "stagelint panicked: {}",
-        String::from_utf8_lossy(&output.stderr)
+        !show.status.success(),
+        "the deletion should be staged, not the stale blob"
+    );
+    assert!(!repo.root.join("doomed.txt").exists());
+}
+
+/// A staged file deleted by the linter stays deleted under `--stash tracked`.
+#[test]
+fn linter_deleted_staged_file_not_resurrected() {
+    let repo = TestRepo::new(&json!({"*.txt": "sh -c 'rm \"$@\"' _"}));
+
+    repo.write_file("victim.txt", "v1\n");
+    repo.git(&["add", "victim.txt"]);
+    repo.git(&["commit", "-m", "add victim"]);
+    repo.write_file("victim.txt", "v2\n");
+    repo.git(&["add", "victim.txt"]);
+
+    assert_success(repo.stagelint(&["--stash", "tracked"]));
+
+    let show = repo.git_cmd(&["show", ":victim.txt"]);
+    assert!(!show.status.success(), "the deletion should be staged");
+    assert!(
+        !repo.root.join("victim.txt").exists(),
+        "the deleted file must not be resurrected"
+    );
+}
+
+/// A partially staged file deleted by the linter: deletion staged, unstaged content preserved.
+#[test]
+fn linter_deleted_partial_stage_preserves_dirty() {
+    let repo = TestRepo::new(&json!({"*.txt": "sh -c 'rm \"$@\"' _"}));
+
+    repo.write_file("file.txt", "staged\n");
+    repo.git(&["add", "file.txt"]);
+    repo.write_file("file.txt", "staged\nunstaged\n");
+
+    assert_success(repo.stagelint(&[]));
+
+    let show = repo.git_cmd(&["show", ":file.txt"]);
+    assert!(!show.status.success(), "the deletion should be staged");
+    assert_eq!(
+        repo.read_file("file.txt"),
+        "staged\nunstaged\n",
+        "unstaged content must be restored from the stash"
+    );
+}
+
+/// A linter that rewrites a file and sets its executable bit: both are staged, as `git add` would.
+#[cfg(unix)]
+#[test]
+fn linter_mode_and_content_change_staged() {
+    let repo = TestRepo::new(&json!({
+        "*.sh": "sh -c 'for f in \"$@\"; do tr a-z A-Z < \"$f\" > \"$f.t\" && mv \"$f.t\" \"$f\" && chmod +x \"$f\"; done' _"
+    }));
+
+    repo.write_file("run.sh", "echo hi\n");
+    repo.git(&["add", "run.sh"]);
+
+    assert_success(repo.stagelint(&[]));
+
+    let ls = repo.git(&["ls-files", "-s", "run.sh"]);
+    assert!(
+        ls.starts_with("100755"),
+        "the executable bit should be staged, got: {ls}"
+    );
+    assert_eq!(repo.git(&["show", ":run.sh"]), "ECHO HI\n");
+}
+
+/// A linter that only flips the executable bit: the mode change is staged, as `git add` would.
+#[cfg(unix)]
+#[test]
+fn linter_mode_only_change_staged() {
+    let repo = TestRepo::new(&json!({"*.sh": "sh -c 'chmod +x \"$@\"' _"}));
+
+    repo.write_file("run.sh", "echo hi\n");
+    repo.git(&["add", "run.sh"]);
+
+    assert_success(repo.stagelint(&[]));
+
+    let ls = repo.git(&["ls-files", "-s", "run.sh"]);
+    assert!(
+        ls.starts_with("100755"),
+        "the executable bit should be staged, got: {ls}"
+    );
+}
+
+/// A chmod-only change is staged even when `core.trustctime=false` makes the stat look clean.
+#[cfg(unix)]
+#[test]
+fn trustctime_disabled_stages_mode_only_change() {
+    let repo = TestRepo::new(&json!({"*.sh": "sh -c 'chmod +x \"$@\"' _"}));
+    repo.git(&["config", "core.trustctime", "false"]);
+
+    repo.write_file("run.sh", "echo hi\n");
+    // Backdate mtime so the entry is not racy and the stat shortcut is actually taken.
+    let past = std::time::SystemTime::now() - Duration::from_secs(10);
+    fs::File::options()
+        .write(true)
+        .open(repo.root.join("run.sh"))
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+    repo.git(&["add", "run.sh"]);
+
+    assert_success(repo.stagelint(&[]));
+
+    let ls = repo.git(&["ls-files", "-s", "run.sh"]);
+    assert!(
+        ls.starts_with("100755"),
+        "the executable bit should be staged, got: {ls}"
+    );
+}
+
+/// With `core.fileMode=false`, executable-bit changes are not staged, as `git add` would.
+#[cfg(unix)]
+#[test]
+fn filemode_disabled_ignores_mode_change() {
+    let repo = TestRepo::new(&json!({"*.sh": "sh -c 'chmod +x \"$@\"' _"}));
+    repo.git(&["config", "core.fileMode", "false"]);
+
+    repo.write_file("run.sh", "echo hi\n");
+    repo.git(&["add", "run.sh"]);
+
+    assert_success(repo.stagelint(&[]));
+
+    let ls = repo.git(&["ls-files", "-s", "run.sh"]);
+    assert!(
+        ls.starts_with("100644"),
+        "the mode must stay 100644 with core.fileMode=false, got: {ls}"
     );
 }
 
@@ -419,6 +547,35 @@ fn stash_tracked_noop_when_clean() {
         stash_list.is_empty(),
         "no stash entries should exist, got: {stash_list}"
     );
+}
+
+/// Sparse-checkout entries are absent on purpose and must not be materialized.
+#[test]
+fn sparse_checkout_files_not_materialized() {
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+
+    repo.write_file("keep.txt", "hello\n");
+    repo.write_file("excluded/gone.txt", "sparse\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "add files"]);
+
+    // Cone mode with no directories keeps only root files on disk.
+    repo.git(&["sparse-checkout", "set"]);
+    assert!(
+        !repo.root.join("excluded/gone.txt").exists(),
+        "sparse-checkout setup should remove the excluded file"
+    );
+
+    repo.write_file("keep.txt", "updated\n");
+    repo.git(&["add", "keep.txt"]);
+
+    assert_success(repo.stagelint(&["--stash", "tracked"]));
+
+    assert!(
+        !repo.root.join("excluded/gone.txt").exists(),
+        "sparse-excluded files must not be materialized"
+    );
+    assert!(!repo.git(&["ls-files", "excluded/gone.txt"]).is_empty());
 }
 
 /// `--stash tracked` restores clean files the linter touched, leaving only the partial file dirty.
@@ -1005,7 +1162,7 @@ fn partial_stage_merge_respects_eol_attribute() {
 /// An external smudge filter converts the merge result to worktree form.
 #[test]
 fn partial_stage_merge_applies_smudge_filter() {
-    let repo = TestRepo::new(&json!({"*.txt": replace("line2", "FORMATTED")}));
+    let repo = TestRepo::new(&json!({"*.txt": replace("LINE2", "FORMATTED")}));
 
     repo.write_file(".gitattributes", "*.txt filter=case\n");
     repo.git(&["add", ".gitattributes"]);
@@ -1013,7 +1170,7 @@ fn partial_stage_merge_applies_smudge_filter() {
     repo.git(&["config", "filter.case.smudge", "tr a-z A-Z"]);
     repo.git(&["commit", "-m", "attrs"]);
 
-    // Git form is lowercase, worktree form uppercase.
+    // Git form is lowercase, worktree form uppercase; the linter sees worktree form.
     repo.write_file("file.txt", "line1\nline2\nline3\n");
     repo.git(&["add", "file.txt"]);
     repo.write_file("file.txt", "LINE1\nLINE2\nLINE3\nEXTRA\n");
@@ -1022,12 +1179,128 @@ fn partial_stage_merge_applies_smudge_filter() {
 
     assert_eq!(
         repo.git(&["show", ":file.txt"]),
-        "line1\nFORMATTED\nline3\n"
+        "line1\nformatted\nline3\n",
+        "staged content must be clean-filtered to git form"
     );
     assert_eq!(
         repo.read_file("file.txt"),
         "LINE1\nFORMATTED\nLINE3\nEXTRA\n",
         "the merge-back must pass through the smudge filter"
+    );
+}
+
+/// The linter's output is clean-filtered when staged, exactly as `git add` would.
+#[test]
+fn linter_output_is_clean_filtered() {
+    let repo = TestRepo::new(&json!({"*.txt": replace("hello", "HELLO")}));
+
+    // Worktree form carries a "W:" line prefix; git form has it stripped.
+    repo.write_file(".gitattributes", "*.txt filter=wrap\n");
+    repo.git(&["config", "filter.wrap.clean", "sed s/^W://"]);
+    repo.git(&["config", "filter.wrap.smudge", "sed s/^/W:/"]);
+    repo.git(&["add", ".gitattributes"]);
+    repo.git(&["commit", "-m", "attrs"]);
+
+    repo.write_file("file.txt", "W:hello\n");
+    repo.git(&["add", "file.txt"]);
+
+    assert_success(repo.stagelint(&[]));
+
+    assert_eq!(
+        repo.git(&["show", ":file.txt"]),
+        "HELLO\n",
+        "staged content must be in git form"
+    );
+    assert_eq!(repo.read_file("file.txt"), "W:HELLO\n");
+}
+
+/// During the run, hidden files hold smudged (worktree-form) staged content.
+#[test]
+fn run_sees_worktree_form_content() {
+    let repo = TestRepo::new(&json!({
+        "*.txt": {"command": "sh -c 'cat file.txt > seen.txt'", "pass_filenames": false}
+    }));
+
+    repo.write_file(".gitattributes", "*.txt filter=wrap\n");
+    repo.git(&["config", "filter.wrap.clean", "sed s/^W://"]);
+    repo.git(&["config", "filter.wrap.smudge", "sed s/^/W:/"]);
+    repo.git(&["add", ".gitattributes"]);
+    repo.git(&["commit", "-m", "attrs"]);
+
+    repo.write_file("file.txt", "W:one\n");
+    repo.git(&["add", "file.txt"]);
+    repo.write_file("file.txt", "W:one\nW:two\n");
+
+    assert_success(repo.stagelint(&[]));
+
+    assert_eq!(
+        repo.read_file("seen.txt"),
+        "W:one\n",
+        "the linter must see worktree-form content"
+    );
+    assert_eq!(repo.read_file("file.txt"), "W:one\nW:two\n");
+}
+
+/// The stash stores git-form blobs so `git stash pop` recovery smudges them correctly.
+#[test]
+fn crash_stash_holds_git_form_content() {
+    let repo = TestRepo::new(&json!({"*.txt": sentinel(1)}));
+
+    repo.write_file(".gitattributes", "*.txt filter=wrap\n");
+    repo.git(&["config", "filter.wrap.clean", "sed s/^W://"]);
+    repo.git(&["config", "filter.wrap.smudge", "sed s/^/W:/"]);
+    repo.git(&["add", ".gitattributes"]);
+    repo.git(&["commit", "-m", "attrs"]);
+
+    repo.write_file("file.txt", "W:base\n");
+    repo.git(&["add", "file.txt"]);
+    repo.git(&["commit", "-m", "add file"]);
+    repo.write_file("file.txt", "W:dirty\n");
+
+    repo.write_file("staged.txt", "s\n");
+    repo.git(&["add", "staged.txt"]);
+
+    let mut child = repo.stagelint(&["--stash", "tracked"]);
+    assert!(repo.wait_sentinel(1, Duration::from_secs(10)));
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    repo.git(&["reset", "--hard", "HEAD"]);
+    repo.git(&["stash", "pop"]);
+
+    assert_eq!(
+        repo.read_file("file.txt"),
+        "W:dirty\n",
+        "recovery must smudge the stashed content exactly once"
+    );
+}
+
+/// The side-effect check compares in git form: a stat-stale filtered file is not rewritten.
+#[test]
+fn revert_keeps_worktree_form() {
+    let repo = TestRepo::new(&json!({
+        "*.txt": {"command": "sh -c 'touch keep.txt'", "pass_filenames": false}
+    }));
+
+    repo.write_file(".gitattributes", "*.txt filter=wrap\n");
+    repo.git(&["config", "filter.wrap.clean", "sed s/^W://"]);
+    repo.git(&["config", "filter.wrap.smudge", "sed s/^/W:/"]);
+    repo.git(&["add", ".gitattributes"]);
+    repo.git(&["commit", "-m", "attrs"]);
+
+    repo.write_file("keep.txt", "W:keep\n");
+    repo.git(&["add", "keep.txt"]);
+    repo.git(&["commit", "-m", "add keep"]);
+
+    repo.write_file("staged.txt", "s\n");
+    repo.git(&["add", "staged.txt"]);
+
+    assert_success(repo.stagelint(&["--stash", "tracked"]));
+
+    assert_eq!(
+        repo.read_file("keep.txt"),
+        "W:keep\n",
+        "a clean filtered file must not be rewritten to git form"
     );
 }
 
@@ -1438,6 +1711,57 @@ fn concurrent_failure_cancels_running_tasks() {
     assert_failure(child);
 }
 
+/// Two tasks failing concurrently are both reported: the failure racing the cancellation must
+/// not lose its output or its error.
+#[test]
+fn concurrent_failures_all_reported() {
+    // Each task prints, signals readiness, waits for the other, then fails: both failures are in
+    // flight before either completion is processed.
+    let repo = TestRepo::new(&json!({
+        "*.md": "sh -c 'echo MD-ERROR; touch .git/linter-1; while [ ! -f .git/linter-2 ]; do sleep 0.01; done; exit 1'",
+        "*.rs": "sh -c 'echo RS-ERROR; touch .git/linter-2; while [ ! -f .git/linter-1 ]; do sleep 0.01; done; exit 1'",
+    }));
+
+    repo.write_file("file.md", "hello\n");
+    repo.git(&["add", "file.md"]);
+    repo.write_file("file.rs", "hello\n");
+    repo.git(&["add", "file.rs"]);
+
+    let output = assert_failure(repo.stagelint(&["--concurrent", "2"]));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("MD-ERROR"),
+        "first failure output lost: {stdout}"
+    );
+    assert!(
+        stdout.contains("RS-ERROR"),
+        "second failure output lost: {stdout}"
+    );
+}
+
+/// `--continue-on-error`: a command that fails to spawn does not stop its pipeline.
+#[test]
+fn continue_on_error_runs_pipeline_after_spawn_failure() {
+    let repo = TestRepo::new(&json!({
+        "*.txt": ["cmd-that-does-not-exist-stagelint-test", "sh -c 'echo ran > marker.txt'"]
+    }));
+
+    repo.write_file("file.txt", "content\n");
+    repo.git(&["add", "file.txt"]);
+
+    let output = assert_failure(repo.stagelint(&["--continue-on-error"]));
+
+    assert!(
+        repo.root.join("marker.txt").exists(),
+        "the pipeline should continue past a spawn failure"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("failed to run"),
+        "the spawn failure should be reported"
+    );
+}
+
 /// A command that cannot be found returns a non-zero exit code.
 #[test]
 fn command_not_found_fails() {
@@ -1451,22 +1775,23 @@ fn command_not_found_fails() {
 
 // Config
 
-/// Glob matching: `*.txt` matches in subdirectories; `sub/*.md` only matches directly in `sub/`.
+/// Bare patterns match basenames at any depth; patterns with `/` do not cross directories.
 #[test]
 fn glob_pattern_matching() {
     let repo = TestRepo::new(&json!({
         "*.txt": UPPERCASE,
+        "cmd*.go": UPPERCASE,
         "sub/*.md": UPPERCASE,
     }));
 
     repo.write_file("root.txt", "hello\n");
-    repo.git(&["add", "root.txt"]);
     repo.write_file("sub/nested.txt", "world\n");
-    repo.git(&["add", "sub/nested.txt"]);
     repo.write_file("readme.md", "hello\n");
-    repo.git(&["add", "readme.md"]);
     repo.write_file("sub/notes.md", "hello\n");
-    repo.git(&["add", "sub/notes.md"]);
+    repo.write_file("sub/deep/notes.md", "hello\n");
+    repo.write_file("pkg/cmdfoo.go", "hello\n");
+    repo.write_file("cmdutil/main.go", "hello\n");
+    repo.git(&["add", "."]);
 
     assert_success(repo.stagelint(&[]));
 
@@ -1474,6 +1799,9 @@ fn glob_pattern_matching() {
     assert_eq!(repo.git(&["show", ":sub/nested.txt"]), "WORLD\n");
     assert_eq!(repo.git(&["show", ":readme.md"]), "hello\n");
     assert_eq!(repo.git(&["show", ":sub/notes.md"]), "HELLO\n");
+    assert_eq!(repo.git(&["show", ":sub/deep/notes.md"]), "hello\n",);
+    assert_eq!(repo.git(&["show", ":pkg/cmdfoo.go"]), "HELLO\n",);
+    assert_eq!(repo.git(&["show", ":cmdutil/main.go"]), "hello\n",);
 }
 
 /// Monorepo: each file uses the nearest config walking up to the root.

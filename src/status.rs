@@ -7,7 +7,7 @@ use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("non-utf8 path in index")]
+    #[error("non-UTF-8 path in index")]
     NonUtf8Path,
     #[error("failed to compute repository status")]
     Status(#[source] Box<dyn std::error::Error + Send + Sync>),
@@ -29,22 +29,28 @@ pub struct WorktreeStatus {
 ///
 /// Partially-staged files appear in both `staged` and `dirty`.
 pub fn collect(repo: &gix::Repository, include_untracked: bool) -> Result<WorktreeStatus, Error> {
+    // The directory walk and rename detection only serve the untracked set: a rename destination
+    // must be found on disk to be hidden, and its source is reported as Rewrite rather than
+    // silently missing. Copies are explicitly disabled: a copy source still exists on disk, so
+    // there is nothing to hide or restore, and content-similarity matching could misclassify a new
+    // untracked file as a copy of a tracked one. Without the walk, a rename source still surfaces
+    // as Removed and feeds `missing`.
+    let (rewrites, untracked_files) = if include_untracked {
+        (
+            Some(gix::diff::Rewrites {
+                copies: None,
+                ..Default::default()
+            }),
+            status::UntrackedFiles::Files,
+        )
+    } else {
+        (None, status::UntrackedFiles::None)
+    };
     let platform = repo
         .status(gix::progress::Discard)
         .map_err(|e| Error::Status(Box::new(e)))?
-        // Enable index->worktree rename detection so that a file deleted from the worktree as part
-        // of a rename is reported as Rewrite rather than silently missing. Copies are explicitly
-        // disabled: a copy source still exists on disk, so there is nothing to hide or restore, and
-        // content-similarity matching could misclassify a new untracked file as a copy of a tracked
-        // one.
-        .index_worktree_rewrites(gix::diff::Rewrites {
-            copies: None,
-            ..Default::default()
-        })
-        // Always walk the directory tree - rename detection requires finding destination files on
-        // disk. The `include_untracked` flag controls whether we populate the `untracked` set, not
-        // whether we do the walk.
-        .untracked_files(status::UntrackedFiles::Files);
+        .index_worktree_rewrites(rewrites)
+        .untracked_files(untracked_files);
 
     let iter = platform
         .into_iter(Vec::<gix::bstr::BString>::new())
@@ -98,15 +104,9 @@ pub fn collect(repo: &gix::Repository, include_untracked: bool) -> Result<Worktr
                 status::index_worktree::Item::Rewrite {
                     source,
                     dirwalk_entry,
-                    copy,
                     ..
                 } => {
-                    // copies: None above means this is always a rename.
-                    debug_assert!(
-                        !copy,
-                        "copy detection is disabled; copy should never be true"
-                    );
-
+                    // Copies are disabled, so a Rewrite is always a rename.
                     // Source path is gone from the worktree. Record it so the run receives indexed
                     // content and the restore step deletes it afterward.
                     let src = source

@@ -1,9 +1,9 @@
 // The gix errors in `Error` push `Result` sizes past the lint threshold; a CLI never feels it.
 #![allow(clippy::result_large_err)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use gix::bstr::ByteSlice;
@@ -39,16 +39,16 @@ pub enum Error {
     #[error("failed to delete stash ref")]
     RefDelete(#[source] gix::reference::edit::Error),
     #[error("failed to read index")]
-    IndexRead(#[source] gix::index::file::init::Error),
+    IndexRead(#[source] gix::worktree::open_index::Error),
     #[error("failed to write index")]
     IndexWrite(#[source] gix::index::file::write::Error),
     #[error("failed to read object")]
     ObjectFind(#[source] gix::object::find::existing::Error),
     #[error("failed to traverse tree")]
     TreeTraverse(#[source] gix::traverse::tree::breadthfirst::Error),
-    #[error("non-utf8 path in tree")]
+    #[error("non-UTF-8 path in tree")]
     NonUtf8Path,
-    #[error("could not determine committer identity; set user.name and user.email in git config")]
+    #[error("failed to determine committer identity; set user.name and user.email in git config")]
     NoIdentity,
     #[error("invalid committer time")]
     CommitterTime(#[source] gix::config::time::Error),
@@ -74,44 +74,56 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to write blob for {path}")]
-    BlobWrite {
-        path: String,
-        #[source]
-        source: gix::object::write::Error,
-    },
-    #[error("failed to read blob for {path}")]
+    #[error("failed to read {path}")]
     BlobRead {
         path: String,
         #[source]
         source: gix::object::find::existing::Error,
     },
-    #[error("failed to create the merge resource cache")]
+    #[error("failed to create merge resource cache")]
     MergeResourceCache(#[source] gix::repository::merge_resource_cache::Error),
     #[error("failed to load merge options")]
     BlobMergeOptions(#[source] gix::repository::blob_merge_options::Error),
-    #[error("failed to load the command context")]
+    #[error("failed to load command context")]
     CommandContext(#[source] gix::config::command_context::Error),
-    #[error("failed to create the filter pipeline")]
+    #[error("failed to create filter pipeline")]
     FilterPipeline(#[source] gix::repository::filter::pipeline::Error),
-    #[error("failed to set merge resource for {path}")]
+    #[error("failed to merge {path}")]
     MergeResource {
         path: String,
         #[source]
         source: gix::merge::blob::platform::set_resource::Error,
     },
-    #[error("failed to prepare merge for {path}")]
+    #[error("failed to merge {path}")]
     MergePrepare {
         path: String,
         #[source]
         source: gix::merge::blob::platform::prepare_merge::Error,
     },
-    #[error("failed to convert merge result for {path}")]
+    #[error("failed to convert {path} to worktree form")]
     ConvertToWorktree {
         path: String,
         #[source]
         source: gix::filter::pipeline::convert_to_worktree::Error,
     },
+    #[error("failed to capture {path}")]
+    Capture {
+        path: String,
+        #[source]
+        source: gix::filter::pipeline::worktree_file_to_object::Error,
+    },
+    #[error("failed to convert {path} to git form")]
+    ConvertToGit {
+        path: String,
+        #[source]
+        source: gix::filter::pipeline::convert_to_git::Error,
+    },
+    #[error("failed to load filesystem capabilities")]
+    FsCapabilities(#[source] gix::config::boolean::Error),
+    #[error("failed to load stat options")]
+    StatOptions(#[source] gix::config::stat_options::Error),
+    #[error("failed to read core.bigFileThreshold")]
+    BigFileThreshold(#[source] gix::config::unsigned_integer::Error),
 }
 
 /// Owns the git state around one run: stash the working changes so commands see only staged
@@ -131,6 +143,8 @@ pub struct Workflow<'a> {
     absent: Vec<String>,
     hidden: BTreeSet<String>, // dirty paths hidden from the run; all restore rewrites on success
     attempted: bool,          // restore() was called; prevents Drop from retrying on failure
+    filter: gix::filter::Pipeline<'a>,
+    filter_index: gix::worktree::IndexPersistedOrInMemory,
 }
 
 impl<'a> Workflow<'a> {
@@ -145,6 +159,9 @@ impl<'a> Workflow<'a> {
         stash_tracked: bool,
         stash_untracked: bool,
     ) -> Result<Self, Error> {
+        let (mut filter, filter_index) =
+            repo.filter_pipeline(None).map_err(Error::FilterPipeline)?;
+
         // Read working-tree content into the ODB before hiding overwrites it with the indexed
         // version. Every dirty file is captured so the stash snapshots the full worktree; only the
         // scope-selected subset is hidden from the run.
@@ -153,7 +170,7 @@ impl<'a> Workflow<'a> {
         let mut hidden: BTreeSet<String> = BTreeSet::new();
 
         for path in &status.dirty {
-            let (oid, mode) = read_blob(repo, workdir, path)?;
+            let (oid, mode) = hash_blob(&mut filter, &filter_index, workdir, path)?;
             captured.push(StashEntry {
                 path: path.clone(),
                 oid,
@@ -166,7 +183,7 @@ impl<'a> Workflow<'a> {
 
         if stash_untracked {
             for path in &status.untracked {
-                let (oid, mode) = read_blob(repo, workdir, path)?;
+                let (oid, mode) = hash_blob(&mut filter, &filter_index, workdir, path)?;
                 untracked_entries.push(StashEntry {
                     path: path.clone(),
                     oid,
@@ -194,10 +211,11 @@ impl<'a> Workflow<'a> {
                 &captured,
                 &untracked_entries,
                 &status.missing,
+                &filter_index,
             )?)
         };
 
-        let workflow = Self {
+        let mut workflow = Self {
             repo,
             workdir,
             status,
@@ -206,14 +224,18 @@ impl<'a> Workflow<'a> {
             absent,
             hidden,
             attempted: false,
+            filter,
+            filter_index,
         };
         if workflow.oid.is_some() {
-            hide_stashed_files(
+            checkout_index(
                 repo,
                 workdir,
                 &workflow.hidden,
                 &untracked_entries,
                 &workflow.absent,
+                &mut workflow.filter,
+                &workflow.filter_index,
             )?;
         }
         Ok(workflow)
@@ -222,36 +244,41 @@ impl<'a> Workflow<'a> {
     /// Finish the run: capture its output into the index, restore the working tree, apply the
     /// changes to it, and drop the backup stash.
     pub fn finish(&mut self, quiet: bool) -> Result<(), Error> {
-        let merge_bases = update(
+        let merge_bases = update_index(
             self.repo,
             self.workdir,
             &self.status.staged,
             &self.status.dirty,
+            &mut self.filter,
+            &self.filter_index,
         )?;
         self.restore(false)?;
-        apply_merges(self.repo, self.workdir, quiet, &merge_bases)?;
+        apply_merges(
+            self.repo,
+            self.workdir,
+            quiet,
+            &merge_bases,
+            &mut self.filter,
+        )?;
         self.cleanup()
     }
 
-    /// Restore the working tree, revert side-effects on clean tracked files, and refresh index
-    /// stats so restored files don't appear dirty.
+    /// Restore the working tree and revert side-effects on clean tracked files.
     ///
-    /// If stash restore fails, subsequent steps are skipped (they depend on knowing which files
-    /// were restored). The stash ref is left intact for `git stash pop` recovery.
+    /// If the stash apply fails, subsequent steps are skipped and the stash ref is left intact
+    /// for `git stash pop` recovery.
     fn restore(&mut self, rollback: bool) -> Result<(), Error> {
         self.attempted = true;
 
-        let paths = if let Some(oid) = self.oid {
+        if let Some(oid) = self.oid {
             // Rollback returns every dirty file to its pre-run bytes; success only unhides.
             let manifest = if rollback {
                 &self.status.dirty
             } else {
                 &self.hidden
             };
-            restore_stashed(self.repo, self.workdir, oid, manifest, &self.hidden)?
-        } else {
-            Vec::new()
-        };
+            apply_stash(self.repo, self.workdir, oid, manifest, &mut self.filter)?;
+        }
 
         // Undo the materialization: these files must return to their deleted worktree state.
         for path in &self.absent {
@@ -264,14 +291,20 @@ impl<'a> Workflow<'a> {
 
         // Rolling back also reverts side-effects in scopes that leave dirty files in place.
         if self.stash_tracked || rollback {
-            let mut skip = paths.clone();
-            skip.extend(self.status.dirty.iter().cloned());
-            skip.extend(self.status.missing.iter().cloned());
-            revert_clean_tracked(self.repo, self.workdir, &skip)?;
-        }
-
-        if self.oid.is_some() {
-            refresh_stat(self.repo, self.workdir, &paths)?;
+            let skip: HashSet<&str> = self
+                .status
+                .dirty
+                .iter()
+                .chain(&self.status.missing)
+                .map(String::as_str)
+                .collect();
+            restore_clean_tracked(
+                self.repo,
+                self.workdir,
+                &skip,
+                &mut self.filter,
+                &self.filter_index,
+            )?;
         }
 
         Ok(())
@@ -280,7 +313,7 @@ impl<'a> Workflow<'a> {
     /// Drop the backup stash now that the run has succeeded.
     fn cleanup(&self) -> Result<(), Error> {
         if let Some(oid) = self.oid {
-            remove_stash_ref(self.repo, oid)?;
+            drop_stash(self.repo, oid)?;
         }
         Ok(())
     }
@@ -310,56 +343,63 @@ struct StashEntry {
     mode: EntryMode,
 }
 
-/// Read a file's content into the ODB and return its OID + tree entry mode.
-fn read_blob(
-    repo: &Repository,
+/// Capture a worktree file into the ODB in git form (clean-filtered), as `git add` would.
+fn hash_blob(
+    filter: &mut gix::filter::Pipeline<'_>,
+    filter_index: &gix::index::State,
     workdir: &Path,
     path: &str,
 ) -> Result<(ObjectId, EntryMode), Error> {
-    let file_path = workdir.join(path);
-    let meta = file_path.symlink_metadata().map_err(|e| Error::FileRead {
-        path: file_path.clone(),
-        source: e,
-    })?;
-
-    let is_symlink = meta.file_type().is_symlink();
-
-    let mode = if is_symlink {
-        EntryKind::Link.into()
-    } else if is_executable(&meta) {
-        EntryKind::BlobExecutable.into()
-    } else {
-        EntryKind::Blob.into()
-    };
-
-    let content = if is_symlink {
-        let target = fs::read_link(&file_path).map_err(|e| Error::FileRead {
-            path: file_path.clone(),
-            source: e,
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            target.as_os_str().as_bytes().to_vec()
-        }
-        #[cfg(not(unix))]
-        target.to_string_lossy().into_owned().into_bytes()
-    } else {
-        fs::read(&file_path).map_err(|e| Error::FileRead {
-            path: file_path.clone(),
-            source: e,
-        })?
-    };
-
-    let oid = repo
-        .write_blob(&content)
-        .map_err(|e| Error::BlobWrite {
+    match filter.worktree_file_to_object(path.as_bytes().as_bstr(), filter_index) {
+        Ok(Some((oid, kind, _))) => Ok((oid, kind.into())),
+        Ok(None) => Err(Error::FileRead {
+            path: workdir.join(path),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        }),
+        Err(e) => Err(Error::Capture {
             path: path.to_owned(),
             source: e,
-        })?
-        .detach();
+        }),
+    }
+}
 
-    Ok((oid, mode))
+/// Convert a git-form blob to worktree form (smudge-filtered) and write it.
+///
+/// Symlink blobs hold the target path, which filters never apply to.
+fn checkout_blob(
+    filter: &mut gix::filter::Pipeline<'_>,
+    data: &[u8],
+    path: &str,
+    file_path: &Path,
+    mode: EntryMode,
+    use_symlinks: bool,
+) -> Result<(), Error> {
+    let converted;
+    let bytes = if mode.is_link() {
+        data
+    } else {
+        let mut outcome = filter
+            .convert_to_worktree(data, path.as_bytes().as_bstr(), Delay::Forbid)
+            .map_err(|e| Error::ConvertToWorktree {
+                path: path.to_owned(),
+                source: e,
+            })?;
+        if let Some(bytes) = outcome.as_bytes() {
+            converted = bytes.to_vec();
+        } else {
+            let mut buf = Vec::new();
+            outcome.read_to_end(&mut buf).map_err(|e| Error::FileRead {
+                path: file_path.to_path_buf(),
+                source: e,
+            })?;
+            converted = buf;
+        }
+        &converted
+    };
+    write_to_worktree(file_path, bytes, mode, use_symlinks).map_err(|e| Error::FileWrite {
+        path: file_path.to_path_buf(),
+        source: e,
+    })
 }
 
 /// Build the stash commit and write refs/stash (if HEAD exists).
@@ -368,6 +408,7 @@ fn create_stash_commit(
     captured: &[StashEntry],
     untracked_entries: &[StashEntry],
     missing: &BTreeSet<String>,
+    index: &gix::index::State,
 ) -> Result<ObjectId, Error> {
     let committer = repo
         .committer()
@@ -383,7 +424,6 @@ fn create_stash_commit(
         Some(commit) => commit.tree().map_err(Error::TreeDecode)?,
         None => repo.empty_tree(),
     };
-    let index = open_index(repo).map_err(Error::IndexRead)?;
     let mut editor = base_tree.edit().map_err(Error::TreeEditInit)?;
     for entry in captured {
         editor
@@ -423,7 +463,7 @@ fn create_stash_commit(
                     continue;
                 }
                 let path =
-                    std::str::from_utf8(entry.path(&index)).map_err(|_| Error::NonUtf8Path)?;
+                    std::str::from_utf8(entry.path(index)).map_err(|_| Error::NonUtf8Path)?;
                 let Some(mode) = entry.mode.to_tree_entry_mode() else {
                     continue;
                 };
@@ -507,45 +547,25 @@ fn write_commit(
         .map_err(Error::CommitWrite)
 }
 
-/// Replace stashed files with their correct on-disk representation.
+/// Check out indexed content over stashed files, as `git checkout-index` would.
 /// For hidden tracked files: write indexed blob content.
 /// For untracked files: delete them so they're absent during the run.
 /// For absent staged files: write indexed content so they exist during the run.
-fn hide_stashed_files(
+fn checkout_index(
     repo: &Repository,
     workdir: &Path,
     hidden: &BTreeSet<String>,
     untracked_entries: &[StashEntry],
     staged_absent: &[String],
+    filter: &mut gix::filter::Pipeline<'_>,
+    index: &gix::index::State,
 ) -> Result<(), Error> {
     let use_symlinks = repo
-        .config_snapshot()
-        .boolean("core.symlinks")
-        .unwrap_or(cfg!(unix));
-    let index = open_index(repo).map_err(Error::IndexRead)?;
+        .filesystem_options()
+        .map_err(Error::FsCapabilities)?
+        .symlink;
 
-    for path in hidden {
-        let bpath = path.as_bytes().as_bstr();
-        let Some(entry) = index.entry_by_path_and_stage(bpath, Stage::Unconflicted) else {
-            continue;
-        };
-        let blob = repo.find_object(entry.id).map_err(|e| Error::BlobRead {
-            path: path.clone(),
-            source: e,
-        })?;
-        let file_path = workdir.join(path);
-        let mode = entry
-            .mode
-            .to_tree_entry_mode()
-            .unwrap_or(EntryKind::Blob.into());
-        write_to_workdir(&file_path, &blob.data, mode, use_symlinks).map_err(|e| {
-            Error::FileWrite {
-                path: file_path.clone(),
-                source: e,
-            }
-        })?;
-    }
-
+    // Deletions first: an untracked file can occupy the parent path of an absent index entry.
     for entry in untracked_entries {
         let file_path = workdir.join(&entry.path);
         remove_if_exists(&file_path).map_err(|e| Error::FileDelete {
@@ -554,9 +574,9 @@ fn hide_stashed_files(
         })?;
     }
 
-    // Recreate absent staged files from indexed content so they exist during the run; restore
-    // deletes them.
-    for path in staged_absent {
+    // Hidden files get their indexed content; absent staged files are recreated from it so they
+    // exist during the run (restore deletes them again).
+    for path in hidden.iter().chain(staged_absent) {
         let bpath = path.as_bytes().as_bstr();
         let Some(entry) = index.entry_by_path_and_stage(bpath, Stage::Unconflicted) else {
             continue;
@@ -570,33 +590,26 @@ fn hide_stashed_files(
             .mode
             .to_tree_entry_mode()
             .unwrap_or(EntryKind::Blob.into());
-        write_to_workdir(&file_path, &blob.data, mode, use_symlinks).map_err(|e| {
-            Error::FileWrite {
-                path: file_path.clone(),
-                source: e,
-            }
-        })?;
+        checkout_blob(filter, &blob.data, path, &file_path, mode, use_symlinks)?;
     }
 
     Ok(())
 }
 
-/// Restore stashed files to the working tree.
+/// Apply stashed files to the working tree, as `git stash apply` would.
 ///
-/// Restored by name rather than by diff: content matching HEAD must still be unhidden.
-///
-/// Returns the hidden paths that were written, for `refresh_stat`.
-fn restore_stashed(
+/// Applied by name rather than by diff: content matching HEAD must still be unhidden.
+fn apply_stash(
     repo: &Repository,
     workdir: &Path,
     stash_oid: ObjectId,
     manifest: &BTreeSet<String>,
-    hidden: &BTreeSet<String>,
-) -> Result<Vec<String>, Error> {
+    filter: &mut gix::filter::Pipeline<'_>,
+) -> Result<(), Error> {
     let use_symlinks = repo
-        .config_snapshot()
-        .boolean("core.symlinks")
-        .unwrap_or(cfg!(unix));
+        .filesystem_options()
+        .map_err(Error::FsCapabilities)?
+        .symlink;
 
     let stash_obj = repo.find_object(stash_oid).map_err(Error::ObjectFind)?;
     let stash_commit = stash_obj.into_commit();
@@ -608,38 +621,37 @@ fn restore_stashed(
 
     // Stash parents: [HEAD, index, untracked?], or [untracked?] on an empty repo (>=2 means HEAD+index).
     let has_head = parents.len() >= 2;
-    let mut restored = restore_stash_files(
+    apply_stash_tree(
         repo,
         workdir,
         stash_tree_oid,
         manifest,
-        hidden,
         use_symlinks,
+        filter,
     )?;
 
     let untracked_idx = if has_head { 2 } else { 0 };
     if let Some(&untracked_oid) = parents.get(untracked_idx) {
-        restore_untracked_files(repo, workdir, untracked_oid, &mut restored, use_symlinks)?;
+        apply_stash_untracked(repo, workdir, untracked_oid, use_symlinks, filter)?;
     }
 
-    Ok(restored)
+    Ok(())
 }
 
 /// Restore stash tree files that differ from HEAD to the working tree.
-fn restore_stash_files(
+fn apply_stash_tree(
     repo: &Repository,
     workdir: &Path,
     stash_tree_oid: ObjectId,
     manifest: &BTreeSet<String>,
-    hidden: &BTreeSet<String>,
     use_symlinks: bool,
-) -> Result<Vec<String>, Error> {
+    filter: &mut gix::filter::Pipeline<'_>,
+) -> Result<(), Error> {
     let stash_tree = repo
         .find_object(stash_tree_oid)
         .map_err(Error::ObjectFind)?
         .into_tree();
 
-    let mut restored = Vec::new();
     for path in manifest {
         let Some(entry) = stash_tree
             .lookup_entry_by_path(Path::new(path))
@@ -653,28 +665,19 @@ fn restore_stash_files(
         }
         let blob = repo.find_object(entry.id()).map_err(Error::ObjectFind)?;
         let file_path = workdir.join(path);
-        write_to_workdir(&file_path, &blob.data, mode, use_symlinks).map_err(|e| {
-            Error::FileWrite {
-                path: file_path,
-                source: e,
-            }
-        })?;
-        // Only hidden paths feed refresh_stat: other manifest paths still differ from the index.
-        if hidden.contains(path) {
-            restored.push(path.clone());
-        }
+        checkout_blob(filter, &blob.data, path, &file_path, mode, use_symlinks)?;
     }
 
-    Ok(restored)
+    Ok(())
 }
 
 /// Restore untracked files stored in the stash's third-parent commit.
-fn restore_untracked_files(
+fn apply_stash_untracked(
     repo: &Repository,
     workdir: &Path,
     untracked_commit_oid: ObjectId,
-    restored: &mut Vec<String>,
     use_symlinks: bool,
+    filter: &mut gix::filter::Pipeline<'_>,
 ) -> Result<(), Error> {
     let untracked_tree_oid = repo
         .find_object(untracked_commit_oid)
@@ -699,19 +702,20 @@ fn restore_untracked_files(
         let path = entry.filepath.to_str().map_err(|_| Error::NonUtf8Path)?;
         let blob = repo.find_object(entry.oid).map_err(Error::ObjectFind)?;
         let file_path = workdir.join(path);
-        write_to_workdir(&file_path, &blob.data, entry.mode, use_symlinks).map_err(|e| {
-            Error::FileWrite {
-                path: file_path.clone(),
-                source: e,
-            }
-        })?;
-        restored.push(path.to_owned());
+        checkout_blob(
+            filter,
+            &blob.data,
+            path,
+            &file_path,
+            entry.mode,
+            use_symlinks,
+        )?;
     }
     Ok(())
 }
 
 /// Remove our stash entry from the reflog and update/delete refs/stash.
-fn remove_stash_ref(repo: &Repository, oid: ObjectId) -> Result<(), Error> {
+fn drop_stash(repo: &Repository, oid: ObjectId) -> Result<(), Error> {
     let reflog_path = repo.common_dir().join("logs/refs/stash");
     if !reflog_path.exists() {
         return Ok(());
@@ -795,51 +799,60 @@ struct MergeBase {
 /// For each staged file: checks index stat first (skip if reliably clean), then streams to ODB. If
 /// the OID changed, updates the entry in place. If also partially staged, records a `MergeBase`.
 /// Writes the index once at the end.
-fn update(
+fn update_index(
     repo: &Repository,
     workdir: &Path,
     staged: &BTreeSet<String>,
     dirty: &BTreeSet<String>,
+    filter: &mut gix::filter::Pipeline<'_>,
+    filter_index: &gix::index::State,
 ) -> Result<Vec<MergeBase>, Error> {
-    let mut index = open_index(repo).map_err(Error::IndexRead)?;
+    // Hold index.lock across the read-modify-write, as git does: a concurrent writer can neither
+    // clobber this update nor be clobbered by it.
+    let lock =
+        gix::lock::File::acquire_to_update_resource(repo.index_path(), Fail::Immediately, None)?;
+    let mut index = repo.open_index().map_err(Error::IndexRead)?;
+    let caps = repo.filesystem_options().map_err(Error::FsCapabilities)?;
+    let stat_options = repo.stat_options().map_err(Error::StatOptions)?;
     let mut merge_bases = Vec::new();
     let mut changed = false;
 
     for path in staged {
         let file_path = workdir.join(path);
-        if !file_path.exists() {
-            continue;
-        }
-
         let bpath = path.as_bytes().as_bstr();
         let Some(pos) = index.entry_index_by_path_and_stage(bpath, Stage::Unconflicted) else {
             continue;
         };
 
-        if stat_is_clean(
-            &file_path,
-            &index.entries()[pos].stat,
-            index.timestamp().seconds(),
-        ) {
+        // Deleted by the run: stage the removal, as `git add` would.
+        let Ok(meta) = Metadata::from_path_no_follow(&file_path) else {
+            index.remove_entry_at_index(pos);
+            changed = true;
+            continue;
+        };
+
+        // Mode before stat, as `git status` does: a chmod only changes ctime, so with
+        // `core.trustctime=false` a clean stat would hide it.
+        let mode_change =
+            index.entries()[pos]
+                .mode
+                .change_to_match_fs(&meta, caps.symlink, caps.executable_bit);
+
+        let entry_stat = index.entries()[pos].stat;
+        if mode_change.is_none()
+            && entry::Stat::from_fs(&meta).ok().is_some_and(|s| {
+                s.matches(&entry_stat, stat_options)
+                    && !entry_stat.is_racy(index.timestamp(), stat_options)
+            })
+        {
             continue;
         }
 
         let original_oid = index.entries()[pos].id;
+        let (new_oid, _) = hash_blob(filter, filter_index, workdir, path)?;
 
-        let file = fs::File::open(&file_path).map_err(|e| Error::FileRead {
-            path: file_path.clone(),
-            source: e,
-        })?;
-        let new_oid = repo
-            .write_blob_stream(file)
-            .map_err(|e| Error::BlobWrite {
-                path: path.to_owned(),
-                source: e,
-            })?
-            .detach();
-
-        if new_oid != original_oid {
-            if dirty.contains(path) {
+        if new_oid != original_oid || mode_change.is_some() {
+            if new_oid != original_oid && dirty.contains(path) {
                 merge_bases.push(MergeBase {
                     path: path.clone(),
                     base_oid: original_oid,
@@ -848,10 +861,10 @@ fn update(
             }
             let entry = &mut index.entries_mut()[pos];
             entry.id = new_oid;
-            if let Some(stat) = Metadata::from_path_no_follow(&file_path)
-                .ok()
-                .and_then(|m| entry::Stat::from_fs(&m).ok())
-            {
+            if let Some(change) = mode_change {
+                entry.mode = change.apply(entry.mode);
+            }
+            if let Ok(stat) = entry::Stat::from_fs(&meta) {
                 entry.stat = stat;
             }
             changed = true;
@@ -859,9 +872,23 @@ fn update(
     }
 
     if changed {
+        // gix writes the tree cache as-is, without invalidating it for modified entries; drop it
+        // so a later commit cannot reuse stale subtrees. This is the documented practice until a
+        // gix-index API rework: https://github.com/GitoxideLabs/gitoxide/issues/2421
+        index.remove_tree();
+        let mut writer = std::io::BufWriter::with_capacity(64 * 1024, lock);
         index
-            .write(write::Options::default())
-            .map_err(Error::IndexWrite)?;
+            .write_to(&mut writer, write::Options::default())
+            .map_err(|e| Error::IndexWrite(e.into()))?;
+        match writer.into_inner() {
+            Ok(lock) => lock.commit().map_err(|e| Error::IndexWrite(e.into()))?,
+            Err(e) => {
+                return Err(Error::FileWrite {
+                    path: repo.index_path(),
+                    source: e.into_error(),
+                });
+            }
+        };
     }
 
     Ok(merge_bases)
@@ -877,12 +904,13 @@ fn apply_merges(
     workdir: &Path,
     quiet: bool,
     merge_bases: &[MergeBase],
+    filter: &mut gix::filter::Pipeline<'_>,
 ) -> Result<(), Error> {
     if merge_bases.is_empty() {
         return Ok(());
     }
 
-    let threshold = big_file_threshold(repo);
+    let threshold = repo.big_file_threshold().map_err(Error::BigFileThreshold)?;
     let roots = WorktreeRoots {
         current_root: Some(workdir.to_path_buf()),
         ..Default::default()
@@ -892,7 +920,6 @@ fn apply_merges(
         .map_err(Error::MergeResourceCache)?;
     let options = repo.blob_merge_options().map_err(Error::BlobMergeOptions)?;
     let context = repo.command_context().map_err(Error::CommandContext)?;
-    let (mut filter, _index) = repo.filter_pipeline(None).map_err(Error::FilterPipeline)?;
 
     let null = ObjectId::null(repo.object_hash());
     let mut out = Vec::new();
@@ -982,7 +1009,7 @@ fn apply_merges(
             }
         };
 
-        write_merged(&mut filter, merged, rela, &file_path)?;
+        write_merged(filter, merged, rela, &file_path)?;
     }
 
     Ok(())
@@ -1014,26 +1041,20 @@ fn write_merged(
     Ok(())
 }
 
-/// Returns `core.bigFileThreshold` in bytes (default 512 MiB).
-fn big_file_threshold(repo: &Repository) -> u64 {
-    repo.config_snapshot()
-        .integer("core.bigFileThreshold")
-        .and_then(|v| u64::try_from(v).ok())
-        .unwrap_or(512 * 1024 * 1024)
-}
-
-/// Revert tracked files modified as a side-effect during the run (not staged, but changed on disk).
-/// Skips any paths in `already_restored`.
-fn revert_clean_tracked(
+/// Restore tracked files modified as a side-effect during the run (not staged, but changed on
+/// disk) from the index, as `git restore` would. Skips any paths in `already_restored`.
+fn restore_clean_tracked(
     repo: &Repository,
     workdir: &Path,
-    already_restored: &[String],
+    skip: &HashSet<&str>,
+    filter: &mut gix::filter::Pipeline<'_>,
+    filter_index: &gix::index::State,
 ) -> Result<(), Error> {
-    let index = open_index(repo).map_err(Error::IndexRead)?;
-    let skip: std::collections::HashSet<&str> =
-        already_restored.iter().map(String::as_str).collect();
+    let index = repo.open_index().map_err(Error::IndexRead)?;
+    let stat_options = repo.stat_options().map_err(Error::StatOptions)?;
 
     for entry in index.entries() {
+        // Skipping an undecodable bystander beats failing the whole rollback over it.
         let Ok(path) = std::str::from_utf8(entry.path(&index)) else {
             continue;
         };
@@ -1047,96 +1068,59 @@ fn revert_clean_tracked(
             continue;
         }
 
+        // Sparse-checkout entries are absent on purpose.
+        if entry.flags.contains(entry::Flags::SKIP_WORKTREE) {
+            continue;
+        }
+
         let file_path = workdir.join(path);
-        if !file_path.exists() {
+        let Ok(meta) = Metadata::from_path_no_follow(&file_path) else {
             // Deleted as a side-effect: user deletions are excluded via `already_restored`.
             let indexed = repo.find_object(entry.id).map_err(Error::ObjectFind)?;
             let mode = entry
                 .mode
                 .to_tree_entry_mode()
                 .unwrap_or(EntryKind::Blob.into());
-            write_to_workdir(&file_path, &indexed.data, mode, false).map_err(|e| {
-                Error::FileWrite {
-                    path: file_path,
-                    source: e,
-                }
-            })?;
+            checkout_blob(filter, &indexed.data, path, &file_path, mode, false)?;
+            continue;
+        };
+
+        if entry::Stat::from_fs(&meta).ok().is_some_and(|s| {
+            s.matches(&entry.stat, stat_options)
+                && !entry.stat.is_racy(index.timestamp(), stat_options)
+        }) {
             continue;
         }
 
-        if stat_is_clean(&file_path, &entry.stat, index.timestamp().seconds()) {
-            continue;
-        }
-
-        let current = fs::read(&file_path).map_err(|e| Error::FileRead {
+        // Compare in git form, as `git status` does: a filtered file whose stat is stale must not
+        // read as modified just because its worktree form differs from the blob.
+        let file = fs::File::open(&file_path).map_err(|e| Error::FileRead {
             path: file_path.clone(),
             source: e,
         })?;
-        let indexed = repo.find_object(entry.id).map_err(Error::ObjectFind)?;
-        if current != indexed.data {
-            fs::write(&file_path, &indexed.data).map_err(|e| Error::FileWrite {
-                path: file_path,
+        let mut current = Vec::new();
+        filter
+            .convert_to_git(file, Path::new(path), filter_index)
+            .map_err(|e| Error::ConvertToGit {
+                path: path.to_owned(),
+                source: e,
+            })?
+            .read_to_end(&mut current)
+            .map_err(|e| Error::FileRead {
+                path: file_path.clone(),
                 source: e,
             })?;
+        let indexed = repo.find_object(entry.id).map_err(Error::ObjectFind)?;
+        if current != indexed.data {
+            let mode = entry
+                .mode
+                .to_tree_entry_mode()
+                .unwrap_or(EntryKind::Blob.into());
+            checkout_blob(filter, &indexed.data, path, &file_path, mode, false)?;
         }
     }
 
     Ok(())
-}
-
-/// Re-stat restored files and update their index entries so `git status` doesn't flag them as dirty
-/// after we overwrote them.
-fn refresh_stat(repo: &Repository, workdir: &Path, paths: &[String]) -> Result<(), Error> {
-    if paths.is_empty() {
-        return Ok(());
-    }
-
-    let mut index = open_index(repo).map_err(Error::IndexRead)?;
-    let mut changed = false;
-
-    for path in paths {
-        let bpath = path.as_bytes().as_bstr();
-        let Some(pos) = index.entry_index_by_path_and_stage(bpath, Stage::Unconflicted) else {
-            continue;
-        };
-        let file_path = workdir.join(path);
-        let Ok(meta) = Metadata::from_path_no_follow(&file_path) else {
-            continue;
-        };
-        let entry = &mut index.entries_mut()[pos];
-        let Ok(stat) = entry::Stat::from_fs(&meta) else {
-            continue;
-        };
-        entry.stat = stat;
-        changed = true;
-    }
-
-    if changed {
-        index
-            .write(write::Options::default())
-            .map_err(Error::IndexWrite)?;
-    }
-
-    Ok(())
-}
-
-/// Returns `true` when the on-disk stat matches `entry_stat` and can be trusted. Requires mtime to
-/// predate `index_write_secs` to guard against the racily-clean case on coarse-grained filesystems
-/// (HFS+ 1-second mtime).
-fn stat_is_clean(path: &Path, entry_stat: &entry::Stat, index_write_secs: i64) -> bool {
-    Metadata::from_path_no_follow(path)
-        .ok()
-        .and_then(|m| entry::Stat::from_fs(&m).ok())
-        .is_some_and(|s| s == *entry_stat && i64::from(entry_stat.mtime.secs) < index_write_secs)
-}
-
-fn open_index(repo: &Repository) -> Result<gix::index::File, gix::index::file::init::Error> {
-    gix::index::File::at(
-        repo.index_path(),
-        repo.object_hash(),
-        false,
-        gix::index::decode::Options::default(),
-    )
 }
 
 #[cfg(unix)]
@@ -1150,7 +1134,7 @@ fn is_executable(_meta: &fs::Metadata) -> bool {
     false
 }
 
-fn write_to_workdir(
+fn write_to_worktree(
     file_path: &Path,
     blob: &[u8],
     mode: EntryMode,

@@ -93,7 +93,15 @@ fn build_runner(
         let prefix = config_dir.strip_prefix(workdir).unwrap_or(Path::new(""));
 
         for (pattern, entry) in &cfg {
-            let matcher = globset::Glob::new(pattern)
+            // Bare patterns match basenames at any depth.
+            let glob = if pattern.contains('/') {
+                pattern.clone()
+            } else {
+                format!("**/{pattern}")
+            };
+            let matcher = globset::GlobBuilder::new(&glob)
+                .literal_separator(true)
+                .build()
                 .map_err(|e| anyhow!("invalid glob pattern '{pattern}': {e}"))?
                 .compile_matcher();
 

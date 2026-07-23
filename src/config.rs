@@ -116,10 +116,6 @@ pub fn find(
     root: &Path,
     cache: &mut HashMap<PathBuf, Option<PathBuf>>,
 ) -> Option<PathBuf> {
-    if let Some(cached) = cache.get(start) {
-        return cached.clone();
-    }
-
     let mut visited = Vec::new();
     let mut dir = start;
     let result = 'walk: loop {

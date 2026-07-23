@@ -86,30 +86,32 @@ impl Runner {
         let mut error_count = 0usize;
         let mut next = 0;
 
-        self.fill(&mut set, &mut next, &mut error_count);
+        self.fill(&mut set, &mut next);
 
-        while !set.is_empty() {
-            let c = tokio::select! {
-                biased;
-                () = self.running.cancelled() => break,
-                r = set.join_next() => match r {
-                    Some(Ok(c)) => c,
-                    Some(Err(e)) => {
-                        eprintln!("stagelint: task panicked: {e}");
-                        error_count += 1;
-                        if !self.continue_on_error {
-                            self.running.cancel();
-                        }
-                        continue;
+        // On cancellation, children kill themselves and no new ones spawn; the loop simply drains.
+        while let Some(r) = set.join_next().await {
+            let c = match r {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("stagelint: task panicked: {e}");
+                    error_count += 1;
+                    if !self.continue_on_error {
+                        self.running.cancel();
                     }
-                    None => break,
-                },
+                    continue;
+                }
             };
 
             print_output(&c.stdout, &c.stderr);
 
             match c.status {
                 Ok(s) if s.success() => {}
+                Ok(s) if s.code().is_none() && self.running.is_cancelled() => {
+                    eprintln!(
+                        "stagelint: command cancelled: {}",
+                        self.tasks[c.task][c.cmd].0
+                    );
+                }
                 Ok(s) => {
                     eprintln!(
                         "stagelint: command failed: {} (exit {s})",
@@ -128,16 +130,13 @@ impl Runner {
 
             if error_count > 0 && !self.continue_on_error {
                 self.running.cancel();
-                break;
             }
 
             if c.cmd + 1 < self.tasks[c.task].len() {
-                self.spawn_task(&mut set, c.task, c.cmd + 1, &mut error_count);
+                self.spawn_task(&mut set, c.task, c.cmd + 1);
             }
-            self.fill(&mut set, &mut next, &mut error_count);
+            self.fill(&mut set, &mut next);
         }
-
-        while set.join_next().await.is_some() {}
 
         if self.cancel.is_cancelled() {
             return Err(Error::Cancelled);
@@ -148,25 +147,21 @@ impl Runner {
         Ok(())
     }
 
-    fn fill(&self, set: &mut JoinSet<Completion>, next: &mut usize, error_count: &mut usize) {
+    fn fill(&self, set: &mut JoinSet<Completion>, next: &mut usize) {
         while *next < self.tasks.len() && (self.concurrent == 0 || set.len() < self.concurrent) {
             if !self.tasks[*next].is_empty() {
-                self.spawn_task(set, *next, 0, error_count);
-                if *error_count > 0 && !self.continue_on_error {
-                    return;
-                }
+                self.spawn_task(set, *next, 0);
             }
             *next += 1;
         }
     }
 
-    fn spawn_task(
-        &self,
-        set: &mut JoinSet<Completion>,
-        task: usize,
-        cmd: usize,
-        error_count: &mut usize,
-    ) {
+    fn spawn_task(&self, set: &mut JoinSet<Completion>, task: usize, cmd: usize) {
+        // Cancellation must not spawn doomed commands.
+        if self.running.is_cancelled() {
+            return;
+        }
+
         let (program, args) = &self.tasks[task][cmd];
 
         let mut proc = tokio::process::Command::new(program);
@@ -206,11 +201,16 @@ impl Runner {
                 });
             }
             Err(e) => {
-                eprintln!("stagelint: failed to run {program}: {e}");
-                *error_count += 1;
-                if !self.continue_on_error {
-                    self.running.cancel();
-                }
+                // Route spawn failures through the completion path like exit failures.
+                set.spawn(async move {
+                    Completion {
+                        task,
+                        cmd,
+                        status: Err(e),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    }
+                });
             }
         }
     }

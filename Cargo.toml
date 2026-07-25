@@ -13,7 +13,7 @@ clap = { version = "4", features = ["derive"] }
 command-group = { version = "5", features = ["with-tokio"] }
 ctrlc = "3"
 gix = {
-  version = "0.85",
+  version = "0.86",
   default-features = false,
   features = [
     "max-performance",
@@ -21,7 +21,8 @@ gix = {
     "sha1",
     "sha256",
     "status",
-    "tree-editor"
+    "tree-editor",
+    "worktree-mutation"
   ]
 }
 globset = "0.4"

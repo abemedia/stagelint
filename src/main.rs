@@ -146,8 +146,7 @@ fn init(force: bool) -> Result<()> {
                     home_dir: gix::path::env::home_dir().as_deref(),
                     ..Default::default()
                 })
-                .map_err(|e| anyhow!("failed to interpolate core.hooksPath: {e}"))?
-                .into_owned();
+                .map_err(|e| anyhow!("failed to interpolate core.hooksPath: {e}"))?;
             workdir.join(dir)
         } else {
             repo.common_dir().join("hooks")

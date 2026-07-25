@@ -3,11 +3,12 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use gix::bstr::ByteSlice;
 use gix::filter::plumbing::driver::apply::Delay;
+use gix::filter::plumbing::pipeline::convert::to_worktree;
 use gix::index::entry::{self, Stage};
 use gix::index::{fs::Metadata, write};
 use gix::lock::acquire::Fail;
@@ -17,7 +18,10 @@ use gix::merge::blob::{Resolution, ResourceKind, pipeline::WorktreeRoots};
 use gix::objs::Commit;
 use gix::objs::tree::{EntryKind, EntryMode};
 use gix::refs::Target;
+use gix::refs::file::log::LineRef;
+use gix::refs::log::Line;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+use gix::status::plumbing::index_as_worktree::EntryStatus;
 use gix::{Id, ObjectId, Repository};
 
 use crate::status::WorktreeStatus;
@@ -74,12 +78,6 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to read {path}")]
-    BlobRead {
-        path: String,
-        #[source]
-        source: gix::object::find::existing::Error,
-    },
     #[error("failed to create merge resource cache")]
     MergeResourceCache(#[source] gix::repository::merge_resource_cache::Error),
     #[error("failed to load merge options")]
@@ -112,12 +110,14 @@ pub enum Error {
         #[source]
         source: gix::filter::pipeline::worktree_file_to_object::Error,
     },
-    #[error("failed to convert {path} to git form")]
-    ConvertToGit {
-        path: String,
-        #[source]
-        source: gix::filter::pipeline::convert_to_git::Error,
-    },
+    #[error("failed to compute repository status")]
+    Status(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("failed to load checkout options")]
+    CheckoutOptions(#[source] gix::config::checkout_options::Error),
+    #[error("failed to check out files")]
+    Checkout(#[source] gix::worktree::state::checkout::Error),
+    #[error("failed to open object database")]
+    OdbOpen(#[source] std::io::Error),
     #[error("failed to load filesystem capabilities")]
     FsCapabilities(#[source] gix::config::boolean::Error),
     #[error("failed to load stat options")]
@@ -215,7 +215,7 @@ impl<'a> Workflow<'a> {
             )?)
         };
 
-        let mut workflow = Self {
+        let workflow = Self {
             repo,
             workdir,
             status,
@@ -234,7 +234,6 @@ impl<'a> Workflow<'a> {
                 &workflow.hidden,
                 &untracked_entries,
                 &workflow.absent,
-                &mut workflow.filter,
                 &workflow.filter_index,
             )?;
         }
@@ -277,7 +276,7 @@ impl<'a> Workflow<'a> {
             } else {
                 &self.hidden
             };
-            apply_stash(self.repo, self.workdir, oid, manifest, &mut self.filter)?;
+            apply_stash(self.repo, self.workdir, oid, manifest)?;
         }
 
         // Undo the materialization: these files must return to their deleted worktree state.
@@ -298,13 +297,7 @@ impl<'a> Workflow<'a> {
                 .chain(&self.status.missing)
                 .map(String::as_str)
                 .collect();
-            restore_clean_tracked(
-                self.repo,
-                self.workdir,
-                &skip,
-                &mut self.filter,
-                &self.filter_index,
-            )?;
+            restore_clean_tracked(self.repo, self.workdir, &skip)?;
         }
 
         Ok(())
@@ -363,43 +356,46 @@ fn hash_blob(
     }
 }
 
-/// Convert a git-form blob to worktree form (smudge-filtered) and write it.
-///
-/// Symlink blobs hold the target path, which filters never apply to.
-fn checkout_blob(
-    filter: &mut gix::filter::Pipeline<'_>,
-    data: &[u8],
-    path: &str,
-    file_path: &Path,
-    mode: EntryMode,
-    use_symlinks: bool,
+/// Write blobs to the worktree as `git checkout-index -f` would, honoring filters and modes.
+fn checkout_worktree(
+    repo: &Repository,
+    workdir: &Path,
+    entries: &[StashEntry],
 ) -> Result<(), Error> {
-    let converted;
-    let bytes = if mode.is_link() {
-        data
-    } else {
-        let mut outcome = filter
-            .convert_to_worktree(data, path.as_bytes().as_bstr(), Delay::Forbid)
-            .map_err(|e| Error::ConvertToWorktree {
-                path: path.to_owned(),
-                source: e,
-            })?;
-        if let Some(bytes) = outcome.as_bytes() {
-            converted = bytes.to_vec();
-        } else {
-            let mut buf = Vec::new();
-            outcome.read_to_end(&mut buf).map_err(|e| Error::FileRead {
-                path: file_path.to_path_buf(),
-                source: e,
-            })?;
-            converted = buf;
-        }
-        &converted
-    };
-    write_to_worktree(file_path, bytes, mode, use_symlinks).map_err(|e| Error::FileWrite {
-        path: file_path.to_path_buf(),
-        source: e,
-    })
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let mut state = gix::index::State::new(repo.object_hash());
+    for entry in entries {
+        state.dangerously_push_entry(
+            entry::Stat::default(),
+            entry.oid,
+            entry::Flags::empty(),
+            entry.mode.into(),
+            entry.path.as_bytes().as_bstr(),
+        );
+    }
+    // dangerously_push_entry requires sorted order, which our sources do not guarantee.
+    state.sort_entries();
+
+    let mut options = repo
+        .checkout_options(gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping)
+        .map_err(Error::CheckoutOptions)?;
+    options.destination_is_initially_empty = false;
+    options.overwrite_existing = true;
+
+    gix::worktree::state::checkout(
+        &mut state,
+        workdir,
+        repo.objects.clone().into_arc().map_err(Error::OdbOpen)?,
+        &gix::progress::Discard,
+        &gix::progress::Discard,
+        &std::sync::atomic::AtomicBool::default(),
+        options,
+    )
+    .map_err(Error::Checkout)?;
+    Ok(())
 }
 
 /// Build the stash commit and write refs/stash (if HEAD exists).
@@ -557,14 +553,8 @@ fn checkout_index(
     hidden: &BTreeSet<String>,
     untracked_entries: &[StashEntry],
     staged_absent: &[String],
-    filter: &mut gix::filter::Pipeline<'_>,
     index: &gix::index::State,
 ) -> Result<(), Error> {
-    let use_symlinks = repo
-        .filesystem_options()
-        .map_err(Error::FsCapabilities)?
-        .symlink;
-
     // Deletions first: an untracked file can occupy the parent path of an absent index entry.
     for entry in untracked_entries {
         let file_path = workdir.join(&entry.path);
@@ -576,24 +566,22 @@ fn checkout_index(
 
     // Hidden files get their indexed content; absent staged files are recreated from it so they
     // exist during the run (restore deletes them again).
+    let mut to_write = Vec::new();
     for path in hidden.iter().chain(staged_absent) {
         let bpath = path.as_bytes().as_bstr();
         let Some(entry) = index.entry_by_path_and_stage(bpath, Stage::Unconflicted) else {
             continue;
         };
-        let blob = repo.find_object(entry.id).map_err(|e| Error::BlobRead {
+        to_write.push(StashEntry {
             path: path.clone(),
-            source: e,
-        })?;
-        let file_path = workdir.join(path);
-        let mode = entry
-            .mode
-            .to_tree_entry_mode()
-            .unwrap_or(EntryKind::Blob.into());
-        checkout_blob(filter, &blob.data, path, &file_path, mode, use_symlinks)?;
+            oid: entry.id,
+            mode: entry
+                .mode
+                .to_tree_entry_mode()
+                .unwrap_or(EntryKind::Blob.into()),
+        });
     }
-
-    Ok(())
+    checkout_worktree(repo, workdir, &to_write)
 }
 
 /// Apply stashed files to the working tree, as `git stash apply` would.
@@ -604,13 +592,7 @@ fn apply_stash(
     workdir: &Path,
     stash_oid: ObjectId,
     manifest: &BTreeSet<String>,
-    filter: &mut gix::filter::Pipeline<'_>,
 ) -> Result<(), Error> {
-    let use_symlinks = repo
-        .filesystem_options()
-        .map_err(Error::FsCapabilities)?
-        .symlink;
-
     let stash_obj = repo.find_object(stash_oid).map_err(Error::ObjectFind)?;
     let stash_commit = stash_obj.into_commit();
     let parents: Vec<ObjectId> = stash_commit.parent_ids().map(Id::detach).collect();
@@ -621,18 +603,11 @@ fn apply_stash(
 
     // Stash parents: [HEAD, index, untracked?], or [untracked?] on an empty repo (>=2 means HEAD+index).
     let has_head = parents.len() >= 2;
-    apply_stash_tree(
-        repo,
-        workdir,
-        stash_tree_oid,
-        manifest,
-        use_symlinks,
-        filter,
-    )?;
+    apply_stash_tree(repo, workdir, stash_tree_oid, manifest)?;
 
     let untracked_idx = if has_head { 2 } else { 0 };
     if let Some(&untracked_oid) = parents.get(untracked_idx) {
-        apply_stash_untracked(repo, workdir, untracked_oid, use_symlinks, filter)?;
+        apply_stash_untracked(repo, workdir, untracked_oid)?;
     }
 
     Ok(())
@@ -644,14 +619,13 @@ fn apply_stash_tree(
     workdir: &Path,
     stash_tree_oid: ObjectId,
     manifest: &BTreeSet<String>,
-    use_symlinks: bool,
-    filter: &mut gix::filter::Pipeline<'_>,
 ) -> Result<(), Error> {
     let stash_tree = repo
         .find_object(stash_tree_oid)
         .map_err(Error::ObjectFind)?
         .into_tree();
 
+    let mut to_write = Vec::new();
     for path in manifest {
         let Some(entry) = stash_tree
             .lookup_entry_by_path(Path::new(path))
@@ -663,12 +637,13 @@ fn apply_stash_tree(
         if mode.is_tree() {
             continue;
         }
-        let blob = repo.find_object(entry.id()).map_err(Error::ObjectFind)?;
-        let file_path = workdir.join(path);
-        checkout_blob(filter, &blob.data, path, &file_path, mode, use_symlinks)?;
+        to_write.push(StashEntry {
+            path: path.clone(),
+            oid: entry.id().detach(),
+            mode,
+        });
     }
-
-    Ok(())
+    checkout_worktree(repo, workdir, &to_write)
 }
 
 /// Restore untracked files stored in the stash's third-parent commit.
@@ -676,8 +651,6 @@ fn apply_stash_untracked(
     repo: &Repository,
     workdir: &Path,
     untracked_commit_oid: ObjectId,
-    use_symlinks: bool,
-    filter: &mut gix::filter::Pipeline<'_>,
 ) -> Result<(), Error> {
     let untracked_tree_oid = repo
         .find_object(untracked_commit_oid)
@@ -690,6 +663,7 @@ fn apply_stash_untracked(
         .find_object(untracked_tree_oid)
         .map_err(Error::ObjectFind)?
         .into_tree();
+    let mut to_write = Vec::new();
     for entry in untracked_tree
         .traverse()
         .breadthfirst
@@ -700,18 +674,13 @@ fn apply_stash_untracked(
             continue;
         }
         let path = entry.filepath.to_str().map_err(|_| Error::NonUtf8Path)?;
-        let blob = repo.find_object(entry.oid).map_err(Error::ObjectFind)?;
-        let file_path = workdir.join(path);
-        checkout_blob(
-            filter,
-            &blob.data,
-            path,
-            &file_path,
-            entry.mode,
-            use_symlinks,
-        )?;
+        to_write.push(StashEntry {
+            path: path.to_owned(),
+            oid: entry.oid,
+            mode: entry.mode,
+        });
     }
-    Ok(())
+    checkout_worktree(repo, workdir, &to_write)
 }
 
 /// Remove our stash entry from the reflog and update/delete refs/stash.
@@ -720,6 +689,12 @@ fn drop_stash(repo: &Repository, oid: ObjectId) -> Result<(), Error> {
     if !reflog_path.exists() {
         return Ok(());
     }
+
+    // All git stash operations run under refs/stash.lock; hold it for the whole rewrite.
+    let ref_path = repo.common_dir().join("refs/stash");
+    let mut ref_lock =
+        gix::lock::File::acquire_to_update_resource(&ref_path, Fail::Immediately, None)?;
+
     let mut reflog_lock =
         gix::lock::File::acquire_to_update_resource(&reflog_path, Fail::Immediately, None)?;
     let reflog_file = match fs::File::open(&reflog_path) {
@@ -733,35 +708,39 @@ fn drop_stash(repo: &Repository, oid: ObjectId) -> Result<(), Error> {
         }
     };
 
-    let our_hex = oid.to_hex().to_string();
-    let mut last_hex = None;
+    let mut last_oid: Option<ObjectId> = None;
 
-    // Stream reflog into the lock file, skipping our entry.
-    // Each line: "<old_oid> <new_oid> <signature>\t<message>"
     for line in BufReader::new(reflog_file).lines() {
         let line = line.map_err(|e| Error::FileRead {
             path: reflog_path.clone(),
             source: e,
         })?;
-        if line.is_empty() {
+        let Ok(parsed) = LineRef::from_bytes(line.as_bytes()) else {
+            continue;
+        };
+        let mut entry = Line::from(parsed);
+        if entry.new_oid == oid {
             continue;
         }
-        let new_hex = line.split(' ').nth(1);
-        if new_hex != Some(our_hex.as_str()) {
-            writeln!(reflog_lock, "{line}").map_err(|e| Error::FileWrite {
+        // The chain is recomputed, not preserved: each old_oid becomes the previous kept entry.
+        entry.previous_oid = last_oid.unwrap_or_else(|| ObjectId::null(repo.object_hash()));
+        entry
+            .write_to(&mut reflog_lock)
+            .map_err(|e| Error::FileWrite {
                 path: reflog_lock.lock_path().to_path_buf(),
                 source: e,
             })?;
-            last_hex = new_hex.map(str::to_owned);
-        }
+        last_oid = Some(entry.new_oid);
     }
 
-    if let Some(hex) = last_hex {
-        let ref_path = repo.common_dir().join("refs/stash");
-        let mut ref_lock =
-            gix::lock::File::acquire_to_update_resource(&ref_path, Fail::Immediately, None)?;
+    reflog_lock.commit().map_err(|e| Error::FileWrite {
+        path: reflog_path,
+        source: e.error,
+    })?;
+
+    if let Some(last) = last_oid {
         ref_lock
-            .write_all(format!("{hex}\n").as_bytes())
+            .write_all(format!("{}\n", last.to_hex()).as_bytes())
             .map_err(|e| Error::FileWrite {
                 path: ref_lock.lock_path().to_path_buf(),
                 source: e,
@@ -770,19 +749,25 @@ fn drop_stash(repo: &Repository, oid: ObjectId) -> Result<(), Error> {
             path: ref_path,
             source: e.error,
         })?;
-        reflog_lock.commit().map_err(|e| Error::FileWrite {
-            path: reflog_path,
-            source: e.error,
-        })?;
+        Ok(())
     } else {
-        // No remaining entries: delete the ref and reflog entirely.
-        if let Ok(r) = repo.find_reference("refs/stash") {
-            r.delete().map_err(Error::RefDelete)?;
+        drop(ref_lock);
+        match repo.edit_reference(RefEdit {
+            change: Change::Delete {
+                expected: PreviousValue::MustExistAndMatch(Target::Object(oid)),
+                log: RefLog::AndReference,
+            },
+            name: "refs/stash".try_into().expect("valid ref name"),
+            deref: false,
+        }) {
+            Ok(_)
+            | Err(gix::reference::edit::Error::FileTransactionPrepare(
+                gix::refs::file::transaction::prepare::Error::ReferenceOutOfDate { .. }
+                | gix::refs::file::transaction::prepare::Error::DeleteReferenceMustExist { .. },
+            )) => Ok(()),
+            Err(e) => Err(Error::RefDelete(e)),
         }
-        fs::remove_file(&reflog_path).ok();
     }
-
-    Ok(())
 }
 
 /// A partially-staged file that changed during the run.
@@ -1023,7 +1008,14 @@ fn write_merged(
     file_path: &Path,
 ) -> Result<(), Error> {
     let mut converted = filter
-        .convert_to_worktree(merged, rela_path, Delay::Forbid)
+        .convert_to_worktree(
+            merged,
+            rela_path,
+            to_worktree::Options {
+                can_delay: Delay::Forbid,
+                ..Default::default()
+            },
+        )
         .map_err(|e| Error::ConvertToWorktree {
             path: rela_path.to_string(),
             source: e,
@@ -1042,182 +1034,71 @@ fn write_merged(
 }
 
 /// Restore tracked files modified as a side-effect during the run (not staged, but changed on
-/// disk) from the index, as `git restore` would. Skips any paths in `already_restored`.
+/// disk) from the index, as `git restore` would. Skips any paths in `skip`.
 fn restore_clean_tracked(
     repo: &Repository,
     workdir: &Path,
     skip: &HashSet<&str>,
-    filter: &mut gix::filter::Pipeline<'_>,
-    filter_index: &gix::index::State,
 ) -> Result<(), Error> {
-    let index = repo.open_index().map_err(Error::IndexRead)?;
-    let stat_options = repo.stat_options().map_err(Error::StatOptions)?;
+    let iter = repo
+        .status(gix::progress::Discard)
+        .map_err(|e| Error::Status(Box::new(e)))?
+        .into_index_worktree_iter(Vec::<gix::bstr::BString>::new())
+        .map_err(|e| Error::Status(Box::new(e)))?;
 
-    for entry in index.entries() {
+    let mut to_write = Vec::new();
+
+    for item in iter {
+        let item = item.map_err(|e| Error::Status(Box::new(e)))?;
+        let gix::status::index_worktree::Item::Modification {
+            entry,
+            rela_path,
+            status,
+            ..
+        } = item
+        else {
+            continue;
+        };
+        if !matches!(status, EntryStatus::Change(_)) {
+            continue;
+        }
+
+        // Indexed symlink data is the target path, not file content; submodules have none at all.
+        if matches!(entry.mode, entry::Mode::SYMLINK | entry::Mode::COMMIT) {
+            continue;
+        }
+
         // Skipping an undecodable bystander beats failing the whole rollback over it.
-        let Ok(path) = std::str::from_utf8(entry.path(&index)) else {
+        let Ok(path) = std::str::from_utf8(&rela_path) else {
             continue;
         };
         if skip.contains(path) {
             continue;
         }
 
-        // Symlinks: indexed data is the target path, not file content. std::fs::read follows the
-        // symlink and would compare/overwrite the target file - skip them entirely.
-        if matches!(entry.mode, entry::Mode::SYMLINK | entry::Mode::COMMIT) {
-            continue;
-        }
-
-        // Sparse-checkout entries are absent on purpose.
-        if entry.flags.contains(entry::Flags::SKIP_WORKTREE) {
-            continue;
-        }
-
-        let file_path = workdir.join(path);
-        let Ok(meta) = Metadata::from_path_no_follow(&file_path) else {
-            // Deleted as a side-effect: user deletions are excluded via `already_restored`.
-            let indexed = repo.find_object(entry.id).map_err(Error::ObjectFind)?;
-            let mode = entry
+        to_write.push(StashEntry {
+            path: path.to_owned(),
+            oid: entry.id,
+            mode: entry
                 .mode
                 .to_tree_entry_mode()
-                .unwrap_or(EntryKind::Blob.into());
-            checkout_blob(filter, &indexed.data, path, &file_path, mode, false)?;
-            continue;
-        };
-
-        if entry::Stat::from_fs(&meta).ok().is_some_and(|s| {
-            s.matches(&entry.stat, stat_options)
-                && !entry.stat.is_racy(index.timestamp(), stat_options)
-        }) {
-            continue;
-        }
-
-        // Compare in git form, as `git status` does: a filtered file whose stat is stale must not
-        // read as modified just because its worktree form differs from the blob.
-        let file = fs::File::open(&file_path).map_err(|e| Error::FileRead {
-            path: file_path.clone(),
-            source: e,
-        })?;
-        let mut current = Vec::new();
-        filter
-            .convert_to_git(file, Path::new(path), filter_index)
-            .map_err(|e| Error::ConvertToGit {
-                path: path.to_owned(),
-                source: e,
-            })?
-            .read_to_end(&mut current)
-            .map_err(|e| Error::FileRead {
-                path: file_path.clone(),
-                source: e,
-            })?;
-        let indexed = repo.find_object(entry.id).map_err(Error::ObjectFind)?;
-        if current != indexed.data {
-            let mode = entry
-                .mode
-                .to_tree_entry_mode()
-                .unwrap_or(EntryKind::Blob.into());
-            checkout_blob(filter, &indexed.data, path, &file_path, mode, false)?;
-        }
+                .unwrap_or(EntryKind::Blob.into()),
+        });
     }
 
-    Ok(())
-}
-
-#[cfg(unix)]
-fn is_executable(meta: &fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    meta.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-fn is_executable(_meta: &fs::Metadata) -> bool {
-    false
-}
-
-fn write_to_worktree(
-    file_path: &Path,
-    blob: &[u8],
-    mode: EntryMode,
-    use_symlinks: bool,
-) -> Result<(), std::io::Error> {
-    if let Some(parent) = file_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    if mode.is_link() && use_symlinks {
-        remove_if_exists(file_path)?;
-        create_symlink(blob, file_path)?;
-    } else {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            let want_exec = mode.kind() == EntryKind::BlobExecutable;
-            let mode_ok = file_path
-                .symlink_metadata()
-                .is_ok_and(|m| m.file_type().is_file() && is_executable(&m) == want_exec);
-            if mode_ok {
-                fs::write(file_path, blob)?;
-            } else {
-                // Recreate with a broad mode so the kernel applies the umask.
-                remove_if_exists(file_path)?;
-                let create_mode = if want_exec { 0o777 } else { 0o666 };
-                fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(create_mode)
-                    .open(file_path)?
-                    .write_all(blob)?;
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            // Unlink an existing symlink first; write() would follow it and corrupt the target.
-            if file_path
-                .symlink_metadata()
-                .is_ok_and(|m| m.file_type().is_symlink())
-            {
-                remove_if_exists(file_path)?;
-            }
-            fs::write(file_path, blob)?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn create_symlink(blob: &[u8], link: &Path) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(blob), link)
-}
-
-#[cfg(windows)]
-fn create_symlink(blob: &[u8], link: &Path) -> std::io::Result<()> {
-    let target = std::str::from_utf8(blob)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    // Resolve target relative to symlink's parent to determine whether it's a directory.
-    // If the target doesn't exist yet, default to symlink_file - matches git's own behavior.
-    let is_dir = link
-        .parent()
-        .map_or_else(|| Path::new(target).to_path_buf(), |p| p.join(target))
-        .is_dir();
-    if is_dir {
-        std::os::windows::fs::symlink_dir(target, link)
-    } else {
-        std::os::windows::fs::symlink_file(target, link)
-    }
+    checkout_worktree(repo, workdir, &to_write)
 }
 
 fn remove_if_exists(path: &Path) -> Result<(), std::io::Error> {
     #[cfg(windows)]
     {
+        use std::os::windows::fs::MetadataExt;
         // On Windows, remove_file fails on directory symlinks - use remove_dir for those.
         match path.symlink_metadata() {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e),
-            Ok(_) if fs::metadata(path).is_ok_and(|m| m.is_dir()) => {
-                return fs::remove_dir(path);
-            }
+            // FILE_ATTRIBUTE_DIRECTORY: set on the link itself, even when dangling.
+            Ok(m) if m.file_attributes() & 0x10 != 0 => return fs::remove_dir(path),
             Ok(_) => {}
         }
     }

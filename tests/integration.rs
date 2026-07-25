@@ -582,7 +582,7 @@ fn sparse_checkout_files_not_materialized() {
 #[test]
 fn stash_tracked_restores_clean_files() {
     let repo = TestRepo::new(&json!({
-        "*.txt": "sh -c 'for f in *.txt; do tr a-z A-Z < \"$f\" > \"$f.tmp\" && mv \"$f.tmp\" \"$f\"; done'"
+        "*.txt": "sh -c 'for f in *.txt; do echo MODIFIED > \"$f\"; done'"
     }));
 
     // A committed file the linter will touch as a side effect.

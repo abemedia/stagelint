@@ -118,14 +118,14 @@ fn build_runner(
                 continue;
             }
 
-            let pipeline: Vec<(&str, &[&str])> = entry
+            let commands: Vec<runner::Command> = entry
                 .iter()
-                .map(|obj| {
-                    let files: &[&str] = if obj.pass_filenames { &matching } else { &[] };
-                    (obj.command.as_str(), files)
+                .map(|obj| runner::Command {
+                    command: obj.command.clone(),
+                    pass_filenames: obj.pass_filenames,
                 })
                 .collect();
-            r.add(&pipeline)?;
+            r.add(&commands, &matching)?;
         }
     }
 

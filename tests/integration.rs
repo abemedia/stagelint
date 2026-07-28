@@ -1708,7 +1708,17 @@ fn concurrent_failure_cancels_running_tasks() {
     repo.release_sentinel(1);
 
     // Task 2 would block forever if not killed; stagelint exiting proves it was cancelled.
-    assert_failure(child);
+    let output = assert_failure(child);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("command cancelled"),
+        "sibling not cancelled: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 task(s) failed"),
+        "killed sibling miscounted: {stderr}"
+    );
 }
 
 /// Two tasks failing concurrently are both reported: the failure racing the cancellation must
@@ -1827,6 +1837,41 @@ fn monorepo_multiple_configs() {
     assert_eq!(repo.git(&["show", ":packages/web/page.txt"]), "goodbye\n");
 }
 
+/// Overlapping globs never run concurrently: the later task starts only after the earlier ends.
+#[test]
+fn overlapping_globs_serialized_under_concurrency() {
+    let repo = TestRepo::empty();
+
+    // IndexMap, not json!: serde_json sorts keys, which would flip the order under test.
+    let mut config = indexmap::IndexMap::new();
+    config.insert("file.txt", sentinel(1));
+    config.insert("*.txt", "sh -c 'touch marker'".to_string());
+    repo.write_file(
+        ".stagelint.json",
+        &serde_json::to_string(&config).expect("serialize"),
+    );
+    repo.git(&["add", ".stagelint.json"]);
+    repo.git(&["commit", "-m", "initial"]);
+
+    repo.write_file("file.txt", "hello\n");
+    repo.git(&["add", "file.txt"]);
+
+    let child = repo.stagelint(&[]);
+
+    assert!(repo.wait_sentinel(1, Duration::from_secs(10)));
+
+    // The first task is blocked on the sentinel; the second must not have started.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !repo.root.join("marker").exists(),
+        "overlapping task started while the earlier one was still running"
+    );
+
+    repo.release_sentinel(1);
+    assert_success(child);
+    assert!(repo.root.join("marker").exists());
+}
+
 /// Overlapping globs run in declaration order, not sorted-pattern order.
 #[test]
 fn overlapping_globs_run_in_declaration_order() {
@@ -1846,7 +1891,7 @@ fn overlapping_globs_run_in_declaration_order() {
     repo.write_file("a.txt", "1\n");
     repo.git(&["add", "a.txt"]);
 
-    assert_success(repo.stagelint(&["--concurrent", "false"]));
+    assert_success(repo.stagelint(&[]));
 
     // Declared order: 1 -> 2 -> 3. Sorted order would give "2".
     assert_eq!(repo.read_file("a.txt"), "3\n");

@@ -138,6 +138,11 @@ impl TestRepo {
             .stderr(Stdio::piped())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", self.root.join(".git/no-global-config"))
+            .env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_COMMITTER_NAME")
+            .env_remove("GIT_COMMITTER_EMAIL")
+            .env_remove("EMAIL")
             .spawn()
             .expect("spawn stagelint")
     }
@@ -157,7 +162,11 @@ pub fn assert_success(child: Child) -> Output {
 /// Wait for stagelint to exit and assert it failed.
 pub fn assert_failure(child: Child) -> Output {
     let output = child.wait_with_output().expect("wait");
-    assert!(!output.status.success(), "stagelint should have failed");
+    assert!(
+        !output.status.success(),
+        "stagelint should have failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     output
 }
 
@@ -177,12 +186,26 @@ pub fn symlink_dir(target: &str, link: &Path) -> io::Result<()> {
 
 pub fn file_symlinks_supported() -> bool {
     let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("target"), "").is_ok()
-        && symlink_file("target", &dir.path().join("link")).is_ok()
+    let ok = fs::write(dir.path().join("target"), "").is_ok()
+        && symlink_file("target", &dir.path().join("link")).is_ok();
+    if !ok {
+        skip("file symlinks unsupported");
+    }
+    ok
 }
 
 pub fn dir_symlinks_supported() -> bool {
     let dir = tempfile::tempdir().unwrap();
-    fs::create_dir(dir.path().join("target")).is_ok()
-        && symlink_dir("target", &dir.path().join("link")).is_ok()
+    let ok = fs::create_dir(dir.path().join("target")).is_ok()
+        && symlink_dir("target", &dir.path().join("link")).is_ok();
+    if !ok {
+        skip("dir symlinks unsupported");
+    }
+    ok
+}
+
+/// CI must run every test: a skipped capability there is lost coverage, not a limited machine.
+fn skip(reason: &str) {
+    assert!(std::env::var_os("CI").is_none(), "{reason}");
+    eprintln!("skipping test: {reason}");
 }

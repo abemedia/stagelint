@@ -613,7 +613,7 @@ fn apply_stash(
     Ok(())
 }
 
-/// Restore stash tree files that differ from HEAD to the working tree.
+/// Restore the manifest's paths from the stash tree; deletions are untouched.
 fn apply_stash_tree(
     repo: &Repository,
     workdir: &Path,
@@ -809,11 +809,25 @@ fn update_index(
             continue;
         };
 
-        // Deleted by the run: stage the removal, as `git add` would.
-        let Ok(meta) = Metadata::from_path_no_follow(&file_path) else {
-            index.remove_entry_at_index(pos);
-            changed = true;
-            continue;
+        let meta = match Metadata::from_path_no_follow(&file_path) {
+            Ok(meta) => meta,
+            // Deleted by the run: stage the removal, as `git add` would.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                index.remove_entry_at_index(pos);
+                changed = true;
+                continue;
+            }
+            Err(e) => {
+                return Err(Error::FileRead {
+                    path: file_path,
+                    source: e,
+                });
+            }
         };
 
         // Mode before stat, as `git status` does: a chmod only changes ctime, so with

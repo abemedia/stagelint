@@ -43,7 +43,7 @@ pub struct CommandObject {
 }
 
 #[derive(Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 enum RawCommand {
     Simple(String),
     Object {
@@ -173,17 +173,18 @@ pub fn load_file(path: &Path) -> Result<Config, Error> {
 mod tests {
     use super::*;
 
-    fn parse_yaml(s: &str) -> Config {
-        yaml_serde::from_str(s).expect("parse yaml")
+    fn load(name: &str, content: &str) -> Result<Config, Error> {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(name);
+        fs::write(&path, content).expect("write");
+        load_file(&path)
     }
 
-    fn parse_json5(s: &str) -> Config {
-        json5::from_str(s).expect("parse json5")
-    }
+    // Each shape is parsed on a different extension, covering both in one pass.
 
     #[test]
-    fn yaml_simple_command() {
-        let cfg = parse_yaml(r#""*.go": "gofmt -w""#);
+    fn simple_command() {
+        let cfg = load(".stagelint.yml", r#""*.go": "gofmt -w""#).expect("load");
         let cmds = &cfg["*.go"];
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].command, "gofmt -w");
@@ -191,60 +192,52 @@ mod tests {
     }
 
     #[test]
-    fn yaml_command_list() {
-        let cfg = parse_yaml(
+    fn command_list() {
+        let cfg = load(
+            ".stagelint.yaml",
             r#"
 "*.md":
   - prettier --write
   - markdownlint
 "#,
-        );
+        )
+        .expect("load");
         let cmds = &cfg["*.md"];
         assert_eq!(cmds.len(), 2);
         assert_eq!(cmds[0].command, "prettier --write");
-        assert!(cmds[0].pass_filenames);
         assert_eq!(cmds[1].command, "markdownlint");
-        assert!(cmds[1].pass_filenames);
     }
 
     #[test]
-    fn yaml_command_object() {
-        let cfg = parse_yaml(
-            r#"
-"*.go":
-  command: "go vet ./..."
-  pass_filenames: false
-"#,
+    fn command_object() {
+        let cfg = load(
+            ".stagelint.json",
+            r#"{
+                "*.go": {"command": "go vet ./...", "pass_filenames": false},
+                "*.md": {"command": "markdownlint"}
+            }"#,
+        )
+        .expect("load");
+        assert_eq!(cfg["*.go"][0].command, "go vet ./...");
+        assert!(!cfg["*.go"][0].pass_filenames);
+        assert!(
+            cfg["*.md"][0].pass_filenames,
+            "pass_filenames defaults to true"
         );
-        let cmds = &cfg["*.go"];
-        assert_eq!(cmds.len(), 1);
-        assert_eq!(cmds[0].command, "go vet ./...");
-        assert!(!cmds[0].pass_filenames);
     }
 
     #[test]
-    fn yaml_object_pass_filenames_defaults_true() {
-        let cfg = parse_yaml(
-            r#"
-"*.go":
-  command: "gofmt -w"
-"#,
-        );
-        let cmds = &cfg["*.go"];
-        assert_eq!(cmds.len(), 1);
-        assert!(cmds[0].pass_filenames);
-    }
-
-    #[test]
-    fn yaml_mixed_list() {
-        let cfg = parse_yaml(
-            r#"
-"*.go":
-  - "goimports -w"
-  - command: "golangci-lint run --fix"
-    pass_filenames: false
-"#,
-        );
+    fn mixed_list() {
+        let cfg = load(
+            ".stagelint.jsonc",
+            r#"{
+                "*.go": [
+                    "goimports -w",
+                    {"command": "golangci-lint run --fix", "pass_filenames": false}
+                ]
+            }"#,
+        )
+        .expect("load");
         let cmds = &cfg["*.go"];
         assert_eq!(cmds.len(), 2);
         assert_eq!(cmds[0].command, "goimports -w");
@@ -254,52 +247,48 @@ mod tests {
     }
 
     #[test]
-    fn json_simple_command() {
-        let cfg = parse_json5(r#"{"*.go": "gofmt -w"}"#);
-        let cmds = &cfg["*.go"];
-        assert_eq!(cmds.len(), 1);
-        assert_eq!(cmds[0].command, "gofmt -w");
-        assert!(cmds[0].pass_filenames);
-    }
-
-    #[test]
-    fn json5_with_comments() {
-        let cfg = parse_json5(
+    fn json5_syntax() {
+        let cfg = load(
+            ".stagelint.json5",
             r#"{
-            // Format Go files
-            "*.go": "gofmt -w",
-            /* Lint markdown */
-            "*.md": "markdownlint",
-        }"#,
-        );
+                // Format Go files
+                "*.go": "gofmt -w",
+                /* Lint markdown */
+                "*.md": "markdownlint",
+            }"#,
+        )
+        .expect("load");
         assert_eq!(cfg["*.go"][0].command, "gofmt -w");
         assert_eq!(cfg["*.md"][0].command, "markdownlint");
     }
 
     #[test]
-    fn json5_trailing_commas() {
-        let cfg = parse_json5(
-            r#"{
-            "*.go": "gofmt -w",
-            "*.md": "markdownlint",
-        }"#,
+    fn unknown_field_rejected() {
+        let result = load(
+            ".stagelint.json",
+            r#"{"*.go": {"command": "gofmt -w", "pass_filename": false}}"#,
         );
-        assert_eq!(cfg.len(), 2);
+        assert!(
+            result.is_err(),
+            "misspelled key must fail, not silently default"
+        );
     }
 
     #[test]
-    fn json_command_object_with_pass_filenames() {
-        let cfg = parse_json5(r#"{"*.go": {"command": "go vet ./...", "pass_filenames": false}}"#);
-        let cmds = &cfg["*.go"];
-        assert_eq!(cmds.len(), 1);
-        assert_eq!(cmds[0].command, "go vet ./...");
-        assert!(!cmds[0].pass_filenames);
+    fn unsupported_extension_rejected() {
+        let result = load("stagelint.toml", r#""*.go" = "gofmt -w""#);
+        assert!(matches!(result, Err(Error::UnsupportedExtension { .. })));
     }
 
     #[test]
-    fn json_command_list() {
-        let cfg = parse_json5(r#"{"*.go": ["goimports -w", "gofmt -w"]}"#);
-        assert_eq!(cfg["*.go"].len(), 2);
+    fn declaration_order_preserved() {
+        let cfg = load(
+            ".stagelint.yml",
+            "\"z.txt\": \"third\"\n\"a.txt\": \"first\"\n\"m.txt\": \"second\"\n",
+        )
+        .expect("load");
+        let keys: Vec<&str> = cfg.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["z.txt", "a.txt", "m.txt"]);
     }
 
     #[test]
@@ -342,37 +331,25 @@ mod tests {
     }
 
     #[test]
-    fn load_yaml_file() {
+    fn find_cache_keeps_lookups_independent() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join(".stagelint.yml");
-        fs::write(&path, r#""*.go": "gofmt -w""#).expect("write");
-        let cfg = load_file(&path).expect("load");
-        assert!(cfg.contains_key("*.go"));
-    }
+        fs::write(dir.path().join(".stagelint.yml"), r#""*.go": "root""#).expect("write");
+        let a = dir.path().join("packages").join("a");
+        let b = dir.path().join("packages").join("b");
+        fs::create_dir_all(&a).expect("mkdir");
+        fs::create_dir_all(&b).expect("mkdir");
+        fs::write(a.join(".stagelint.yml"), r#""*.go": "a""#).expect("write");
 
-    #[test]
-    fn load_json_file() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join(".stagelint.json");
-        fs::write(&path, r#"{"*.go": "gofmt -w"}"#).expect("write");
-        let cfg = load_file(&path).expect("load");
-        assert!(cfg.contains_key("*.go"));
-    }
-
-    #[test]
-    fn load_json5_file() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join(".stagelint.json5");
-        fs::write(
-            &path,
-            r#"{
-                // Go formatting
-                "*.go": "gofmt -w",
-            }"#,
-        )
-        .expect("write");
-        let cfg = load_file(&path).expect("load");
-        assert!(cfg.contains_key("*.go"));
+        // a's walk must not poison the shared dirs with a's config.
+        let mut cache = HashMap::new();
+        assert_eq!(
+            find(&a, dir.path(), &mut cache).expect("find a"),
+            a.join(".stagelint.yml")
+        );
+        assert_eq!(
+            find(&b, dir.path(), &mut cache).expect("find b"),
+            dir.path().join(".stagelint.yml")
+        );
     }
 
     #[test]

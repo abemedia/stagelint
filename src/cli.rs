@@ -31,12 +31,12 @@ pub struct Opts {
     #[arg(long)]
     pub continue_on_error: bool,
 
-    /// Run tasks concurrently. Pass false to run sequentially, or a number to limit concurrency.
+    /// Limit how many tasks run at once: a number, true or 0 (unlimited), or false (sequential).
     #[arg(long, default_value = "true", value_parser = parse_concurrent)]
     pub concurrent: usize,
 
-    /// Control stash scope. Without value: stash everything. Values: tracked, untracked, all.
-    #[arg(long, value_enum, default_missing_value = "all", num_args = 0..=1, default_value_t)]
+    /// Control stash scope; each value includes the previous.
+    #[arg(long, value_enum, default_value_t)]
     pub stash: StashScope,
 
     /// Suppress warnings.
@@ -46,15 +46,13 @@ pub struct Opts {
 
 #[derive(Clone, Default, ValueEnum)]
 pub enum StashScope {
-    /// Only stash partially-staged files (default).
+    /// Only stash partially-staged files.
     #[default]
     Partial,
     /// Also stash dirty tracked files.
     Tracked,
     /// Also stash untracked files.
     Untracked,
-    /// Stash everything.
-    All,
 }
 
 fn parse_concurrent(s: &str) -> Result<usize, String> {

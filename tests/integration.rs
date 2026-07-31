@@ -605,24 +605,64 @@ fn stash_tracked_restores_clean_files() {
     );
 }
 
-/// `--stash untracked` hides untracked files so the linter cannot see them.
+/// `--stash tracked` hides an intent-to-add file to empty, restores it, and never stages it.
 #[test]
-fn stash_untracked_hides_untracked_files() {
+fn stash_tracked_intent_to_add_round_trip() {
     let repo = TestRepo::new(&json!({
-        "*.txt": {"command": "sh -c 'ls *.txt > manifest.txt'", "pass_filenames": false}
+        "*.txt": {"command": "sh -c 'cat ita.txt > seen.txt'", "pass_filenames": false}
     }));
+
+    repo.write_file("staged.txt", "hello\n");
+    repo.git(&["add", "staged.txt"]);
+
+    repo.write_file("ita.txt", "precious\n");
+    repo.git(&["add", "-N", "ita.txt"]);
+
+    assert_success(repo.stagelint(&["--stash", "tracked"]));
+
+    assert_eq!(repo.read_file("ita.txt"), "precious\n");
+    assert_eq!(
+        repo.read_file("seen.txt"),
+        "",
+        "the run must see the staged (empty) content"
+    );
+    assert_eq!(
+        repo.git(&["diff", "--cached", "--name-only"]),
+        "staged.txt\n",
+        "the next commit must not include the intent-to-add file"
+    );
+}
+
+/// `--stash untracked` hides dirty tracked and untracked files from the linter.
+#[test]
+fn stash_untracked_hides_dirty_and_untracked() {
+    let repo = TestRepo::new(&json!({
+        "*.txt": {"command": "sh -c 'git status --porcelain > manifest.txt'", "pass_filenames": false}
+    }));
+
+    repo.write_file("tracked.txt", "committed\n");
+    repo.git(&["add", "tracked.txt"]);
+    repo.git(&["commit", "-m", "add tracked"]);
+    repo.write_file("tracked.txt", "dirty tracked\n");
 
     repo.write_file("staged.txt", "staged content\n");
     repo.git(&["add", "staged.txt"]);
+
     repo.write_file("untracked.txt", "untracked content\n");
 
     assert_success(repo.stagelint(&["--stash", "untracked"]));
 
     let manifest = repo.read_file("manifest.txt");
     assert!(
-        !manifest.contains("untracked.txt"),
-        "untracked file should be hidden during the run, manifest: {manifest}"
+        !manifest.contains("tracked.txt"),
+        "dirty tracked file should be hidden, manifest: {manifest}"
     );
+    assert!(
+        !manifest.contains("untracked.txt"),
+        "untracked file should be hidden, manifest: {manifest}"
+    );
+
+    assert_eq!(repo.read_file("tracked.txt"), "dirty tracked\n");
     assert_eq!(repo.read_file("untracked.txt"), "untracked content\n");
 }
 
@@ -684,39 +724,6 @@ fn stash_untracked_hides_rename_destination() {
         !repo.root.join("old.txt").exists(),
         "old.txt should remain absent after restore"
     );
-}
-
-/// `--stash all` hides dirty tracked and untracked files from the linter.
-#[test]
-fn stash_all_hides_dirty_and_untracked() {
-    let repo = TestRepo::new(&json!({
-        "*.txt": {"command": "sh -c 'git status --porcelain > manifest.txt'", "pass_filenames": false}
-    }));
-
-    repo.write_file("tracked.txt", "committed\n");
-    repo.git(&["add", "tracked.txt"]);
-    repo.git(&["commit", "-m", "add tracked"]);
-    repo.write_file("tracked.txt", "dirty tracked\n");
-
-    repo.write_file("staged.txt", "staged content\n");
-    repo.git(&["add", "staged.txt"]);
-
-    repo.write_file("untracked.txt", "untracked content\n");
-
-    assert_success(repo.stagelint(&["--stash", "all"]));
-
-    let manifest = repo.read_file("manifest.txt");
-    assert!(
-        !manifest.contains("tracked.txt"),
-        "dirty tracked file should be hidden, manifest: {manifest}"
-    );
-    assert!(
-        !manifest.contains("untracked.txt"),
-        "untracked file should be hidden, manifest: {manifest}"
-    );
-
-    assert_eq!(repo.read_file("tracked.txt"), "dirty tracked\n");
-    assert_eq!(repo.read_file("untracked.txt"), "untracked content\n");
 }
 
 /// A stash-creation failure must leave the working tree untouched.
@@ -827,6 +834,31 @@ fn preserves_multiple_user_stashes() {
 
     repo.git(&["stash", "pop"]);
     assert_eq!(repo.read_file("file.txt"), "stash one\n");
+}
+
+/// A non-UTF-8 committer name in the reflog must not break dropping the stash; git reads reflogs
+/// as raw bytes.
+#[test]
+fn drop_stash_with_non_utf8_committer() {
+    let repo = TestRepo::new(&json!({"*.txt": "true"}));
+
+    // Latin-1 e-acute: invalid UTF-8, legal in git config and reflog lines.
+    let mut config = fs::read(repo.root.join(".git/config")).expect("read config");
+    config.extend_from_slice(b"[user]\n\tname = Ren\xe9\n\temail = rene@example.com\n");
+    fs::write(repo.root.join(".git/config"), config).expect("write config");
+
+    // Partially staged: forces a stash whose reflog line carries the committer.
+    repo.write_file("file.txt", "hello\n");
+    repo.git(&["add", "file.txt"]);
+    repo.write_file("file.txt", "hello\nextra\n");
+
+    assert_success(repo.stagelint(&[]));
+
+    assert_eq!(
+        repo.git(&["stash", "list"]),
+        "",
+        "backup stash must be dropped"
+    );
 }
 
 /// Stagelint's stash entry is removed by OID even after a mid-run user stash displaces it.

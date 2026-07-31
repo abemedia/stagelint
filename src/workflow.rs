@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use gix::bstr::ByteSlice;
@@ -18,7 +18,6 @@ use gix::merge::blob::{Resolution, ResourceKind, pipeline::WorktreeRoots};
 use gix::objs::Commit;
 use gix::objs::tree::{EntryKind, EntryMode};
 use gix::refs::Target;
-use gix::refs::file::log::LineRef;
 use gix::refs::log::Line;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::status::plumbing::index_as_worktree::EntryStatus;
@@ -112,6 +111,8 @@ pub enum Error {
     },
     #[error("failed to compute repository status")]
     Status(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("failed to read stash reflog")]
+    ReflogRead(#[source] gix::refs::file::log::Error),
     #[error("failed to load checkout options")]
     CheckoutOptions(#[source] gix::config::checkout_options::Error),
     #[error("failed to check out files")]
@@ -697,25 +698,19 @@ fn drop_stash(repo: &Repository, oid: ObjectId) -> Result<(), Error> {
 
     let mut reflog_lock =
         gix::lock::File::acquire_to_update_resource(&reflog_path, Fail::Immediately, None)?;
-    let reflog_file = match fs::File::open(&reflog_path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => {
-            return Err(Error::FileRead {
-                path: reflog_path,
-                source: e,
-            });
-        }
+    let mut buf = Vec::new();
+    let Some(lines) = repo
+        .refs
+        .reflog_iter("refs/stash", &mut buf)
+        .map_err(Error::ReflogRead)?
+    else {
+        return Ok(());
     };
 
     let mut last_oid: Option<ObjectId> = None;
 
-    for line in BufReader::new(reflog_file).lines() {
-        let line = line.map_err(|e| Error::FileRead {
-            path: reflog_path.clone(),
-            source: e,
-        })?;
-        let Ok(parsed) = LineRef::from_bytes(line.as_bytes()) else {
+    for line in lines {
+        let Ok(parsed) = line else {
             continue;
         };
         let mut entry = Line::from(parsed);

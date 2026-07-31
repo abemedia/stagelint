@@ -36,8 +36,8 @@ fn run(opts: &Opts) -> Result<()> {
         .to_path_buf();
     std::env::set_current_dir(&workdir)?;
 
-    let stash_tracked = matches!(opts.stash, StashScope::Tracked | StashScope::All);
-    let stash_untracked = matches!(opts.stash, StashScope::Untracked | StashScope::All);
+    let stash_tracked = matches!(opts.stash, StashScope::Tracked | StashScope::Untracked);
+    let stash_untracked = matches!(opts.stash, StashScope::Untracked);
 
     let status = status::collect(&repo, stash_untracked)?;
     if status.staged.is_empty() {

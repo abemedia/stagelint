@@ -19,8 +19,8 @@ pub enum Error {
     Empty,
     #[error("failed to create async runtime")]
     Runtime(#[source] io::Error),
-    #[error("{0} task(s) failed")]
-    TasksFailed(usize),
+    #[error("{0} command(s) failed")]
+    CommandsFailed(usize),
     #[error("cancelled")]
     Cancelled,
 }
@@ -174,7 +174,7 @@ impl Runner {
             return Err(Error::Cancelled);
         }
         if error_count > 0 {
-            return Err(Error::TasksFailed(error_count));
+            return Err(Error::CommandsFailed(error_count));
         }
         Ok(())
     }

@@ -1608,19 +1608,19 @@ fn staged_file_deleted_from_worktree_formats_staged_version() {
 
 // Runner
 
-/// Commands in a pipeline are executed sequentially; each receives the output of the previous.
+/// Commands in a pipeline run sequentially; each one sees the file changes made by the previous.
 #[test]
 fn multiple_commands_sequential() {
     let repo = TestRepo::new(&json!({
-        "*.txt": [replace("a", "A"), replace("b", "B")]
+        "*.txt": [replace("1", "2"), replace("2", "3")]
     }));
 
-    repo.write_file("file.txt", "ab\n");
+    repo.write_file("file.txt", "1\n");
     repo.git(&["add", "file.txt"]);
 
     assert_success(repo.stagelint(&[]));
 
-    assert_eq!(repo.git(&["show", ":file.txt"]), "AB\n");
+    assert_eq!(repo.git(&["show", ":file.txt"]), "3\n");
 }
 
 /// With `pass_filenames: false`, no filenames are appended to the command.
@@ -1748,7 +1748,7 @@ fn concurrent_failure_cancels_running_tasks() {
         "sibling not cancelled: {stderr}"
     );
     assert!(
-        stderr.contains("1 task(s) failed"),
+        stderr.contains("1 command(s) failed"),
         "killed sibling miscounted: {stderr}"
     );
 }

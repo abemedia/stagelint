@@ -157,8 +157,8 @@ fn init(force: bool) -> Result<()> {
     let hook_content = "#!/bin/sh\nstagelint\n";
 
     if !force && hook_path.exists() {
-        let existing = fs::read_to_string(&hook_path)?;
-        if existing != hook_content {
+        let existing = fs::read(&hook_path)?;
+        if existing != hook_content.as_bytes() {
             bail!(
                 "pre-commit hook already exists at {}\nUse --force to overwrite",
                 hook_path.display()

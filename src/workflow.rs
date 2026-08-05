@@ -449,12 +449,12 @@ fn create_stash_commit(
             .is_some()
         {
             editor.remove(path.as_str()).map_err(Error::TreeEdit)?;
-        } else if let Some((id, kind)) = index
-            .entry_by_path_and_stage(path.as_bytes().as_bstr(), Stage::Unconflicted)
-            .and_then(|e| e.mode.to_tree_entry_mode().map(|m| (e.id, m.kind())))
+        } else if let Some(entry) =
+            index.entry_by_path_and_stage(path.as_bytes().as_bstr(), Stage::Unconflicted)
+            && let Some(mode) = entry.mode.to_tree_entry_mode()
         {
             editor
-                .upsert(path.as_str(), kind, id)
+                .upsert(path.as_str(), mode.kind(), entry.id)
                 .map_err(Error::TreeEdit)?;
         }
     }
@@ -841,10 +841,9 @@ fn update_index(
 
         let entry_stat = index.entries()[pos].stat;
         if mode_change.is_none()
-            && entry::Stat::from_fs(&meta).ok().is_some_and(|s| {
-                s.matches(&entry_stat, stat_options)
-                    && !entry_stat.is_racy(index.timestamp(), stat_options)
-            })
+            && let Ok(s) = entry::Stat::from_fs(&meta)
+            && s.matches(&entry_stat, stat_options)
+            && !entry_stat.is_racy(index.timestamp(), stat_options)
         {
             continue;
         }
@@ -1059,6 +1058,8 @@ fn restore_clean_tracked(
     let iter = repo
         .status(gix::progress::Discard)
         .map_err(|e| Error::Status(Box::new(e)))?
+        .untracked_files(gix::status::UntrackedFiles::None)
+        .index_worktree_submodules(None)
         .into_index_worktree_iter(Vec::<gix::bstr::BString>::new())
         .map_err(|e| Error::Status(Box::new(e)))?;
 

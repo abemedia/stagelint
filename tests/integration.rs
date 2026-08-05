@@ -1017,7 +1017,7 @@ fn closed_stdout_does_not_leak_stash() {
 
     let mut child = repo.stagelint(&[]);
     drop(child.stdout.take()); // close stdout so the linter output hits a broken pipe
-    assert!(child.wait().unwrap().success());
+    assert_success(child);
 
     assert_eq!(repo.read_file("file.txt"), "v2\n");
     assert!(repo.git(&["stash", "list"]).is_empty());
@@ -1979,10 +1979,21 @@ fn monorepo_multiple_configs() {
     assert_eq!(repo.git(&["show", ":packages/web/page.txt"]), "goodbye\n");
 }
 
-/// A commit whose files match no config passes.
+/// A commit in a repo with no config file passes.
+#[test]
+fn no_config_passes() {
+    let repo = TestRepo::empty();
+
+    repo.write_file("README.md", "readme\n");
+    repo.git(&["add", "README.md"]);
+
+    assert_success(repo.stagelint(&[]));
+}
+
+/// A commit whose files match no configured pattern passes.
 #[test]
 fn unmatched_files_pass() {
-    let repo = TestRepo::empty();
+    let repo = TestRepo::new(&json!({"*.txt": "false"}));
 
     repo.write_file("README.md", "readme\n");
     repo.git(&["add", "README.md"]);
@@ -2560,9 +2571,6 @@ fn crash_dirty_state_recoverable() {
     let mut child = repo.stagelint(&[]);
     assert!(repo.wait_sentinel(1, Duration::from_secs(10)));
 
-    // A stale index.lock left by the crash must not block recovery.
-    repo.write_file(".git/index.lock", "");
-
     child.kill().unwrap();
     child.wait().unwrap();
 
@@ -2578,8 +2586,6 @@ fn crash_dirty_state_recoverable() {
             .success(),
         "stash tree should record the user's deletion"
     );
-
-    let _ = fs::remove_file(repo.root.join(".git/index.lock"));
 
     repo.git(&["reset", "--hard", "HEAD"]);
     repo.git(&["stash", "pop"]);

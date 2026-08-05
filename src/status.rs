@@ -50,7 +50,9 @@ pub fn collect(repo: &gix::Repository, include_untracked: bool) -> Result<Worktr
         .status(gix::progress::Discard)
         .map_err(|e| Error::Status(Box::new(e)))?
         .index_worktree_rewrites(rewrites)
-        .untracked_files(untracked_files);
+        .untracked_files(untracked_files)
+        .tree_index_track_renames(status::tree_index::TrackRenames::Disabled)
+        .index_worktree_submodules(None);
 
     let iter = platform
         .into_iter(Vec::<gix::bstr::BString>::new())

@@ -270,6 +270,15 @@ impl<'a> Workflow<'a> {
     fn restore(&mut self, rollback: bool) -> Result<(), Error> {
         self.attempted = true;
 
+        // Undo the materialization: these files must return to their deleted worktree state.
+        for path in &self.absent {
+            let file_path = self.workdir.join(path);
+            remove_if_exists(&file_path).map_err(|e| Error::FileDelete {
+                path: file_path,
+                source: e,
+            })?;
+        }
+
         if let Some(oid) = self.oid {
             // Rollback returns every dirty file to its pre-run bytes; success only unhides.
             let manifest = if rollback {
@@ -278,15 +287,6 @@ impl<'a> Workflow<'a> {
                 &self.hidden
             };
             apply_stash(self.repo, self.workdir, oid, manifest)?;
-        }
-
-        // Undo the materialization: these files must return to their deleted worktree state.
-        for path in &self.absent {
-            let file_path = self.workdir.join(path);
-            remove_if_exists(&file_path).map_err(|e| Error::FileDelete {
-                path: file_path,
-                source: e,
-            })?;
         }
 
         // Rolling back also reverts side-effects in scopes that leave dirty files in place.
@@ -335,6 +335,20 @@ struct StashEntry {
     path: String,
     oid: ObjectId,
     mode: EntryMode,
+}
+
+impl StashEntry {
+    /// Index modes with no tree form fall back to a plain blob.
+    fn from_index_entry(path: String, entry: &gix::index::Entry) -> Self {
+        StashEntry {
+            path,
+            oid: entry.id,
+            mode: entry
+                .mode
+                .to_tree_entry_mode()
+                .unwrap_or(EntryKind::Blob.into()),
+        }
+    }
 }
 
 /// Capture a worktree file into the ODB in git form (clean-filtered), as `git add` would.
@@ -573,14 +587,7 @@ fn checkout_index(
         let Some(entry) = index.entry_by_path_and_stage(bpath, Stage::Unconflicted) else {
             continue;
         };
-        to_write.push(StashEntry {
-            path: path.clone(),
-            oid: entry.id,
-            mode: entry
-                .mode
-                .to_tree_entry_mode()
-                .unwrap_or(EntryKind::Blob.into()),
-        });
+        to_write.push(StashEntry::from_index_entry(path.clone(), entry));
     }
     checkout_worktree(repo, workdir, &to_write)
 }
@@ -1085,14 +1092,7 @@ fn restore_clean_tracked(
             continue;
         }
 
-        to_write.push(StashEntry {
-            path: path.to_owned(),
-            oid: entry.id,
-            mode: entry
-                .mode
-                .to_tree_entry_mode()
-                .unwrap_or(EntryKind::Blob.into()),
-        });
+        to_write.push(StashEntry::from_index_entry(path.to_owned(), &entry));
     }
 
     checkout_worktree(repo, workdir, &to_write)
@@ -1113,7 +1113,14 @@ fn remove_if_exists(path: &Path) -> Result<(), std::io::Error> {
     }
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(())
+        }
         Err(e) => Err(e),
     }
 }

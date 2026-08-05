@@ -1,92 +1,18 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use serde::Deserialize;
 
-pub type Config = IndexMap<String, Commands>;
-
-#[derive(Debug, Deserialize)]
-#[serde(from = "RawEntry")]
-pub struct Commands(Vec<CommandObject>);
-
-impl std::ops::Deref for Commands {
-    type Target = [CommandObject];
-
-    fn deref(&self) -> &[CommandObject] {
-        &self.0
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RawEntry {
-    Single(CommandObject),
-    List(Vec<CommandObject>),
-}
-
-impl From<RawEntry> for Commands {
-    fn from(raw: RawEntry) -> Self {
-        match raw {
-            RawEntry::Single(obj) => Commands(vec![obj]),
-            RawEntry::List(items) => Commands(items),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(from = "RawCommand")]
-pub struct CommandObject {
-    pub command: String,
-    pub pass_filenames: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged, deny_unknown_fields)]
-enum RawCommand {
-    Simple(String),
-    Object {
-        command: String,
-        #[serde(default = "default_true")]
-        pass_filenames: bool,
-    },
-}
-
-impl From<RawCommand> for CommandObject {
-    fn from(raw: RawCommand) -> Self {
-        match raw {
-            RawCommand::Simple(command) => CommandObject {
-                command,
-                pass_filenames: true,
-            },
-            RawCommand::Object {
-                command,
-                pass_filenames,
-            } => CommandObject {
-                command,
-                pass_filenames,
-            },
-        }
-    }
-}
-
-fn default_true() -> bool {
-    true
-}
-
-const CONFIG_FILES: &[&str] = &[
-    ".stagelint.yml",
-    ".stagelint.yaml",
-    ".stagelint.json",
-    ".stagelint.jsonc",
-    ".stagelint.json5",
-];
-
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("no config file found (looked for {})", CONFIG_FILES.join(", "))]
-    NotFound,
+    #[error("invalid glob pattern '{pattern}'")]
+    InvalidGlob {
+        pattern: String,
+        #[source]
+        source: globset::Error,
+    },
     #[error("failed to read {path}")]
     Read {
         path: PathBuf,
@@ -105,13 +31,103 @@ pub enum Error {
         #[source]
         source: json5::Error,
     },
-    #[error("unsupported config file extension: {}", path.display())]
-    UnsupportedExtension { path: PathBuf },
+    #[error("invalid config {path}: {message}")]
+    Invalid { path: PathBuf, message: String },
 }
+
+/// One runner task per config pattern with matching files.
+pub struct Task {
+    pub commands: Vec<CommandObject>,
+    pub files: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandObject {
+    pub command: String,
+    #[serde(default = "default_true")]
+    pub pass_filenames: bool,
+}
+
+impl From<String> for CommandObject {
+    fn from(command: String) -> Self {
+        CommandObject {
+            command,
+            pass_filenames: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Group `paths` by their nearest config file, load each, and match its patterns.
+/// Tasks are ordered by config path, then by pattern declaration order.
+pub fn resolve<'a>(paths: impl IntoIterator<Item = &'a str>) -> Result<Vec<Task>, Error> {
+    let mut cache = HashMap::new();
+    let mut by_config: BTreeMap<PathBuf, Vec<&str>> = BTreeMap::new();
+    for path in paths {
+        let dir = Path::new(path).parent().unwrap_or(Path::new(""));
+        if let Some(config_path) = find(dir, Path::new(""), &mut cache) {
+            by_config.entry(config_path).or_default().push(path);
+        }
+    }
+
+    let mut tasks = Vec::new();
+    for (config_path, paths) in &by_config {
+        let cfg = load_file(config_path)?;
+        let prefix = config_path.parent().unwrap_or(Path::new(""));
+
+        for (pattern, entry) in cfg {
+            // Bare patterns match basenames at any depth.
+            let glob = if pattern.contains('/') {
+                pattern.clone()
+            } else {
+                format!("**/{pattern}")
+            };
+            let matcher = globset::GlobBuilder::new(&glob)
+                .literal_separator(true)
+                .build()
+                .map_err(|source| Error::InvalidGlob {
+                    pattern: pattern.clone(),
+                    source,
+                })?
+                .compile_matcher();
+
+            let files: Vec<String> = paths
+                .iter()
+                .filter(|p| {
+                    let relative = Path::new(p).strip_prefix(prefix).unwrap_or(Path::new(p));
+                    matcher.is_match(relative)
+                })
+                .map(|p| (*p).to_owned())
+                .collect();
+
+            if files.is_empty() {
+                continue;
+            }
+
+            tasks.push(Task {
+                commands: entry,
+                files,
+            });
+        }
+    }
+    Ok(tasks)
+}
+
+const CONFIG_FILES: &[&str] = &[
+    ".stagelint.yml",
+    ".stagelint.yaml",
+    ".stagelint.json",
+    ".stagelint.jsonc",
+    ".stagelint.json5",
+];
 
 /// Search for a config file starting from `start` and walking up to `root` (inclusive).
 /// Caches results for all visited directories so repeated lookups in the same subtree are free.
-pub fn find(
+fn find(
     start: &Path,
     root: &Path,
     cache: &mut HashMap<PathBuf, Option<PathBuf>>,
@@ -122,14 +138,13 @@ pub fn find(
         if let Some(cached) = cache.get(dir) {
             break cached.clone();
         }
+        visited.push(dir.to_path_buf());
         for name in CONFIG_FILES {
             let path = dir.join(name);
             if path.is_file() {
-                visited.push(dir.to_path_buf());
                 break 'walk Some(path);
             }
         }
-        visited.push(dir.to_path_buf());
         if dir == root {
             break None;
         }
@@ -146,7 +161,14 @@ pub fn find(
     result
 }
 
-pub fn load_file(path: &Path) -> Result<Config, Error> {
+type Config = IndexMap<String, Vec<CommandObject>>;
+type ConfigAs = serde_with::MapPreventDuplicates<
+    serde_with::Same,
+    serde_with::OneOrMany<serde_with::PickFirst<(serde_with::Same, serde_with::FromInto<String>)>>,
+>;
+type ConfigWrap = serde_with::de::DeserializeAsWrap<Config, ConfigAs>;
+
+fn load_file(path: &Path) -> Result<Config, Error> {
     let content = fs::read_to_string(path).map_err(|e| Error::Read {
         path: path.to_owned(),
         source: e,
@@ -154,19 +176,37 @@ pub fn load_file(path: &Path) -> Result<Config, Error> {
 
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-    match ext {
-        "yml" | "yaml" => yaml_serde::from_str(&content).map_err(|e| Error::ParseYaml {
+    let cfg: Config = match ext {
+        "yml" | "yaml" => yaml_serde::from_str::<ConfigWrap>(&content)
+            .map_err(|e| Error::ParseYaml {
+                path: path.to_owned(),
+                source: e,
+            })?
+            .into_inner(),
+        "json" | "jsonc" | "json5" => json5::from_str::<ConfigWrap>(&content)
+            .map_err(|e| Error::ParseJson {
+                path: path.to_owned(),
+                source: e,
+            })?
+            .into_inner(),
+        _ => unreachable!("no parser for {}", path.display()),
+    };
+
+    for (pattern, commands) in &cfg {
+        let message = if commands.is_empty() {
+            format!("pattern \"{pattern}\" has no commands")
+        } else if commands.iter().any(|obj| obj.command.trim().is_empty()) {
+            format!("empty command in pattern \"{pattern}\"")
+        } else {
+            continue;
+        };
+        return Err(Error::Invalid {
             path: path.to_owned(),
-            source: e,
-        }),
-        "json" | "jsonc" | "json5" => json5::from_str(&content).map_err(|e| Error::ParseJson {
-            path: path.to_owned(),
-            source: e,
-        }),
-        _ => Err(Error::UnsupportedExtension {
-            path: path.to_owned(),
-        }),
+            message,
+        });
     }
+
+    Ok(cfg)
 }
 
 #[cfg(test)]
@@ -268,16 +308,33 @@ mod tests {
             ".stagelint.json",
             r#"{"*.go": {"command": "gofmt -w", "pass_filename": false}}"#,
         );
+        let Err(err) = result else {
+            panic!("misspelled key must fail, not silently default");
+        };
+        let source = std::error::Error::source(&err).expect("source").to_string();
         assert!(
-            result.is_err(),
-            "misspelled key must fail, not silently default"
+            source.contains("pass_filename"),
+            "the error should name the unknown field, got: {source}"
         );
     }
 
     #[test]
-    fn unsupported_extension_rejected() {
-        let result = load("stagelint.toml", r#""*.go" = "gofmt -w""#);
-        assert!(matches!(result, Err(Error::UnsupportedExtension { .. })));
+    fn duplicate_pattern_rejected() {
+        let result = load(".stagelint.yml", "\"*.js\": eslint\n\"*.js\": prettier\n");
+        assert!(result.is_err(), "a duplicated key must fail, not last-wins");
+    }
+
+    #[test]
+    fn empty_commands_rejected() {
+        assert!(load(".stagelint.yml", "\"*.js\": []\n").is_err());
+        assert!(load(".stagelint.yml", "\"*.js\": \"\"\n").is_err());
+    }
+
+    #[test]
+    fn every_config_file_name_has_a_parser() {
+        for name in CONFIG_FILES {
+            let _ = load(name, "");
+        }
     }
 
     #[test]

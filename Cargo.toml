@@ -6,12 +6,13 @@ rust-version = "1.85"
 description = "Run linters and formatters on staged git files"
 repository = "https://github.com/abemedia/stagelint"
 license = "MIT"
+exclude = [".github/"]
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 command-group = { version = "5", features = ["with-tokio"] }
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
 gix = {
   version = "0.86",
   default-features = false,
@@ -29,9 +30,13 @@ globset = "0.4"
 indexmap = { version = "2", features = ["serde"] }
 json5 = "1"
 serde = { version = "1", features = ["derive"] }
+serde_with = { version = "3", features = ["indexmap_2"] }
 shell-words = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "process", "rt", "sync"] }
+tokio = {
+  version = "1",
+  features = ["io-util", "macros", "process", "rt", "sync"]
+}
 tokio-util = "0.7"
 yaml_serde = "0.10"
 
@@ -46,5 +51,5 @@ pedantic = { level = "warn", priority = -1 }
 opt-level = "z"
 strip = true
 lto = true
-panic = "abort"
+panic = "abort"  # Panics abort into the tested crash-recovery path (stash survives).
 codegen-units = 1

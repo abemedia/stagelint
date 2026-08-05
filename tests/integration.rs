@@ -3,7 +3,7 @@ mod helpers;
 use helpers::*;
 use serde_json::json;
 use std::fs;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 // Core
@@ -28,6 +28,28 @@ fn formats_staged_file() {
 
     assert_eq!(repo.git(&["show", ":hello.txt"]), "HELLO WORLD\n");
     assert_eq!(repo.read_file("hello.txt"), "HELLO WORLD\n");
+}
+
+/// Running from a repo subdirectory behaves identically to running from the root.
+#[test]
+fn runs_from_subdirectory() {
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+
+    repo.write_file("file.txt", "hello\n");
+    repo.git(&["add", "file.txt"]);
+
+    let sub = repo.root.join("sub/dir");
+    fs::create_dir_all(&sub).expect("mkdir");
+
+    let mut cmd = repo.stagelint_cmd();
+    let output = cmd.current_dir(&sub).output().expect("run stagelint");
+    assert!(
+        output.status.success(),
+        "stagelint failed from a subdirectory: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(repo.git(&["show", ":file.txt"]), "HELLO\n");
 }
 
 /// A failing run rolls back every linter side-effect while leaving the user's changes alone.
@@ -441,17 +463,18 @@ fn empty_repo_stash_untracked_restores() {
     assert_eq!(repo.git(&["show", ":staged.txt"]), "HELLO\n");
 }
 
-/// Ctrl+C mid-run cancels the linter and restores the repo with no stash left behind.
+/// SIGTERM mid-run cancels the linter and restores the repo with no stash left behind.
+/// SIGINT (Ctrl+C) shares the same handler, so this covers both.
 #[test]
 #[cfg(unix)]
-fn ctrl_c_restores_repo() {
+fn sigterm_restores_repo() {
     let repo = TestRepo::new(&json!({"*.txt": sentinel(1)}));
 
     repo.write_file("file.txt", "staged\n");
     repo.git(&["add", "file.txt"]);
     repo.write_file("file.txt", "working tree\n");
 
-    let mut child = repo.stagelint(&[]);
+    let child = repo.stagelint(&[]);
 
     assert!(repo.wait_sentinel(1, Duration::from_secs(10)));
 
@@ -462,15 +485,15 @@ fn ctrl_c_restores_repo() {
     );
 
     Command::new("kill")
-        .args(["-INT", &child.id().to_string()])
+        .args(["-TERM", &child.id().to_string()])
         .status()
-        .expect("send SIGINT");
+        .expect("send SIGTERM");
 
-    let status = child.wait().unwrap();
+    let output = wait_bounded(child);
     assert_eq!(
-        status.code(),
+        output.status.code(),
         Some(1),
-        "SIGINT should trigger a controlled exit, not a signal-kill"
+        "SIGTERM should trigger a controlled exit, not a signal-kill"
     );
 
     assert_eq!(repo.git(&["show", ":file.txt"]), "staged\n");
@@ -481,6 +504,36 @@ fn ctrl_c_restores_repo() {
         stash_list.is_empty(),
         "no stash entries should remain after interrupt, got: {stash_list}"
     );
+}
+
+/// Ctrl+C restores the repo even when a pipe-holding background child outlives the leader.
+#[test]
+#[cfg(unix)]
+fn ctrl_c_kills_background_pipe_holder() {
+    let repo = TestRepo::new(&json!({
+        "*.txt": "sh -c 'sleep 30 & touch .git/linter-1; exit 0'"
+    }));
+
+    repo.write_file("file.txt", "staged\n");
+    repo.git(&["add", "file.txt"]);
+    repo.write_file("file.txt", "working tree\n");
+
+    let child = repo.stagelint(&[]);
+
+    assert!(repo.wait_sentinel(1, Duration::from_secs(10)));
+    // Let the leader's `exit 0` land so only the backgrounded sleep holds the pipes.
+    std::thread::sleep(Duration::from_millis(500));
+
+    Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("send SIGINT");
+
+    let output = wait_bounded(child);
+    assert_eq!(output.status.code(), Some(1), "expected a controlled exit");
+
+    assert_eq!(repo.read_file("file.txt"), "working tree\n");
+    assert!(repo.git(&["stash", "list"]).is_empty());
 }
 
 // Stash
@@ -724,6 +777,40 @@ fn stash_untracked_hides_rename_destination() {
         !repo.root.join("old.txt").exists(),
         "old.txt should remain absent after restore"
     );
+}
+
+/// `--stash untracked` round-trips a staged file whose parent directory became an untracked file.
+#[test]
+fn stash_untracked_restores_directory_file_conflict() {
+    let repo = TestRepo::new(&json!({"*.txt": "true"}));
+
+    repo.write_file("trigger.txt", "staged\n");
+    repo.git(&["add", "trigger.txt"]);
+
+    repo.write_file("build/out.txt", "staged nested\n");
+    repo.git(&["add", "build/out.txt"]);
+    fs::remove_dir_all(repo.root.join("build")).expect("remove build dir");
+    repo.write_file("build", "now a file\n");
+
+    assert_success(repo.stagelint(&["--stash", "untracked"]));
+
+    assert_eq!(repo.read_file("build"), "now a file\n");
+    assert_eq!(repo.git(&["show", ":build/out.txt"]), "staged nested\n");
+}
+
+/// `--stash untracked` skips a nested git repository instead of aborting.
+#[test]
+fn stash_untracked_skips_nested_repo() {
+    let repo = TestRepo::new(&json!({"*.txt": "true"}));
+
+    repo.write_file("trigger.txt", "staged\n");
+    repo.git(&["add", "trigger.txt"]);
+
+    repo.git(&["init", "nested"]);
+
+    assert_success(repo.stagelint(&["--stash", "untracked"]));
+
+    assert!(repo.root.join("nested/.git").exists());
 }
 
 /// A stash-creation failure must leave the working tree untouched.
@@ -1665,6 +1752,23 @@ fn default_stops_on_first_error() {
     );
 }
 
+/// Commands must not inherit stagelint's stdin: a command reading it would hang forever.
+#[test]
+fn command_stdin_is_closed() {
+    let repo = TestRepo::new(&json!({
+        "*.txt": {"command": "sh -c 'cat'", "pass_filenames": false}
+    }));
+
+    repo.write_file("file.txt", "hello\n");
+    repo.git(&["add", "file.txt"]);
+
+    // The pipe stays open for the whole run; an inheriting `cat` would block on it.
+    let mut cmd = repo.stagelint_cmd();
+    let child = cmd.stdin(Stdio::piped()).spawn().expect("spawn stagelint");
+
+    assert_success(child);
+}
+
 /// `--continue-on-error`: all commands run despite a failure; exit code still non-zero.
 #[test]
 fn continue_on_error_runs_all_on_failure() {
@@ -1780,6 +1884,12 @@ fn concurrent_failures_all_reported() {
         stdout.contains("RS-ERROR"),
         "second failure output lost: {stdout}"
     );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("command failed: `sh -c 'echo "),
+        "failure should name the full command, got: {stderr}"
+    );
 }
 
 /// `--continue-on-error`: a command that fails to spawn does not stop its pipeline.
@@ -1867,6 +1977,17 @@ fn monorepo_multiple_configs() {
     assert_eq!(repo.git(&["show", ":root.txt"]), "HELLO\n");
 
     assert_eq!(repo.git(&["show", ":packages/web/page.txt"]), "goodbye\n");
+}
+
+/// A commit whose files match no config passes.
+#[test]
+fn unmatched_files_pass() {
+    let repo = TestRepo::empty();
+
+    repo.write_file("README.md", "readme\n");
+    repo.git(&["add", "README.md"]);
+
+    assert_success(repo.stagelint(&[]));
 }
 
 /// Overlapping globs never run concurrently: the later task starts only after the earlier ends.
@@ -2365,6 +2486,27 @@ fn init_no_overwrite_without_force() {
     );
 }
 
+/// A hook symlink is detected even when dangling; `--force` replaces the link itself.
+#[test]
+fn init_replaces_hook_symlink() {
+    if !file_symlinks_supported() {
+        return;
+    }
+    let repo = TestRepo::empty();
+
+    symlink_file("gone-target", &repo.root.join(".git/hooks/pre-commit")).expect("symlink hook");
+
+    assert_failure(repo.stagelint(&["init"]));
+
+    assert_success(repo.stagelint(&["init", "--force"]));
+    let meta = fs::symlink_metadata(repo.root.join(".git/hooks/pre-commit")).expect("hook meta");
+    assert!(meta.is_file(), "the hook should be a regular file now");
+    assert!(
+        !repo.root.join(".git/hooks/gone-target").exists(),
+        "init must not write through the link"
+    );
+}
+
 /// Run-only flags cannot be combined with the `init` subcommand.
 #[test]
 fn init_rejects_run_flags() {
@@ -2381,10 +2523,9 @@ fn init_relative_hookspath_resolves_to_root() {
     repo.git(&["config", "core.hooksPath", "my-hooks"]);
     repo.write_file("sub/keep.txt", "x\n");
 
-    let output = Command::new(stagelint_exe())
+    let mut cmd = repo.stagelint_cmd();
+    let output = cmd
         .current_dir(repo.root.join("sub"))
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", repo.root.join(".git/no-global-config"))
         .arg("init")
         .output()
         .expect("run stagelint init");

@@ -65,13 +65,13 @@ pub fn collect(repo: &gix::Repository, include_untracked: bool) -> Result<Worktr
         let item = item.map_err(|e| Error::Status(Box::new(e)))?;
         match item {
             status::Item::TreeIndex(change) => {
-                let path = change.location().to_str().map_err(|_| Error::NonUtf8Path)?;
                 if matches!(change.entry_mode(), Mode::SYMLINK | Mode::COMMIT) {
                     continue;
                 }
                 if let gix::diff::index::Change::Deletion { .. } = &change {
                     continue;
                 }
+                let path = change.location().to_str().map_err(|_| Error::NonUtf8Path)?;
                 staged.insert(path.to_owned());
             }
             status::Item::IndexWorktree(iw_item) => match iw_item {
@@ -96,6 +96,10 @@ pub fn collect(repo: &gix::Repository, include_untracked: bool) -> Result<Worktr
                 status::index_worktree::Item::DirectoryContents { entry, .. } => {
                     if include_untracked
                         && matches!(entry.status, gix::dir::entry::Status::Untracked)
+                        && matches!(
+                            entry.disk_kind,
+                            Some(gix::dir::entry::Kind::File | gix::dir::entry::Kind::Symlink)
+                        )
                     {
                         let path = entry.rela_path.to_str().map_err(|_| Error::NonUtf8Path)?;
                         untracked.insert(path.to_owned());

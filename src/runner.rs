@@ -25,6 +25,19 @@ pub enum Error {
     Cancelled,
 }
 
+/// A single command of a task pipeline.
+pub struct Command {
+    pub command: String,
+    pub pass_filenames: bool,
+}
+
+#[derive(Clone)]
+struct Cmd {
+    command: String,
+    program: String,
+    args: Vec<String>,
+}
+
 struct CommandResult {
     status: Result<process::ExitStatus, io::Error>,
     stdout: Vec<u8>,
@@ -37,14 +50,8 @@ struct TaskOutcome {
     commands: Vec<CommandResult>,
 }
 
-/// A single command of a task pipeline.
-pub struct Command {
-    pub command: String,
-    pub pass_filenames: bool,
-}
-
 pub struct Runner {
-    tasks: Vec<Vec<(String, Vec<String>)>>,
+    tasks: Vec<Vec<Cmd>>,
     /// Tasks whose pending count drops when the task at the same index finishes.
     dependents: Vec<Vec<usize>>,
     /// Unfinished predecessors per task; a task is ready to start at zero.
@@ -93,7 +100,11 @@ impl Runner {
                 args.extend(files.iter().map(ToString::to_string));
             }
             let program = args.remove(0);
-            resolved.push((program, args));
+            resolved.push(Cmd {
+                command: command.command.clone(),
+                program,
+                args,
+            });
         }
 
         let mut after: Vec<usize> = files
@@ -146,16 +157,16 @@ impl Runner {
 
             for (cmd, result) in outcome.commands.iter().enumerate() {
                 print_output(&result.stdout, &result.stderr);
-                let name = &self.tasks[outcome.task][cmd].0;
+                let name = &self.tasks[outcome.task][cmd].command;
                 match &result.status {
                     Ok(s) if s.success() => {}
-                    _ if result.cancelled => eprintln!("stagelint: command cancelled: {name}"),
+                    _ if result.cancelled => eprintln!("stagelint: command cancelled: `{name}`"),
                     Ok(s) => {
-                        eprintln!("stagelint: command failed: {name} (exit {s})");
+                        eprintln!("stagelint: command failed: `{name}` ({s})");
                         error_count += 1;
                     }
                     Err(e) => {
-                        eprintln!("stagelint: failed to run {name}: {e}");
+                        eprintln!("stagelint: failed to run `{name}`: {e}");
                         error_count += 1;
                     }
                 }
@@ -203,16 +214,15 @@ impl Runner {
 
         set.spawn(async move {
             let mut results = Vec::with_capacity(commands.len());
-            for (program, args) in &commands {
+            for cmd in &commands {
                 // Don't spawn a command a pending cancellation would instantly kill.
                 if running.is_cancelled() {
                     break;
                 }
-                let result = run_command(program, args, &running).await;
-                let stop = result.cancelled
-                    || (!continue_on_error && !matches!(&result.status, Ok(s) if s.success()));
+                let result = run_command(&cmd.program, &cmd.args, &running).await;
+                let failed = !matches!(&result.status, Ok(s) if s.success());
                 results.push(result);
-                if stop {
+                if failed && !continue_on_error {
                     break;
                 }
             }
@@ -228,6 +238,7 @@ impl Runner {
 async fn run_command(program: &str, args: &[String], running: &CancellationToken) -> CommandResult {
     let mut proc = tokio::process::Command::new(program);
     proc.args(args)
+        .stdin(process::Stdio::null())
         .stdout(process::Stdio::piped())
         .stderr(process::Stdio::piped());
 
@@ -264,10 +275,8 @@ async fn run_command(program: &str, args: &[String], running: &CancellationToken
             () = running.cancelled(), if !handled => {
                 handled = true;
                 // A process already exiting is no cancellation; keep its real status.
-                if child.try_wait().ok().flatten().is_none() {
-                    child.start_kill().ok();
-                    cancelled = true;
-                }
+                cancelled = child.try_wait().ok().flatten().is_none();
+                child.start_kill().ok();
             }
         }
     };

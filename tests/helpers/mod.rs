@@ -127,13 +127,11 @@ impl TestRepo {
         fs::remove_file(self.root.join(format!(".git/linter-{n}"))).expect("release sentinel");
     }
 
-    /// Spawn stagelint in this repo with captured output. Pass the returned child to
-    /// `assert_success`, `assert_failure`, or use `.kill()` + `.wait()` for crash tests.
-    /// Host git config is ignored so local settings cannot leak into tests.
-    pub fn stagelint(&self, args: &[&str]) -> Child {
-        Command::new(&self.stagelint_exe)
-            .current_dir(&self.root)
-            .args(args)
+    /// Preconfigured stagelint command with captured output.
+    /// Host git config and identity are stripped so local settings cannot leak into tests.
+    pub fn stagelint_cmd(&self) -> Command {
+        let mut cmd = Command::new(&self.stagelint_exe);
+        cmd.current_dir(&self.root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -142,15 +140,40 @@ impl TestRepo {
             .env_remove("GIT_AUTHOR_EMAIL")
             .env_remove("GIT_COMMITTER_NAME")
             .env_remove("GIT_COMMITTER_EMAIL")
-            .env_remove("EMAIL")
+            .env_remove("EMAIL");
+        cmd
+    }
+
+    /// Spawn stagelint in this repo with captured output. Pass the returned child to
+    /// `assert_success`, `assert_failure`, or use `.kill()` + `.wait()` for crash tests.
+    pub fn stagelint(&self, args: &[&str]) -> Child {
+        self.stagelint_cmd()
+            .args(args)
             .spawn()
             .expect("spawn stagelint")
     }
 }
 
+/// Wait for stagelint to exit, killing it if it hangs.
+pub fn wait_bounded(mut child: Child) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        if child.try_wait().expect("poll stagelint").is_some() {
+            return child.wait_with_output().expect("wait");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.kill().ok();
+    let output = child.wait_with_output().expect("wait");
+    panic!(
+        "stagelint did not exit within 60s\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Wait for stagelint to exit and assert it succeeded.
 pub fn assert_success(child: Child) -> Output {
-    let output = child.wait_with_output().expect("wait");
+    let output = wait_bounded(child);
     assert!(
         output.status.success(),
         "stagelint failed:\n{}",
@@ -161,7 +184,7 @@ pub fn assert_success(child: Child) -> Output {
 
 /// Wait for stagelint to exit and assert it failed.
 pub fn assert_failure(child: Child) -> Output {
-    let output = child.wait_with_output().expect("wait");
+    let output = wait_bounded(child);
     assert!(
         !output.status.success(),
         "stagelint should have failed:\n{}",
@@ -186,8 +209,8 @@ pub fn symlink_dir(target: &str, link: &Path) -> io::Result<()> {
 
 pub fn file_symlinks_supported() -> bool {
     let dir = tempfile::tempdir().unwrap();
-    let ok = fs::write(dir.path().join("target"), "").is_ok()
-        && symlink_file("target", &dir.path().join("link")).is_ok();
+    fs::write(dir.path().join("target"), "").expect("write symlink target");
+    let ok = symlink_file("target", &dir.path().join("link")).is_ok();
     if !ok {
         skip("file symlinks unsupported");
     }
@@ -196,8 +219,8 @@ pub fn file_symlinks_supported() -> bool {
 
 pub fn dir_symlinks_supported() -> bool {
     let dir = tempfile::tempdir().unwrap();
-    let ok = fs::create_dir(dir.path().join("target")).is_ok()
-        && symlink_dir("target", &dir.path().join("link")).is_ok();
+    fs::create_dir(dir.path().join("target")).expect("create symlink target");
+    let ok = symlink_dir("target", &dir.path().join("link")).is_ok();
     if !ok {
         skip("dir symlinks unsupported");
     }

@@ -4,9 +4,8 @@ mod runner;
 mod status;
 mod workflow;
 
-use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Result, anyhow, bail};
 use clap::Parser;
@@ -29,12 +28,15 @@ fn main() {
 }
 
 fn run(opts: &Opts) -> Result<()> {
-    let repo = gix::discover(".")?;
+    let (root, _trust) = gix::discover::upwards(Path::new("."))?;
+    let (_, workdir) = root.into_repository_and_work_tree_directories();
+    std::env::set_current_dir(workdir.ok_or_else(|| anyhow!("bare repository"))?)?;
+
+    let repo = gix::open(".")?;
     let workdir = repo
         .workdir()
         .ok_or_else(|| anyhow!("bare repository"))?
         .to_path_buf();
-    std::env::set_current_dir(&workdir)?;
 
     let stash_tracked = matches!(opts.stash, StashScope::Tracked | StashScope::Untracked);
     let stash_untracked = matches!(opts.stash, StashScope::Untracked);
@@ -44,8 +46,25 @@ fn run(opts: &Opts) -> Result<()> {
         return Ok(());
     }
 
+    let tasks = config::resolve(status.staged.iter().map(String::as_str))?;
+    if tasks.is_empty() {
+        return Ok(());
+    }
+
     let cancel = CancellationToken::new();
-    let runner = build_runner(&workdir, &status, opts, cancel.clone())?;
+    let mut runner = runner::Runner::new(opts.continue_on_error, opts.concurrent, cancel.clone());
+    for task in &tasks {
+        let commands: Vec<runner::Command> = task
+            .commands
+            .iter()
+            .map(|obj| runner::Command {
+                command: obj.command.clone(),
+                pass_filenames: obj.pass_filenames,
+            })
+            .collect();
+        let files: Vec<&str> = task.files.iter().map(String::as_str).collect();
+        runner.add(&commands, &files)?;
+    }
 
     // Once we start stashing, Ctrl+C must not kill the process or it could result in data-loss.
     ctrlc::set_handler({
@@ -56,80 +75,11 @@ fn run(opts: &Opts) -> Result<()> {
     let mut workflow =
         workflow::Workflow::new(&repo, &workdir, status, stash_tracked, stash_untracked)?;
 
-    if let Err(e) = runner.run() {
-        bail!(e);
-    }
+    runner.run()?;
 
     workflow.finish(opts.quiet)?;
 
     Ok(())
-}
-
-fn build_runner(
-    workdir: &Path,
-    status: &status::WorktreeStatus,
-    opts: &Opts,
-    cancel: CancellationToken,
-) -> Result<runner::Runner> {
-    let mut files_by_config: BTreeMap<PathBuf, Vec<&str>> = BTreeMap::new();
-    let mut cache = HashMap::new();
-
-    for path in &status.staged {
-        let file_dir = workdir.join(path).parent().unwrap_or(workdir).to_path_buf();
-        if let Some(config_path) = config::find(&file_dir, workdir, &mut cache) {
-            files_by_config.entry(config_path).or_default().push(path);
-        }
-    }
-
-    if files_by_config.is_empty() {
-        bail!("{}", config::Error::NotFound);
-    }
-
-    let mut r = runner::Runner::new(opts.continue_on_error, opts.concurrent, cancel);
-
-    for (config_path, paths) in &files_by_config {
-        let cfg = config::load_file(config_path)?;
-        let config_dir = config_path.parent().unwrap_or(workdir);
-        let prefix = config_dir.strip_prefix(workdir).unwrap_or(Path::new(""));
-
-        for (pattern, entry) in &cfg {
-            // Bare patterns match basenames at any depth.
-            let glob = if pattern.contains('/') {
-                pattern.clone()
-            } else {
-                format!("**/{pattern}")
-            };
-            let matcher = globset::GlobBuilder::new(&glob)
-                .literal_separator(true)
-                .build()
-                .map_err(|e| anyhow!("invalid glob pattern '{pattern}': {e}"))?
-                .compile_matcher();
-
-            let matching: Vec<&str> = paths
-                .iter()
-                .copied()
-                .filter(|p| {
-                    let relative = Path::new(p).strip_prefix(prefix).unwrap_or(Path::new(p));
-                    matcher.is_match(relative)
-                })
-                .collect();
-
-            if matching.is_empty() {
-                continue;
-            }
-
-            let commands: Vec<runner::Command> = entry
-                .iter()
-                .map(|obj| runner::Command {
-                    command: obj.command.clone(),
-                    pass_filenames: obj.pass_filenames,
-                })
-                .collect();
-            r.add(&commands, &matching)?;
-        }
-    }
-
-    Ok(r)
 }
 
 fn init(force: bool) -> Result<()> {
@@ -156,9 +106,9 @@ fn init(force: bool) -> Result<()> {
     let hook_path = hooks_dir.join("pre-commit");
     let hook_content = "#!/bin/sh\nstagelint\n";
 
-    if !force && hook_path.exists() {
-        let existing = fs::read(&hook_path)?;
-        if existing != hook_content.as_bytes() {
+    if !force && hook_path.symlink_metadata().is_ok() {
+        let existing = fs::read(&hook_path).ok();
+        if existing.as_deref() != Some(hook_content.as_bytes()) {
             bail!(
                 "pre-commit hook already exists at {}\nUse --force to overwrite",
                 hook_path.display()
@@ -166,6 +116,11 @@ fn init(force: bool) -> Result<()> {
         }
     }
 
+    match fs::remove_file(&hook_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
     fs::write(&hook_path, hook_content)?;
 
     #[cfg(unix)]

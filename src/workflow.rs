@@ -925,24 +925,20 @@ fn apply_merges(
     let mut out = Vec::new();
     for mb in merge_bases {
         let file_path = workdir.join(&mb.path);
-        // Only merge regular files; anything else would read and write through symlinks.
-        let Ok(meta) = file_path.symlink_metadata() else {
-            continue;
+        let meta = match file_path.symlink_metadata() {
+            Ok(meta) => meta,
+            Err(e) => {
+                warn_unapplied(quiet, &mb.path, e);
+                continue;
+            }
         };
+        // Only merge regular files; anything else would read and write through symlinks.
         if !meta.is_file() {
             continue;
         }
 
-        let file_size = meta.len();
-        if file_size > threshold {
-            if !quiet {
-                eprintln!(
-                    "stagelint: warning: could not apply changes to working tree for {}: file \
-                     exceeds core.bigFileThreshold - staged content is updated, working tree \
-                     unchanged",
-                    mb.path
-                );
-            }
+        if meta.len() > threshold {
+            warn_unapplied(quiet, &mb.path, "file exceeds core.bigFileThreshold");
             continue;
         }
 
@@ -972,23 +968,12 @@ fn apply_merges(
         let (pick, resolution) = match prepared.merge(&mut out, Labels::default(), &context) {
             Ok(result) => result,
             Err(e) => {
-                if !quiet {
-                    eprintln!(
-                        "stagelint: warning: could not apply all changes to {}: {:#}",
-                        mb.path,
-                        anyhow::Error::new(e)
-                    );
-                }
+                warn_unapplied(quiet, &mb.path, format!("{:#}", anyhow::Error::new(e)));
                 continue;
             }
         };
         if resolution != Resolution::Complete {
-            if !quiet {
-                eprintln!(
-                    "stagelint: warning: could not apply changes to {}: they conflict with unstaged changes",
-                    mb.path
-                );
-            }
+            warn_unapplied(quiet, &mb.path, "they conflict with unstaged changes");
             continue;
         }
         // Ours means the worktree file already holds the result.
@@ -999,12 +984,7 @@ fn apply_merges(
             Ok(Some(bytes)) => bytes,
             Ok(None) => out.as_slice(),
             Err(()) => {
-                if !quiet {
-                    eprintln!(
-                        "stagelint: warning: could not apply changes to {}: merge result unavailable",
-                        mb.path
-                    );
-                }
+                warn_unapplied(quiet, &mb.path, "merge result unavailable");
                 continue;
             }
         };
@@ -1013,6 +993,13 @@ fn apply_merges(
     }
 
     Ok(())
+}
+
+/// Warn that a merge base was skipped: staged content is updated, the working tree is not.
+fn warn_unapplied(quiet: bool, path: &str, reason: impl std::fmt::Display) {
+    if !quiet {
+        eprintln!("stagelint: warning: could not apply changes to {path}: {reason}");
+    }
 }
 
 /// Convert a merge result from git form back to worktree form and write it.

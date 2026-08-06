@@ -1440,7 +1440,7 @@ fn merge_driver_failure_warns_and_skips() {
     let output = assert_success(repo.stagelint(&[]));
 
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("could not apply all changes"),
+        String::from_utf8_lossy(&output.stderr).contains("could not apply changes"),
         "driver failure should be warned about, got: {}",
         String::from_utf8_lossy(&output.stderr)
     );

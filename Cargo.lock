@@ -2259,6 +2259,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "which",
  "yaml_serde",
 ]
 
@@ -2579,6 +2580,15 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap 2.13.0",
  "semver",
+]
+
+[[package]]
+name = "which"
+version = "8.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f3ef584124b911bcc3875c2f1472e80f24361ceb789bd1c62b3e9a3df9ff43c"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

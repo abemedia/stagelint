@@ -44,6 +44,9 @@ yaml_serde = "0.10"
 serde_json = "1"
 tempfile = "3"
 
+[target."cfg(windows)".dependencies]
+which = "8"
+
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 

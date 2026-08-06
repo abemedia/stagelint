@@ -100,6 +100,14 @@ impl Runner {
                 args.extend(files.iter().map(ToString::to_string));
             }
             let program = args.remove(0);
+
+            // CreateProcess appends only `.exe` to bare names; npm tools ship as `.cmd` shims.
+            #[cfg(windows)]
+            let program = which::which(&program)
+                .ok()
+                .and_then(|p| p.into_os_string().into_string().ok())
+                .unwrap_or(program);
+
             resolved.push(Cmd {
                 command: command.command.clone(),
                 program,

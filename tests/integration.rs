@@ -1710,6 +1710,36 @@ fn multiple_commands_sequential() {
     assert_eq!(repo.git(&["show", ":file.txt"]), "3\n");
 }
 
+/// Bare command names must find npm's `.cmd` shims on PATH - npm ships no `.exe`.
+#[cfg(windows)]
+#[test]
+fn windows_resolves_cmd_shims() {
+    let repo = TestRepo::new(&json!({"*.txt": "tool"}));
+
+    repo.write_file(
+        ".git/bin/tool.cmd",
+        "@echo off\r\necho ran> .git\\shim-ran\r\n",
+    );
+
+    repo.write_file("hello.txt", "content\n");
+    repo.git(&["add", "hello.txt"]);
+
+    let mut path_var = repo.root.join(".git/bin").into_os_string();
+    path_var.push(";");
+    path_var.push(std::env::var_os("PATH").unwrap_or_default());
+    let child = repo
+        .stagelint_cmd()
+        .env("PATH", path_var)
+        .spawn()
+        .expect("spawn stagelint");
+    assert_success(child);
+
+    assert!(
+        repo.root.join(".git/shim-ran").exists(),
+        "the .cmd shim must have run"
+    );
+}
+
 /// With `pass_filenames: false`, no filenames are appended to the command.
 #[test]
 fn pass_filenames_false() {

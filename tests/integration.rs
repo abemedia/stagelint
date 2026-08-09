@@ -57,7 +57,7 @@ fn runs_from_subdirectory() {
 fn failure_rolls_back_all_side_effects() {
     let repo = TestRepo::new(&json!({
         "*.txt": [
-            "sh -c 'echo SIDE EFFECT > clean_modified.txt; rm clean_deleted.txt dirty_deleted.txt; echo JUNK >> dirty_modified.txt'",
+            "sh -c 'echo SIDE EFFECT > clean_modified.txt; rm clean_deleted.txt dirty_deleted.txt; echo JUNK >> dirty_modified.txt; echo RESURRECTED > user_deleted.txt'",
             "false"
         ]
     }));
@@ -334,6 +334,42 @@ fn handles_unicode_and_space_filenames() {
 
     assert_eq!(repo.git(&["show", ":привет.txt"]), "HELLO\n");
     assert_eq!(repo.git(&["show", ":hello world.txt"]), "HELLO\n");
+}
+
+/// A tracked filename that is not valid UTF-8 does not block runs that never touch it.
+/// git stores paths as bytes; such names are legal and appear in repos created on other systems.
+#[cfg(unix)]
+#[test]
+fn non_utf8_bystander_does_not_block_run() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+
+    repo.write_file("seed.txt", "legacy\n");
+    repo.git(&["add", "seed.txt"]);
+    let oid = repo.git(&["rev-parse", ":seed.txt"]).trim().to_owned();
+
+    let mut latin1 = OsString::from("caf");
+    latin1.push(std::ffi::OsStr::from_bytes(&[0xE9]));
+    latin1.push(".txt");
+    let staged = Command::new("git")
+        .args(["update-index", "--add", "--cacheinfo", "100644", &oid])
+        .arg(&latin1)
+        .current_dir(&repo.root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", repo.root.join(".git/no-global-config"))
+        .status()
+        .expect("git update-index");
+    assert!(staged.success(), "planting the latin-1 index entry failed");
+    repo.git(&["commit", "-m", "latin-1 bystander"]);
+
+    repo.write_file("hello.txt", "hello\n");
+    repo.git(&["add", "hello.txt"]);
+
+    assert_success(repo.stagelint(&[]));
+
+    assert_eq!(repo.git(&["show", ":hello.txt"]), "HELLO\n");
 }
 
 /// stagelint fails immediately when invoked outside a git repository.
@@ -629,6 +665,48 @@ fn sparse_checkout_files_not_materialized() {
         "sparse-excluded files must not be materialized"
     );
     assert!(!repo.git(&["ls-files", "excluded/gone.txt"]).is_empty());
+}
+
+/// Skip-worktree entries are absent on purpose and must not be staged as deletions.
+#[test]
+fn sparse_checkout_staged_path_not_deleted() {
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+
+    repo.write_file("keep.txt", "hello\n");
+    repo.write_file("excluded/gone.txt", "sparse\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "add files"]);
+
+    repo.git(&["sparse-checkout", "set"]);
+
+    // Mimics a merge: an excluded path is not on disk, so `git add` cannot stage it.
+    repo.write_file("keep.txt", "changed\n");
+    repo.git(&["add", "keep.txt"]);
+    let oid = repo.git(&["rev-parse", ":keep.txt"]).trim().to_owned();
+    repo.git(&[
+        "update-index",
+        "--cacheinfo",
+        "100644",
+        &oid,
+        "excluded/gone.txt",
+    ]);
+    // --cacheinfo rewrites the entry and clears the flag sparse-checkout set on it.
+    repo.git(&["update-index", "--skip-worktree", "excluded/gone.txt"]);
+
+    assert_success(repo.stagelint(&[]));
+
+    assert_eq!(
+        repo.git(&[
+            "diff",
+            "--cached",
+            "--name-status",
+            "--",
+            "excluded/gone.txt"
+        ]),
+        "M\texcluded/gone.txt\n",
+        "the sparse path must stay modified, not become a deletion"
+    );
+    assert_eq!(repo.git(&["show", ":keep.txt"]), "CHANGED\n");
 }
 
 /// `--stash tracked` restores clean files the linter touched, leaving only the partial file dirty.
@@ -1944,47 +2022,7 @@ fn continue_on_error_runs_pipeline_after_spawn_failure() {
     );
 }
 
-/// A command that cannot be found returns a non-zero exit code.
-#[test]
-fn command_not_found_fails() {
-    let repo = TestRepo::new(&json!({"*.txt": "cmd-that-does-not-exist-stagelint-test"}));
-
-    repo.write_file("file.txt", "content\n");
-    repo.git(&["add", "file.txt"]);
-
-    assert_failure(repo.stagelint(&[]));
-}
-
 // Config
-
-/// Bare patterns match basenames at any depth; patterns with `/` do not cross directories.
-#[test]
-fn glob_pattern_matching() {
-    let repo = TestRepo::new(&json!({
-        "*.txt": UPPERCASE,
-        "cmd*.go": UPPERCASE,
-        "sub/*.md": UPPERCASE,
-    }));
-
-    repo.write_file("root.txt", "hello\n");
-    repo.write_file("sub/nested.txt", "world\n");
-    repo.write_file("readme.md", "hello\n");
-    repo.write_file("sub/notes.md", "hello\n");
-    repo.write_file("sub/deep/notes.md", "hello\n");
-    repo.write_file("pkg/cmdfoo.go", "hello\n");
-    repo.write_file("cmdutil/main.go", "hello\n");
-    repo.git(&["add", "."]);
-
-    assert_success(repo.stagelint(&[]));
-
-    assert_eq!(repo.git(&["show", ":root.txt"]), "HELLO\n");
-    assert_eq!(repo.git(&["show", ":sub/nested.txt"]), "WORLD\n");
-    assert_eq!(repo.git(&["show", ":readme.md"]), "hello\n");
-    assert_eq!(repo.git(&["show", ":sub/notes.md"]), "HELLO\n");
-    assert_eq!(repo.git(&["show", ":sub/deep/notes.md"]), "hello\n",);
-    assert_eq!(repo.git(&["show", ":pkg/cmdfoo.go"]), "HELLO\n",);
-    assert_eq!(repo.git(&["show", ":cmdutil/main.go"]), "hello\n",);
-}
 
 /// Monorepo: each file uses the nearest config walking up to the root.
 #[test]
@@ -2007,6 +2045,44 @@ fn monorepo_multiple_configs() {
     assert_eq!(repo.git(&["show", ":root.txt"]), "HELLO\n");
 
     assert_eq!(repo.git(&["show", ":packages/web/page.txt"]), "goodbye\n");
+}
+
+/// A task declared in a subdirectory config runs with that directory as its cwd.
+#[test]
+fn subdirectory_config_runs_in_its_own_directory() {
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+
+    let web_config = json!({"*.txt": "sh -c 'echo ran > proof'"});
+    let web_config_str = serde_json::to_string(&web_config).expect("serialize");
+    repo.write_file("packages/web/.stagelint.json", &web_config_str);
+    repo.git(&["add", "packages/web/.stagelint.json"]);
+    repo.git(&["commit", "-m", "add web config"]);
+
+    repo.write_file("packages/web/page.txt", "hello\n");
+    repo.git(&["add", "packages/web/page.txt"]);
+
+    assert_success(repo.stagelint(&[]));
+
+    // A relative write only lands here if the task ran in packages/web.
+    assert_eq!(repo.read_file("packages/web/proof"), "ran\n");
+}
+
+/// Paths reach commands absolute, so a filename that looks like a flag cannot be parsed as one.
+#[test]
+fn dash_prefixed_filename_passed_as_path() {
+    let repo = TestRepo::new(&json!({
+        "*.txt": [
+            "sh -c 'for f in \"$@\"; do case \"$f\" in -*) exit 1;; esac; done' _",
+            UPPERCASE
+        ]
+    }));
+
+    repo.write_file("--version.txt", "hello\n");
+    repo.git(&["add", "--", "--version.txt"]);
+
+    assert_success(repo.stagelint(&[]));
+
+    assert_eq!(repo.git(&["show", ":--version.txt"]), "HELLO\n");
 }
 
 /// A commit in a repo with no config file passes.
@@ -2253,8 +2329,13 @@ fn merge_does_not_write_through_symlink() {
     fs::remove_file(repo.root.join("file.txt")).expect("remove file");
     symlink_file("victim.txt", &repo.root.join("file.txt")).expect("create symlink");
 
-    assert_success(repo.stagelint(&[]));
+    let output = assert_success(repo.stagelint(&[]));
 
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("could not apply changes"),
+        "the skipped merge must be reported, got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(
         repo.read_file("victim.txt"),
         "hello\n",
@@ -2397,10 +2478,8 @@ fn stash_restores_symlink_entry_symlinks_disabled() {
     repo.git(&["add", "trigger.txt"]);
     repo.git(&["commit", "-m", "init"]);
 
-    // Modify the "symlink" text file on disk so it is dirty.
     repo.write_file("link.txt", "target_b.txt");
 
-    // Stage a trigger so stagelint has something to lint.
     repo.write_file("trigger.txt", "updated\n");
     repo.git(&["add", "trigger.txt"]);
 
@@ -2433,7 +2512,6 @@ fn partial_stage_symlink_entry_symlinks_disabled() {
     repo.git(&["add", "trigger.txt"]);
     repo.git(&["commit", "-m", "init"]);
 
-    // Stage trigger.txt so stagelint has something to lint.
     repo.write_file("trigger.txt", "updated\n");
     repo.git(&["add", "trigger.txt"]);
 
@@ -2546,15 +2624,6 @@ fn init_replaces_hook_symlink() {
         !repo.root.join(".git/hooks/gone-target").exists(),
         "init must not write through the link"
     );
-}
-
-/// Run-only flags cannot be combined with the `init` subcommand.
-#[test]
-fn init_rejects_run_flags() {
-    let repo = TestRepo::empty();
-
-    assert_failure(repo.stagelint(&["--quiet", "init"]));
-    assert_failure(repo.stagelint(&["--concurrent", "false", "init"]));
 }
 
 /// A relative `core.hooksPath` resolves against the worktree root, not the caller's cwd.

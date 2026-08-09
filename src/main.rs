@@ -5,9 +5,8 @@ mod status;
 mod workflow;
 
 use std::fs;
-use std::path::Path;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 
@@ -28,11 +27,7 @@ fn main() {
 }
 
 fn run(opts: &Opts) -> Result<()> {
-    let (root, _trust) = gix::discover::upwards(Path::new("."))?;
-    let (_, workdir) = root.into_repository_and_work_tree_directories();
-    std::env::set_current_dir(workdir.ok_or_else(|| anyhow!("bare repository"))?)?;
-
-    let repo = gix::open(".")?;
+    let repo = gix::discover(std::env::current_dir()?)?;
     let workdir = repo
         .workdir()
         .ok_or_else(|| anyhow!("bare repository"))?
@@ -46,24 +41,28 @@ fn run(opts: &Opts) -> Result<()> {
         return Ok(());
     }
 
-    let tasks = config::resolve(status.staged.iter().map(String::as_str))?;
+    // Git paths are bytes; everything downstream of here works in filesystem paths.
+    let mut staged = Vec::with_capacity(status.staged.len());
+    for path in &status.staged {
+        staged.push(
+            gix::path::try_from_byte_slice(path.as_slice())
+                .with_context(|| format!("cannot represent {path} as a filesystem path"))?,
+        );
+    }
+
+    let tasks = config::resolve(staged.iter().copied(), &workdir)?;
     if tasks.is_empty() {
         return Ok(());
     }
 
     let cancel = CancellationToken::new();
     let mut runner = runner::Runner::new(opts.continue_on_error, opts.concurrent, cancel.clone());
-    for task in &tasks {
-        let commands: Vec<runner::Command> = task
-            .commands
-            .iter()
-            .map(|obj| runner::Command {
-                command: obj.command.clone(),
-                pass_filenames: obj.pass_filenames,
-            })
-            .collect();
-        let files: Vec<&str> = task.files.iter().map(String::as_str).collect();
-        runner.add(&commands, &files)?;
+    for task in tasks {
+        let commands = task.commands.into_iter().map(|obj| runner::Command {
+            command: obj.command,
+            pass_filenames: obj.pass_filenames,
+        });
+        runner.add(commands, task.files, task.cwd)?;
     }
 
     // Once we start stashing, Ctrl+C must not kill the process or it could result in data-loss.
@@ -83,45 +82,38 @@ fn run(opts: &Opts) -> Result<()> {
 }
 
 fn init(force: bool) -> Result<()> {
-    let repo = gix::discover(".")?;
+    let repo = gix::discover(std::env::current_dir()?)?;
     let workdir = repo
         .workdir()
         .ok_or_else(|| anyhow!("bare repository: stagelint cannot install a pre-commit hook"))?
         .to_path_buf();
-    let hooks_dir = {
-        let config = repo.config_snapshot();
-        if let Some(path) = config.path("core.hooksPath") {
-            let dir = path
-                .interpolate(gix::config::path::interpolate::Context {
-                    home_dir: gix::path::env::home_dir().as_deref(),
-                    ..Default::default()
-                })
-                .map_err(|e| anyhow!("failed to interpolate core.hooksPath: {e}"))?;
-            workdir.join(dir)
-        } else {
-            repo.common_dir().join("hooks")
-        }
+    let hooks_dir = match repo
+        .config_snapshot()
+        .trusted_path("core.hooksPath")
+        .map_err(|e| anyhow!("failed to interpolate core.hooksPath: {e}"))?
+    {
+        Some(dir) => workdir.join(dir),
+        None => repo.common_dir().join("hooks"),
     };
     fs::create_dir_all(&hooks_dir)?;
     let hook_path = hooks_dir.join("pre-commit");
     let hook_content = "#!/bin/sh\nstagelint\n";
 
-    if !force && hook_path.symlink_metadata().is_ok() {
-        let existing = fs::read(&hook_path).ok();
-        if existing.as_deref() != Some(hook_content.as_bytes()) {
+    if fs::read(&hook_path).ok().as_deref() != Some(hook_content.as_bytes()) {
+        if !force && hook_path.symlink_metadata().is_ok() {
             bail!(
                 "pre-commit hook already exists at {}\nUse --force to overwrite",
                 hook_path.display()
             );
         }
-    }
 
-    match fs::remove_file(&hook_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
+        match fs::remove_file(&hook_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        fs::write(&hook_path, hook_content)?;
     }
-    fs::write(&hook_path, hook_content)?;
 
     #[cfg(unix)]
     {

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -38,7 +39,8 @@ pub enum Error {
 /// One runner task per config pattern with matching files.
 pub struct Task {
     pub commands: Vec<CommandObject>,
-    pub files: Vec<String>,
+    pub files: Vec<OsString>,
+    pub cwd: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -64,19 +66,22 @@ fn default_true() -> bool {
 
 /// Group `paths` by their nearest config file, load each, and match its patterns.
 /// Tasks are ordered by config path, then by pattern declaration order.
-pub fn resolve<'a>(paths: impl IntoIterator<Item = &'a str>) -> Result<Vec<Task>, Error> {
+pub fn resolve<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+    workdir: &Path,
+) -> Result<Vec<Task>, Error> {
     let mut cache = HashMap::new();
-    let mut by_config: BTreeMap<PathBuf, Vec<&str>> = BTreeMap::new();
+    let mut by_config: BTreeMap<PathBuf, Vec<&Path>> = BTreeMap::new();
     for path in paths {
-        let dir = Path::new(path).parent().unwrap_or(Path::new(""));
-        if let Some(config_path) = find(dir, Path::new(""), &mut cache) {
+        let dir = path.parent().unwrap_or(Path::new(""));
+        if let Some(config_path) = find(workdir, dir, &mut cache) {
             by_config.entry(config_path).or_default().push(path);
         }
     }
 
     let mut tasks = Vec::new();
     for (config_path, paths) in &by_config {
-        let cfg = load_file(config_path)?;
+        let cfg = load_file(&workdir.join(config_path))?;
         let prefix = config_path.parent().unwrap_or(Path::new(""));
 
         for (pattern, entry) in cfg {
@@ -95,13 +100,13 @@ pub fn resolve<'a>(paths: impl IntoIterator<Item = &'a str>) -> Result<Vec<Task>
                 })?
                 .compile_matcher();
 
-            let files: Vec<String> = paths
+            let files: Vec<OsString> = paths
                 .iter()
-                .filter(|p| {
-                    let relative = Path::new(p).strip_prefix(prefix).unwrap_or(Path::new(p));
+                .filter(|path| {
+                    let relative = path.strip_prefix(prefix).unwrap_or(path);
                     matcher.is_match(relative)
                 })
-                .map(|p| (*p).to_owned())
+                .map(|path| workdir.join(path).into_os_string())
                 .collect();
 
             if files.is_empty() {
@@ -111,6 +116,7 @@ pub fn resolve<'a>(paths: impl IntoIterator<Item = &'a str>) -> Result<Vec<Task>
             tasks.push(Task {
                 commands: entry,
                 files,
+                cwd: workdir.join(prefix),
             });
         }
     }
@@ -125,14 +131,19 @@ const CONFIG_FILES: &[&str] = &[
     ".stagelint.json5",
 ];
 
-/// Search for a config file starting from `start` and walking up to `root` (inclusive).
+/// Search for a config file starting from the repo-relative `start`, walking up to the repo root.
 /// Caches results for all visited directories so repeated lookups in the same subtree are free.
 fn find(
+    workdir: &Path,
     start: &Path,
-    root: &Path,
     cache: &mut HashMap<PathBuf, Option<PathBuf>>,
 ) -> Option<PathBuf> {
+    if let Some(cached) = cache.get(start) {
+        return cached.clone();
+    }
+
     let mut visited = Vec::new();
+    let mut probe = workdir.join(start);
     let mut dir = start;
     let result = 'walk: loop {
         if let Some(cached) = cache.get(dir) {
@@ -140,18 +151,17 @@ fn find(
         }
         visited.push(dir.to_path_buf());
         for name in CONFIG_FILES {
-            let path = dir.join(name);
-            if path.is_file() {
-                break 'walk Some(path);
+            probe.push(name);
+            if probe.is_file() {
+                break 'walk Some(dir.join(name));
             }
+            probe.pop();
         }
-        if dir == root {
+        if dir.as_os_str().is_empty() {
             break None;
         }
-        dir = match dir.parent() {
-            Some(p) => p,
-            None => break None,
-        };
+        dir = dir.parent().unwrap_or(Path::new(""));
+        probe.pop();
     };
 
     for dir in visited {
@@ -348,10 +358,75 @@ mod tests {
         assert_eq!(keys, ["z.txt", "a.txt", "m.txt"]);
     }
 
+    /// Bare patterns match basenames at any depth; patterns with `/` do not cross directories.
+    #[test]
+    fn glob_pattern_matching() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(
+            dir.path().join(".stagelint.yml"),
+            "\"*.txt\": \"a\"\n\"cmd*.go\": \"b\"\n\"sub/*.md\": \"c\"\n",
+        )
+        .expect("write");
+
+        let paths: Vec<PathBuf> = [
+            "root.txt",
+            "sub/nested.txt",
+            "readme.md",
+            "sub/notes.md",
+            "sub/deep/notes.md",
+            "pkg/cmdfoo.go",
+            "cmdutil/main.go",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+
+        let tasks = resolve(paths.iter().map(PathBuf::as_path), dir.path()).expect("resolve");
+        let matched = |task: &Task| -> Vec<String> {
+            task.files
+                .iter()
+                .map(|f| {
+                    Path::new(f)
+                        .strip_prefix(dir.path())
+                        .expect("under temp dir")
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .collect()
+        };
+
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(matched(&tasks[0]), ["root.txt", "sub/nested.txt"]);
+        assert_eq!(matched(&tasks[1]), ["pkg/cmdfoo.go"]);
+        assert_eq!(matched(&tasks[2]), ["sub/notes.md"]);
+    }
+
+    /// An anchored pattern is relative to its own config, not the repo root.
+    #[test]
+    fn nested_config_anchors_to_its_own_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let web = dir.path().join("packages/web");
+        fs::create_dir_all(&web).expect("mkdir");
+        fs::write(web.join(".stagelint.yml"), "\"src/*.ts\": \"a\"\n").expect("write");
+
+        let paths: Vec<PathBuf> = ["packages/web/src/a.ts", "packages/web/lib/b.ts"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+
+        let tasks = resolve(paths.iter().map(PathBuf::as_path), dir.path()).expect("resolve");
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].files,
+            [dir.path().join("packages/web/src/a.ts").into_os_string()]
+        );
+    }
+
     #[test]
     fn find_not_found() {
         let dir = tempfile::tempdir().expect("temp dir");
-        assert!(find(dir.path(), dir.path(), &mut HashMap::new()).is_none());
+        assert!(find(dir.path(), Path::new(""), &mut HashMap::new()).is_none());
     }
 
     #[test]
@@ -360,8 +435,8 @@ mod tests {
         fs::write(dir.path().join(".stagelint.yml"), r#""*.go": "gofmt -w""#).expect("write");
         let child = dir.path().join("packages").join("foo");
         fs::create_dir_all(&child).expect("mkdir");
-        let found = find(&child, dir.path(), &mut HashMap::new()).expect("find");
-        assert_eq!(found, dir.path().join(".stagelint.yml"));
+        let found = find(dir.path(), Path::new("packages/foo"), &mut HashMap::new()).expect("find");
+        assert_eq!(found, Path::new(".stagelint.yml"));
     }
 
     #[test]
@@ -371,8 +446,8 @@ mod tests {
         let child = dir.path().join("packages").join("foo");
         fs::create_dir_all(&child).expect("mkdir");
         fs::write(child.join(".stagelint.yml"), r#""*.go": "child""#).expect("write");
-        let found = find(&child, dir.path(), &mut HashMap::new()).expect("find");
-        assert_eq!(found, child.join(".stagelint.yml"));
+        let found = find(dir.path(), Path::new("packages/foo"), &mut HashMap::new()).expect("find");
+        assert_eq!(found, Path::new("packages/foo/.stagelint.yml"));
     }
 
     #[test]
@@ -382,9 +457,8 @@ mod tests {
         let parent = root.join("packages");
         let child = parent.join("foo");
         fs::create_dir_all(&child).expect("mkdir");
-        // Config exists above root - should not be found
         fs::write(dir.path().join(".stagelint.yml"), r#""*.go": "above""#).expect("write");
-        assert!(find(&child, &root, &mut HashMap::new()).is_none());
+        assert!(find(&root, Path::new("packages/foo"), &mut HashMap::new()).is_none());
     }
 
     #[test]
@@ -400,12 +474,12 @@ mod tests {
         // a's walk must not poison the shared dirs with a's config.
         let mut cache = HashMap::new();
         assert_eq!(
-            find(&a, dir.path(), &mut cache).expect("find a"),
-            a.join(".stagelint.yml")
+            find(dir.path(), Path::new("packages/a"), &mut cache).expect("find a"),
+            Path::new("packages/a/.stagelint.yml")
         );
         assert_eq!(
-            find(&b, dir.path(), &mut cache).expect("find b"),
-            dir.path().join(".stagelint.yml")
+            find(dir.path(), Path::new("packages/b"), &mut cache).expect("find b"),
+            Path::new(".stagelint.yml")
         );
     }
 
@@ -418,8 +492,8 @@ mod tests {
             r#"{"*.go": "from-json"}"#,
         )
         .expect("write json");
-        let found = find(dir.path(), dir.path(), &mut HashMap::new()).expect("find");
-        let cfg = load_file(&found).expect("load");
+        let found = find(dir.path(), Path::new(""), &mut HashMap::new()).expect("find");
+        let cfg = load_file(&dir.path().join(found)).expect("load");
         assert_eq!(cfg["*.go"][0].command, "from-yml");
     }
 }

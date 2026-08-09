@@ -67,7 +67,16 @@ fn parse_concurrent(s: &str) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_concurrent;
+    use super::{Cli, parse_concurrent};
+    use clap::Parser;
+
+    /// `args_conflicts_with_subcommands` means run flags cannot be combined with `init`.
+    #[test]
+    fn init_rejects_run_flags() {
+        assert!(Cli::try_parse_from(["stagelint", "--quiet", "init"]).is_err());
+        assert!(Cli::try_parse_from(["stagelint", "--concurrent", "false", "init"]).is_err());
+        assert!(Cli::try_parse_from(["stagelint", "init", "--force"]).is_ok());
+    }
 
     #[test]
     fn parse_concurrent_values() {

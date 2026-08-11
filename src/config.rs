@@ -144,8 +144,11 @@ fn find(
 
     let mut visited = Vec::new();
     let mut probe = workdir.join(start);
-    let mut dir = start;
+    let mut ancestors = start.ancestors();
     let result = 'walk: loop {
+        let Some(dir) = ancestors.next() else {
+            break None;
+        };
         if let Some(cached) = cache.get(dir) {
             break cached.clone();
         }
@@ -157,10 +160,6 @@ fn find(
             }
             probe.pop();
         }
-        if dir.as_os_str().is_empty() {
-            break None;
-        }
-        dir = dir.parent().unwrap_or(Path::new(""));
         probe.pop();
     };
 
@@ -201,6 +200,13 @@ fn load_file(path: &Path) -> Result<Config, Error> {
             .into_inner(),
         _ => unreachable!("no parser for {}", path.display()),
     };
+
+    if cfg.is_empty() {
+        return Err(Error::Invalid {
+            path: path.to_owned(),
+            message: "no patterns configured".into(),
+        });
+    }
 
     for (pattern, commands) in &cfg {
         let message = if commands.is_empty() {
@@ -338,6 +344,12 @@ mod tests {
     fn empty_commands_rejected() {
         assert!(load(".stagelint.yml", "\"*.js\": []\n").is_err());
         assert!(load(".stagelint.yml", "\"*.js\": \"\"\n").is_err());
+    }
+
+    #[test]
+    fn empty_config_rejected() {
+        assert!(load(".stagelint.yml", "").is_err(), "empty yaml file");
+        assert!(load(".stagelint.json", "{}").is_err(), "empty json map");
     }
 
     #[test]

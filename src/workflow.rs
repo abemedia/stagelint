@@ -159,6 +159,7 @@ impl<'a> Workflow<'a> {
         status: WorktreeStatus,
         stash_tracked: bool,
         stash_untracked: bool,
+        quiet: bool,
     ) -> Result<Self, Error> {
         let (mut filter, filter_index) =
             repo.filter_pipeline(None).map_err(Error::FilterPipeline)?;
@@ -213,6 +214,7 @@ impl<'a> Workflow<'a> {
                 &untracked_entries,
                 &status.missing,
                 &filter_index,
+                quiet,
             )?)
         };
 
@@ -424,6 +426,7 @@ fn create_stash_commit(
     untracked_entries: &[StashEntry],
     missing: &BTreeSet<BString>,
     index: &gix::index::State,
+    quiet: bool,
 ) -> Result<ObjectId, Error> {
     let committer = repo
         .committer()
@@ -471,21 +474,19 @@ fn create_stash_commit(
         // parent[1]: index commit - tree is the current staged state.
         // git stash pop uses this as the merge base for staged changes; using HEAD tree instead
         // would produce wrong 3-way merge results for partially-staged files.
-        let index_tree_oid = {
-            let mut editor = repo.empty_tree().edit().map_err(Error::TreeEditInit)?;
-            for entry in index.entries() {
-                if entry.flags.stage() != Stage::Unconflicted {
-                    continue;
-                }
-                let Some(mode) = entry.mode.to_tree_entry_mode() else {
-                    continue;
-                };
-                editor
-                    .upsert(entry.path(index), mode.kind(), entry.id)
-                    .map_err(Error::TreeEdit)?;
+        let mut editor = repo.empty_tree().edit().map_err(Error::TreeEditInit)?;
+        for entry in index.entries() {
+            if entry.flags.stage() != Stage::Unconflicted {
+                continue;
             }
-            editor.write().map_err(Error::TreeEditorWrite)?.detach()
-        };
+            let Some(mode) = entry.mode.to_tree_entry_mode() else {
+                continue;
+            };
+            editor
+                .upsert(entry.path(index), mode.kind(), entry.id)
+                .map_err(Error::TreeEdit)?;
+        }
+        let index_tree_oid = editor.write().map_err(Error::TreeEditorWrite)?.detach();
         let index_commit_oid = write_commit(
             repo,
             &committer,
@@ -534,6 +535,10 @@ fn create_stash_commit(
             deref: false,
         })
         .map_err(Error::RefWrite)?;
+    } else if !quiet {
+        eprintln!(
+            "stagelint: warning: no initial commit: if this run is killed, recover your work with `git fsck --lost-found`"
+        );
     }
 
     Ok(commit_oid)
@@ -1076,8 +1081,8 @@ fn restore_clean_tracked(
             continue;
         }
 
-        // Indexed symlink data is the target path, not file content; submodules have none at all.
-        if matches!(entry.mode, entry::Mode::SYMLINK | entry::Mode::COMMIT) {
+        // Submodules have no file content to restore.
+        if entry.mode == entry::Mode::COMMIT {
             continue;
         }
 

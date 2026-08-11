@@ -55,15 +55,25 @@ fn runs_from_subdirectory() {
 /// A failing run rolls back every linter side-effect while leaving the user's changes alone.
 #[test]
 fn failure_rolls_back_all_side_effects() {
+    if !file_symlinks_supported() {
+        return;
+    }
+
     let repo = TestRepo::new(&json!({
         "*.txt": [
-            "sh -c 'echo SIDE EFFECT > clean_modified.txt; rm clean_deleted.txt dirty_deleted.txt; echo JUNK >> dirty_modified.txt; echo RESURRECTED > user_deleted.txt'",
+            "sh -c 'echo SIDE EFFECT > clean_modified.txt'",
+            "sh -c 'rm clean_deleted.txt dirty_deleted.txt'",
+            "sh -c 'echo JUNK >> dirty_modified.txt'",
+            "sh -c 'echo RESURRECTED > user_deleted.txt'",
+            "sh -c 'rm clean_link.txt; ln -s clean_modified.txt clean_link.txt'",
             "false"
         ]
     }));
+    repo.git(&["config", "core.symlinks", "true"]);
 
     repo.write_file("clean_modified.txt", "clean\n");
     repo.write_file("clean_deleted.txt", "content\n");
+    symlink_file("clean_deleted.txt", &repo.root.join("clean_link.txt")).expect("symlink");
     repo.write_file("dirty_modified.txt", "v0\n");
     repo.write_file("dirty_deleted.txt", "v0\n");
     repo.write_file("user_dirty.txt", "v0\n");
@@ -104,6 +114,12 @@ fn failure_rolls_back_all_side_effects() {
     assert!(
         !repo.root.join("user_deleted.txt").exists(),
         "the user's own deletion must not be resurrected"
+    );
+    let link = fs::read_link(repo.root.join("clean_link.txt")).expect("readlink");
+    assert_eq!(
+        link.to_str().unwrap(),
+        "clean_deleted.txt",
+        "a repointed clean tracked symlink should be reverted, still as a symlink"
     );
 }
 
@@ -426,9 +442,13 @@ fn empty_repo_fully_staged() {
     repo.write_file("hello.txt", "hello\n");
     repo.git(&["add", "hello.txt"]);
 
-    assert_success(repo.stagelint(&[]));
+    let output = assert_success(repo.stagelint(&[]));
 
     assert_eq!(repo.git(&["show", ":hello.txt"]), "HELLO\n");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("no initial commit"),
+        "nothing is stashed here, so there is no unreferenced backup to warn about"
+    );
 }
 
 /// On an empty repo, partial staging works correctly.
@@ -493,10 +513,14 @@ fn empty_repo_stash_untracked_restores() {
 
     repo.write_file("untracked.txt", "keep me\n");
 
-    assert_success(repo.stagelint(&["--stash", "untracked"]));
+    let output = assert_success(repo.stagelint(&["--stash", "untracked"]));
 
     assert_eq!(repo.read_file("untracked.txt"), "keep me\n");
     assert_eq!(repo.git(&["show", ":staged.txt"]), "HELLO\n");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no initial commit"),
+        "a backup no ref points at must be announced"
+    );
 }
 
 /// SIGTERM mid-run cancels the linter and restores the repo with no stash left behind.
@@ -2096,7 +2120,7 @@ fn no_config_passes() {
     assert_success(repo.stagelint(&[]));
 }
 
-/// A commit whose files match no configured pattern passes.
+/// A commit whose files match no configured pattern passes, saying so unless quietened.
 #[test]
 fn unmatched_files_pass() {
     let repo = TestRepo::new(&json!({"*.txt": "false"}));
@@ -2104,7 +2128,18 @@ fn unmatched_files_pass() {
     repo.write_file("README.md", "readme\n");
     repo.git(&["add", "README.md"]);
 
-    assert_success(repo.stagelint(&[]));
+    let output = assert_success(repo.stagelint(&[]));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no tasks configured"),
+        "a run that does nothing must say so"
+    );
+
+    let quiet = assert_success(repo.stagelint(&["--quiet"]));
+    assert!(
+        quiet.stderr.is_empty(),
+        "--quiet suppresses the notice: {}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
 }
 
 /// Overlapping globs never run concurrently: the later task starts only after the earlier ends.
@@ -2624,6 +2659,24 @@ fn init_replaces_hook_symlink() {
         !repo.root.join(".git/hooks/gone-target").exists(),
         "init must not write through the link"
     );
+}
+
+/// A symlink is a foreign hook even when its target already holds the hook text.
+#[test]
+fn init_rejects_matching_content_symlink() {
+    if !file_symlinks_supported() {
+        return;
+    }
+    let repo = TestRepo::empty();
+    repo.write_file("outside-hook", "#!/bin/sh\nstagelint\n");
+
+    symlink_file(
+        "../../outside-hook",
+        &repo.root.join(".git/hooks/pre-commit"),
+    )
+    .expect("symlink hook");
+
+    assert_failure(repo.stagelint(&["init"]));
 }
 
 /// A relative `core.hooksPath` resolves against the worktree root, not the caller's cwd.

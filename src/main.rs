@@ -52,6 +52,9 @@ fn run(opts: &Opts) -> Result<()> {
 
     let tasks = config::resolve(staged.iter().copied(), &workdir)?;
     if tasks.is_empty() {
+        if !opts.quiet {
+            eprintln!("stagelint: warning: no tasks configured for the staged files");
+        }
         return Ok(());
     }
 
@@ -71,8 +74,14 @@ fn run(opts: &Opts) -> Result<()> {
         move || c.cancel()
     })?;
 
-    let mut workflow =
-        workflow::Workflow::new(&repo, &workdir, status, stash_tracked, stash_untracked)?;
+    let mut workflow = workflow::Workflow::new(
+        &repo,
+        &workdir,
+        status,
+        stash_tracked,
+        stash_untracked,
+        opts.quiet,
+    )?;
 
     runner.run()?;
 
@@ -99,8 +108,12 @@ fn init(force: bool) -> Result<()> {
     let hook_path = hooks_dir.join("pre-commit");
     let hook_content = "#!/bin/sh\nstagelint\n";
 
-    if fs::read(&hook_path).ok().as_deref() != Some(hook_content.as_bytes()) {
-        if !force && hook_path.symlink_metadata().is_ok() {
+    let existing = fs::symlink_metadata(&hook_path);
+    let current = existing.as_ref().is_ok_and(fs::Metadata::is_file)
+        && fs::read(&hook_path).ok().as_deref() == Some(hook_content.as_bytes());
+
+    if !current {
+        if !force && existing.is_ok() {
             bail!(
                 "pre-commit hook already exists at {}\nUse --force to overwrite",
                 hook_path.display()

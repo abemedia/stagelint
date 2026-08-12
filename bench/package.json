@@ -1,0 +1,11 @@
+{
+  "name": "stagelint-bench",
+  "private": true,
+  "type": "module",
+  "description": "Pinned competitors for the comparative benchmark. Not part of the cargo workspace.",
+  "devDependencies": {
+    "lefthook": "2.1.10",
+    "lint-staged": "17.3.0",
+    "nano-staged": "1.0.2"
+  }
+}

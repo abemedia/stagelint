@@ -1,11 +1,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(
-    version,
-    about = "Run linters and formatters on staged git files",
-    args_conflicts_with_subcommands = true
-)]
+#[command(version, about, args_conflicts_with_subcommands = true)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -24,7 +20,7 @@ pub enum Commands {
     },
 }
 
-/// Run linters and formatters on staged git files.
+/// Run commands like linters and formatters on staged git files.
 #[derive(Args)]
 pub struct Opts {
     /// Run all tasks to completion even if one fails, then report all errors together.

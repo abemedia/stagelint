@@ -38,7 +38,7 @@ on small commits and fast formatters, which is most of them. Reproduce with `ben
 ### Node
 
 ```sh
-npm install --save-dev stagelint
+npm install --save-dev @stagelint/stagelint
 ```
 
 Add the hook to your `prepare` script so it installs itself for the whole team:

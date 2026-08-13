@@ -8,6 +8,7 @@ use std::fs;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+use gix::discover::upwards;
 use tokio_util::sync::CancellationToken;
 
 use cli::{Cli, Commands, Opts, StashScope};
@@ -50,7 +51,7 @@ fn run(opts: &Opts) -> Result<()> {
         );
     }
 
-    let tasks = config::resolve(staged.iter().copied(), &workdir)?;
+    let tasks = config::resolve(staged, &workdir)?;
     if tasks.is_empty() {
         if !opts.quiet {
             eprintln!("stagelint: warning: no tasks configured for the staged files");
@@ -91,7 +92,17 @@ fn run(opts: &Opts) -> Result<()> {
 }
 
 fn init(force: bool) -> Result<()> {
-    let repo = gix::discover(std::env::current_dir()?)?;
+    let repo = match gix::discover(std::env::current_dir()?) {
+        Ok(repo) => repo,
+        Err(gix::discover::Error::Discover(upwards::Error::NoGitRepository { path })) => {
+            eprintln!(
+                "stagelint: no git repository in {}; skipping hook installation",
+                path.display()
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
     let workdir = repo
         .workdir()
         .ok_or_else(|| anyhow!("bare repository: stagelint cannot install a pre-commit hook"))?

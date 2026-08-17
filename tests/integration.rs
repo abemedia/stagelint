@@ -2702,6 +2702,77 @@ fn init_relative_hookspath_resolves_to_root() {
     assert!(!repo.root.join("sub/my-hooks/pre-commit").exists());
 }
 
+/// A binary inside the worktree is invoked relative to it, independent of `PATH`.
+#[test]
+fn init_uses_relative_path_in_worktree() {
+    let repo = TestRepo::empty();
+    // `CreateProcess` assumes `.exe`, so the copy has to keep the extension to be launchable.
+    let name = format!("stagelint{}", std::env::consts::EXE_SUFFIX);
+    let inside = repo.root.join("tools").join(&name);
+    fs::create_dir_all(repo.root.join("tools")).expect("create tools dir");
+    fs::copy(stagelint_exe(), &inside).expect("copy binary");
+
+    assert_success(
+        Command::new(&inside)
+            .arg("init")
+            .current_dir(&repo.root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn stagelint"),
+    );
+
+    let hook = repo.read_file(".git/hooks/pre-commit");
+    let expected = format!("'./tools/{name}'");
+    assert!(hook.contains(&expected), "want {expected} in: {hook}");
+}
+
+/// Outside the worktree the hook gets what `PATH` resolves to, not the running binary.
+#[test]
+fn init_uses_path_entry_outside_worktree() {
+    let repo = TestRepo::empty();
+    let bin = tempfile::tempdir().expect("temp dir");
+    // Only ever looked up, never run.
+    let on_path = bin
+        .path()
+        .join(format!("stagelint{}", std::env::consts::EXE_SUFFIX));
+    fs::copy(stagelint_exe(), &on_path).expect("copy binary");
+
+    assert_success(
+        repo.stagelint_cmd()
+            .arg("init")
+            .env("PATH", bin.path())
+            .spawn()
+            .expect("spawn stagelint"),
+    );
+
+    let hook = repo.read_file(".git/hooks/pre-commit");
+    let expected = format!("'{}'", on_path.display().to_string().replace('\\', "/"));
+    assert!(hook.contains(&expected), "want {expected} in: {hook}");
+}
+
+/// With nothing on `PATH`, the hook falls back to the binary that installed it.
+#[test]
+fn init_uses_own_path_without_path_entry() {
+    let repo = TestRepo::empty();
+    let empty = tempfile::tempdir().expect("temp dir");
+
+    assert_success(
+        repo.stagelint_cmd()
+            .arg("init")
+            .env("PATH", empty.path())
+            .spawn()
+            .expect("spawn stagelint"),
+    );
+
+    let hook = repo.read_file(".git/hooks/pre-commit");
+    let expected = format!(
+        "'{}'",
+        stagelint_exe().display().to_string().replace('\\', "/")
+    );
+    assert!(hook.contains(&expected), "want {expected} in: {hook}");
+}
+
 // Crash recovery
 
 /// The stash snapshots the full worktree: dirty edits and deletions survive a crash.

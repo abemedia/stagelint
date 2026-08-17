@@ -1,14 +1,12 @@
 mod cli;
 mod config;
+mod hook;
 mod runner;
 mod status;
 mod workflow;
 
-use std::fs;
-
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
-use gix::discover::upwards;
 use tokio_util::sync::CancellationToken;
 
 use cli::{Cli, Commands, Opts, StashScope};
@@ -17,7 +15,7 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Some(Commands::Init { force }) => init(force),
+        Some(Commands::Init { force }) => hook::install(force),
         None => run(&cli.opts),
     };
 
@@ -88,63 +86,5 @@ fn run(opts: &Opts) -> Result<()> {
 
     workflow.finish(opts.quiet)?;
 
-    Ok(())
-}
-
-fn init(force: bool) -> Result<()> {
-    let repo = match gix::discover(std::env::current_dir()?) {
-        Ok(repo) => repo,
-        Err(gix::discover::Error::Discover(upwards::Error::NoGitRepository { path })) => {
-            eprintln!(
-                "stagelint: no git repository in {}; skipping hook installation",
-                path.display()
-            );
-            return Ok(());
-        }
-        Err(e) => return Err(e.into()),
-    };
-    let workdir = repo
-        .workdir()
-        .ok_or_else(|| anyhow!("bare repository: stagelint cannot install a pre-commit hook"))?
-        .to_path_buf();
-    let hooks_dir = match repo
-        .config_snapshot()
-        .trusted_path("core.hooksPath")
-        .map_err(|e| anyhow!("failed to interpolate core.hooksPath: {e}"))?
-    {
-        Some(dir) => workdir.join(dir),
-        None => repo.common_dir().join("hooks"),
-    };
-    fs::create_dir_all(&hooks_dir)?;
-    let hook_path = hooks_dir.join("pre-commit");
-    let hook_content = "#!/bin/sh\nstagelint\n";
-
-    let existing = fs::symlink_metadata(&hook_path);
-    let current = existing.as_ref().is_ok_and(fs::Metadata::is_file)
-        && fs::read(&hook_path).ok().as_deref() == Some(hook_content.as_bytes());
-
-    if !current {
-        if !force && existing.is_ok() {
-            bail!(
-                "pre-commit hook already exists at {}\nUse --force to overwrite",
-                hook_path.display()
-            );
-        }
-
-        match fs::remove_file(&hook_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        fs::write(&hook_path, hook_content)?;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755))?;
-    }
-
-    eprintln!("Installed pre-commit hook at {}", hook_path.display());
     Ok(())
 }

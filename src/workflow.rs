@@ -23,7 +23,7 @@ use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::status::plumbing::index_as_worktree::EntryStatus;
 use gix::{Id, ObjectId, Repository};
 
-use crate::status::WorktreeStatus;
+use crate::status::Status;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -138,8 +138,11 @@ pub enum Error {
 pub struct Workflow<'a> {
     repo: &'a Repository,
     workdir: &'a Path,
-    status: WorktreeStatus,
+    scope: BTreeSet<BString>,
+    dirty: BTreeSet<BString>,
+    missing: BTreeSet<BString>,
     stash_tracked: bool,
+    quiet: bool,
     oid: Option<ObjectId>,
     absent: BTreeSet<BString>,
     hidden: BTreeSet<BString>, // dirty paths hidden from the run; all restore rewrites on success
@@ -156,51 +159,60 @@ impl<'a> Workflow<'a> {
     pub fn new(
         repo: &'a Repository,
         workdir: &'a Path,
-        status: WorktreeStatus,
+        status: Status,
         stash_tracked: bool,
-        stash_untracked: bool,
         quiet: bool,
     ) -> Result<Self, Error> {
+        let Status {
+            changes,
+            scope,
+            dirty,
+            untracked,
+            missing,
+        } = status;
+        let staged: BTreeSet<&BStr> = changes
+            .iter()
+            .map(gix::diff::index::ChangeRef::location)
+            .collect();
+
         let (mut filter, filter_index) =
             repo.filter_pipeline(None).map_err(Error::FilterPipeline)?;
 
         // Read working-tree content into the ODB before hiding overwrites it with the indexed
         // version. Every dirty file is captured so the stash snapshots the full worktree; only the
-        // scope-selected subset is hidden from the run.
+        // staged subset is hidden from the run.
         let mut captured: Vec<StashEntry> = Vec::new();
         let mut untracked_entries: Vec<StashEntry> = Vec::new();
         let mut hidden: BTreeSet<BString> = BTreeSet::new();
 
-        for path in &status.dirty {
+        for path in &dirty {
             let (oid, mode) = hash_blob(&mut filter, &filter_index, workdir, path.as_ref())?;
             captured.push(StashEntry {
                 path: path.clone(),
                 oid,
                 mode,
             });
-            if stash_tracked || status.staged.contains(path) {
+            if stash_tracked || staged.contains(path.as_bstr()) {
                 hidden.insert(path.clone());
             }
         }
 
-        if stash_untracked {
-            for path in &status.untracked {
-                let (oid, mode) = hash_blob(&mut filter, &filter_index, workdir, path.as_ref())?;
-                untracked_entries.push(StashEntry {
-                    path: path.clone(),
-                    oid,
-                    mode,
-                });
-            }
+        for path in &untracked {
+            let (oid, mode) = hash_blob(&mut filter, &filter_index, workdir, path.as_ref())?;
+            untracked_entries.push(StashEntry {
+                path: path.clone(),
+                oid,
+                mode,
+            });
         }
 
         // Commands need staged files on disk; tracked stashing also hides unstaged deletions.
         let absent: BTreeSet<BString> = if stash_tracked {
-            status.missing.clone()
+            missing.clone()
         } else {
-            status
-                .staged
-                .intersection(&status.missing)
+            missing
+                .iter()
+                .filter(|path| staged.contains(path.as_bstr()))
                 .cloned()
                 .collect()
         };
@@ -212,7 +224,8 @@ impl<'a> Workflow<'a> {
                 repo,
                 &captured,
                 &untracked_entries,
-                &status.missing,
+                &missing,
+                &changes,
                 &filter_index,
                 quiet,
             )?)
@@ -221,8 +234,11 @@ impl<'a> Workflow<'a> {
         let workflow = Self {
             repo,
             workdir,
-            status,
+            scope,
+            dirty,
+            missing,
             stash_tracked,
+            quiet,
             oid,
             absent,
             hidden,
@@ -243,12 +259,12 @@ impl<'a> Workflow<'a> {
 
     /// Finish the run: capture its output into the index, restore the working tree, apply the
     /// changes to it, and drop the backup stash.
-    pub fn finish(&mut self, quiet: bool) -> Result<(), Error> {
+    pub fn finish(&mut self) -> Result<(), Error> {
         let merge_bases = update_index(
             self.repo,
             self.workdir,
-            &self.status.staged,
-            &self.status.dirty,
+            &self.scope,
+            &self.dirty,
             &mut self.filter,
             &self.filter_index,
         )?;
@@ -256,7 +272,7 @@ impl<'a> Workflow<'a> {
         apply_merges(
             self.repo,
             self.workdir,
-            quiet,
+            self.quiet,
             &merge_bases,
             &mut self.filter,
         )?;
@@ -273,7 +289,7 @@ impl<'a> Workflow<'a> {
         // Undo the materialization: these files must return to their deleted worktree state.
         // Rollback sweeps every deletion, since a command may have recreated one we never made.
         let deleted = if rollback {
-            &self.status.missing
+            &self.missing
         } else {
             &self.absent
         };
@@ -287,21 +303,16 @@ impl<'a> Workflow<'a> {
 
         if let Some(oid) = self.oid {
             // Rollback returns every dirty file to its pre-run bytes; success only unhides.
-            let manifest = if rollback {
-                &self.status.dirty
-            } else {
-                &self.hidden
-            };
+            let manifest = if rollback { &self.dirty } else { &self.hidden };
             apply_stash(self.repo, self.workdir, oid, manifest)?;
         }
 
         // Rolling back also reverts side-effects in scopes that leave dirty files in place.
         if self.stash_tracked || rollback {
             let skip: HashSet<&BStr> = self
-                .status
                 .dirty
                 .iter()
-                .chain(&self.status.missing)
+                .chain(&self.missing)
                 .map(BString::as_ref)
                 .collect();
             restore_clean_tracked(self.repo, self.workdir, &skip)?;
@@ -425,6 +436,7 @@ fn create_stash_commit(
     captured: &[StashEntry],
     untracked_entries: &[StashEntry],
     missing: &BTreeSet<BString>,
+    changes: &[gix::diff::index::Change],
     index: &gix::index::State,
     quiet: bool,
 ) -> Result<ObjectId, Error> {
@@ -474,17 +486,15 @@ fn create_stash_commit(
         // parent[1]: index commit - tree is the current staged state.
         // git stash pop uses this as the merge base for staged changes; using HEAD tree instead
         // would produce wrong 3-way merge results for partially-staged files.
-        let mut editor = repo.empty_tree().edit().map_err(Error::TreeEditInit)?;
-        for entry in index.entries() {
-            if entry.flags.stage() != Stage::Unconflicted {
-                continue;
+        let mut editor = base_tree.edit().map_err(Error::TreeEditInit)?;
+        for change in changes {
+            if let gix::diff::index::Change::Deletion { .. } = change {
+                editor.remove(change.location()).map_err(Error::TreeEdit)?;
+            } else if let Some(mode) = change.entry_mode().to_tree_entry_mode() {
+                editor
+                    .upsert(change.location(), mode.kind(), change.id().to_owned())
+                    .map_err(Error::TreeEdit)?;
             }
-            let Some(mode) = entry.mode.to_tree_entry_mode() else {
-                continue;
-            };
-            editor
-                .upsert(entry.path(index), mode.kind(), entry.id)
-                .map_err(Error::TreeEdit)?;
         }
         let index_tree_oid = editor.write().map_err(Error::TreeEditorWrite)?.detach();
         let index_commit_oid = write_commit(
@@ -790,7 +800,7 @@ struct MergeBase {
 fn update_index(
     repo: &Repository,
     workdir: &Path,
-    staged: &BTreeSet<BString>,
+    scope: &BTreeSet<BString>,
     dirty: &BTreeSet<BString>,
     filter: &mut gix::filter::Pipeline<'_>,
     filter_index: &gix::index::State,
@@ -805,7 +815,7 @@ fn update_index(
     let mut merge_bases = Vec::new();
     let mut changed = false;
 
-    for path in staged {
+    for path in scope {
         let file_path = os_path(workdir, path.as_ref())?;
         let Some(pos) = index.entry_index_by_path_and_stage(path.as_ref(), Stage::Unconflicted)
         else {

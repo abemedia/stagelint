@@ -2130,8 +2130,60 @@ fn unmatched_files_pass() {
 
     let output = assert_success(repo.stagelint(&[]));
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("no tasks configured"),
+        String::from_utf8_lossy(&output.stderr)
+            .contains("could not find any staged files matching configured tasks"),
         "a run that does nothing must say so"
+    );
+
+    let quiet = assert_success(repo.stagelint(&["--quiet"]));
+    assert!(
+        quiet.stderr.is_empty(),
+        "--quiet suppresses the notice: {}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+}
+
+/// A commit of only unlintable entries - symlink, deletion, submodule - passes, saying so unless quietened.
+#[test]
+fn unlintable_entries_pass() {
+    if !file_symlinks_supported() {
+        return;
+    }
+
+    let subrepo = TestRepo::empty();
+    subrepo.write_file("README.md", "# Sub\n");
+    subrepo.git(&["add", "README.md"]);
+    subrepo.git(&["commit", "-m", "initial"]);
+
+    let repo = TestRepo::new(&json!({"*": "false"}));
+
+    repo.write_file("real.txt", "hello\n");
+    repo.write_file("delete-me.txt", "bye\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "init"]);
+
+    symlink_file("real.txt", &repo.root.join("link.txt")).expect("create symlink");
+    repo.git(&["add", "link.txt"]);
+    repo.git(&["rm", "-q", "delete-me.txt"]);
+    let subrepo_str = subrepo.root.to_str().expect("path");
+    repo.git(&[
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "--force",
+        subrepo_str,
+        "submodule.txt",
+    ]);
+    // `submodule add` also stages `.gitmodules`, which is a lintable regular file.
+    repo.git(&["rm", "-q", "--cached", ".gitmodules"]);
+
+    let output = assert_success(repo.stagelint(&[]));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not find any staged files")
+            && !stderr.contains("matching configured tasks"),
+        "the empty scope must be explained, got: {stderr}"
     );
 
     let quiet = assert_success(repo.stagelint(&["--quiet"]));
@@ -2474,6 +2526,83 @@ fn partial_stage_dir_symlink() {
 
     let indexed = repo.git(&["show", ":link"]);
     assert_eq!(indexed, "dir_b");
+}
+
+/// A partially staged symlink is hidden: commands see the staged target, not the worktree one.
+#[test]
+fn partial_stage_symlink_hidden_from_run() {
+    if !file_symlinks_supported() {
+        return;
+    }
+
+    let repo = TestRepo::new(&json!({"*.txt": "sh -c 'readlink link.txt > .git/seen' _"}));
+    repo.git(&["config", "core.symlinks", "true"]);
+
+    repo.write_file("target_a.txt", "a\n");
+    repo.write_file("target_b.txt", "b\n");
+    repo.write_file("trigger.txt", "hello\n");
+    symlink_file("target_a.txt", &repo.root.join("link.txt")).unwrap();
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "init"]);
+
+    repo.write_file("trigger.txt", "updated\n");
+    repo.git(&["add", "trigger.txt"]);
+
+    fs::remove_file(repo.root.join("link.txt")).unwrap();
+    symlink_file("target_b.txt", &repo.root.join("link.txt")).unwrap();
+    repo.git(&["add", "link.txt"]);
+    fs::remove_file(repo.root.join("link.txt")).unwrap();
+    symlink_file("target_a.txt", &repo.root.join("link.txt")).unwrap();
+
+    assert_success(repo.stagelint(&[]));
+
+    assert_eq!(
+        repo.read_file(".git/seen").trim(),
+        "target_b.txt",
+        "the run must see the staged symlink, not the worktree one"
+    );
+    let target = fs::read_link(repo.root.join("link.txt")).unwrap();
+    assert_eq!(
+        target.to_str().unwrap(),
+        "target_a.txt",
+        "the worktree symlink must be restored"
+    );
+    assert_eq!(repo.git(&["show", ":link.txt"]), "target_b.txt");
+}
+
+/// A staged symlink deleted from the worktree is materialized for the run, then removed again.
+#[test]
+fn staged_symlink_deleted_from_worktree_materialized() {
+    if !file_symlinks_supported() {
+        return;
+    }
+
+    let repo = TestRepo::new(&json!({"*.txt": "sh -c 'readlink link.txt > .git/seen' _"}));
+    repo.git(&["config", "core.symlinks", "true"]);
+
+    repo.write_file("real.txt", "hello\n");
+    repo.write_file("trigger.txt", "hello\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "init"]);
+
+    repo.write_file("trigger.txt", "updated\n");
+    repo.git(&["add", "trigger.txt"]);
+    symlink_file("real.txt", &repo.root.join("link.txt")).unwrap();
+    repo.git(&["add", "link.txt"]);
+    fs::remove_file(repo.root.join("link.txt")).unwrap();
+
+    assert_success(repo.stagelint(&[]));
+
+    assert_eq!(
+        repo.read_file(".git/seen").trim(),
+        "real.txt",
+        "the run must see the staged symlink on disk"
+    );
+    assert!(
+        fs::symlink_metadata(repo.root.join("link.txt")).is_err(),
+        "the materialized symlink must be removed after the run"
+    );
+    assert_eq!(repo.git(&["show", ":link.txt"]), "real.txt");
 }
 
 /// A mode-120000 entry stored as plain text (`core.symlinks=false`) is not passed to the linter.

@@ -36,23 +36,28 @@ fn run(opts: &Opts) -> Result<()> {
     let stash_untracked = matches!(opts.stash, StashScope::Untracked);
 
     let status = status::collect(&repo, stash_untracked)?;
-    if status.staged.is_empty() {
+    if status.scope.is_empty() {
+        if !opts.quiet {
+            eprintln!("stagelint: warning: could not find any staged files");
+        }
         return Ok(());
     }
 
     // Git paths are bytes; everything downstream of here works in filesystem paths.
-    let mut staged = Vec::with_capacity(status.staged.len());
-    for path in &status.staged {
-        staged.push(
+    let mut paths = Vec::with_capacity(status.scope.len());
+    for path in &status.scope {
+        paths.push(
             gix::path::try_from_byte_slice(path.as_slice())
                 .with_context(|| format!("cannot represent {path} as a filesystem path"))?,
         );
     }
 
-    let tasks = config::resolve(staged, &workdir)?;
+    let tasks = config::resolve(paths, &workdir)?;
     if tasks.is_empty() {
         if !opts.quiet {
-            eprintln!("stagelint: warning: no tasks configured for the staged files");
+            eprintln!(
+                "stagelint: warning: could not find any staged files matching configured tasks"
+            );
         }
         return Ok(());
     }
@@ -73,18 +78,11 @@ fn run(opts: &Opts) -> Result<()> {
         move || c.cancel()
     })?;
 
-    let mut workflow = workflow::Workflow::new(
-        &repo,
-        &workdir,
-        status,
-        stash_tracked,
-        stash_untracked,
-        opts.quiet,
-    )?;
+    let mut workflow = workflow::Workflow::new(&repo, &workdir, status, stash_tracked, opts.quiet)?;
 
     runner.run()?;
 
-    workflow.finish(opts.quiet)?;
+    workflow.finish()?;
 
     Ok(())
 }

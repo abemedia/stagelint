@@ -27,8 +27,8 @@ pub struct Opts {
     #[arg(long)]
     pub continue_on_error: bool,
 
-    /// Limit how many tasks run at once: a number, true or 0 (unlimited), or false (sequential).
-    #[arg(long, default_value = "true", value_parser = parse_concurrent)]
+    /// Run at most this many tasks at once, or false to run them sequentially.
+    #[arg(long, default_value = "true", value_name = "NUM|BOOL", value_parser = parse_concurrent)]
     pub concurrent: usize,
 
     /// Control stash scope; each value includes the previous.
@@ -55,9 +55,10 @@ fn parse_concurrent(s: &str) -> Result<usize, String> {
     match s {
         "true" => Ok(0), // 0 means unlimited.
         "false" => Ok(1),
-        _ => s
-            .parse::<usize>()
-            .map_err(|_| format!("expected true, false, or a number, got '{s}'")),
+        _ => match s.parse::<usize>() {
+            Ok(0) | Err(_) => Err("expected true, false, or a positive number".into()),
+            Ok(n) => Ok(n),
+        },
     }
 }
 
@@ -79,12 +80,11 @@ mod tests {
         assert_eq!(parse_concurrent("true"), Ok(0));
         assert_eq!(parse_concurrent("false"), Ok(1));
         assert_eq!(parse_concurrent("4"), Ok(4));
-        assert_eq!(parse_concurrent("0"), Ok(0));
     }
 
     #[test]
     fn parse_concurrent_invalid() {
-        let err = parse_concurrent("maybe").unwrap_err();
-        assert_eq!(err, "expected true, false, or a number, got 'maybe'");
+        assert!(parse_concurrent("maybe").is_err());
+        assert!(parse_concurrent("0").is_err());
     }
 }

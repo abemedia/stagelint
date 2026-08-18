@@ -2046,6 +2046,126 @@ fn continue_on_error_runs_pipeline_after_spawn_failure() {
     );
 }
 
+// Diff
+
+/// A revspec that is not a diff range is rejected.
+#[test]
+fn diff_rejects_non_range_spec() {
+    let repo = TestRepo::new(&json!({"*.txt": "false"}));
+
+    let output = assert_failure(repo.stagelint(&["--diff", "^HEAD"]));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not a diff range"),
+        "got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = assert_failure(repo.stagelint(&["--diff", "no-such-ref"]));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("failed to resolve revision"),
+        "got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `--diff a..b` lints the files changed between the two revisions, not the staged set.
+#[test]
+fn diff_range_lints_changed_files() {
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+
+    repo.write_file("changed.txt", "changed\n");
+    repo.git(&["add", "changed.txt"]);
+    repo.git(&["commit", "-m", "change"]);
+    repo.write_file("staged.txt", "staged\n");
+    repo.git(&["add", "staged.txt"]);
+
+    assert_success(repo.stagelint(&["--diff", "HEAD~1..HEAD"]));
+
+    assert_eq!(repo.read_file("changed.txt"), "CHANGED\n");
+    assert_eq!(repo.read_file("staged.txt"), "staged\n");
+}
+
+/// `--diff a...b` diffs from the merge base: a file the other branch changed since the fork is
+/// out of scope, where `a..b` would include it.
+#[test]
+fn diff_merge_base_excludes_other_branch() {
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+
+    repo.write_file("shared.txt", "base\n");
+    repo.git(&["add", "shared.txt"]);
+    repo.git(&["commit", "-m", "base"]);
+    repo.git(&["checkout", "-qb", "feature"]);
+    repo.write_file("feature.txt", "feature\n");
+    repo.git(&["add", "feature.txt"]);
+    repo.git(&["commit", "-m", "feature"]);
+    repo.git(&["checkout", "-q", "-"]);
+    repo.write_file("shared.txt", "main\n");
+    repo.git(&["add", "shared.txt"]);
+    repo.git(&["commit", "-m", "main"]);
+    repo.git(&["checkout", "-q", "feature"]);
+
+    assert_success(repo.stagelint(&["--diff", "main...HEAD"]));
+
+    assert_eq!(repo.read_file("feature.txt"), "FEATURE\n");
+    assert_eq!(
+        repo.read_file("shared.txt"),
+        "base\n",
+        "changed on main since the fork: in main..HEAD, not in main...HEAD"
+    );
+}
+
+/// A single revision under `--diff` compares against HEAD, as `git diff <rev>` does.
+#[test]
+fn diff_single_revision_compares_to_head() {
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+
+    repo.write_file("file.txt", "changed\n");
+    repo.git(&["add", "file.txt"]);
+    repo.git(&["commit", "-m", "change"]);
+
+    assert_success(repo.stagelint(&["--diff", "HEAD~1"]));
+
+    assert_eq!(repo.read_file("file.txt"), "CHANGED\n");
+}
+
+/// A file in the range that no longer exists on disk is not passed to commands.
+#[test]
+fn diff_skips_files_missing_from_disk() {
+    let repo = TestRepo::new(&json!({"*.txt": "sh -c 'printf \"%s\\n\" \"$@\" > .git/argv' _"}));
+
+    repo.write_file("kept.txt", "kept\n");
+    repo.write_file("gone.txt", "gone\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "change"]);
+    fs::remove_file(repo.root.join("gone.txt")).unwrap();
+
+    assert_success(repo.stagelint(&["--diff", "HEAD~1..HEAD"]));
+
+    let argv = repo.read_file(".git/argv");
+    assert!(argv.contains("kept.txt"), "got: {argv}");
+    assert!(!argv.contains("gone.txt"), "got: {argv}");
+}
+
+/// Under `--diff` an unstaged edit to a file in the range is linted and its result staged.
+#[test]
+fn diff_stages_unstaged_edits_in_range() {
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+
+    repo.write_file("file.txt", "base\n");
+    repo.git(&["add", "file.txt"]);
+    repo.git(&["commit", "-m", "base"]);
+    repo.write_file("file.txt", "committed\n");
+    repo.git(&["add", "file.txt"]);
+    repo.git(&["commit", "-m", "change"]);
+
+    repo.write_file("file.txt", "committed\nunstaged\n");
+
+    assert_success(repo.stagelint(&["--diff", "HEAD~1..HEAD"]));
+
+    assert_eq!(repo.git(&["show", ":file.txt"]), "COMMITTED\nUNSTAGED\n");
+    assert_eq!(repo.read_file("file.txt"), "COMMITTED\nUNSTAGED\n");
+}
+
 // Config
 
 /// Monorepo: each file uses the nearest config walking up to the root.

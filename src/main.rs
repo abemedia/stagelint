@@ -35,10 +35,17 @@ fn run(opts: &Opts) -> Result<()> {
     let stash_tracked = matches!(opts.stash, StashScope::Tracked | StashScope::Untracked);
     let stash_untracked = matches!(opts.stash, StashScope::Untracked);
 
-    let status = status::collect(&repo, stash_untracked)?;
+    let status = status::collect(&repo, stash_untracked, opts.diff.as_deref())?;
     if status.scope.is_empty() {
         if !opts.quiet {
-            eprintln!("stagelint: warning: could not find any staged files");
+            eprintln!(
+                "stagelint: warning: could not find any {} files",
+                if opts.diff.is_some() {
+                    "changed"
+                } else {
+                    "staged"
+                }
+            );
         }
         return Ok(());
     }
@@ -56,7 +63,12 @@ fn run(opts: &Opts) -> Result<()> {
     if tasks.is_empty() {
         if !opts.quiet {
             eprintln!(
-                "stagelint: warning: could not find any staged files matching configured tasks"
+                "stagelint: warning: could not find any {} files matching configured tasks",
+                if opts.diff.is_some() {
+                    "changed"
+                } else {
+                    "staged"
+                }
             );
         }
         return Ok(());

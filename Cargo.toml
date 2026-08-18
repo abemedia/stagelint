@@ -17,7 +17,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 command-group = { version = "5", features = ["with-tokio"] }
 ctrlc = { version = "3", features = ["termination"] }
-gix = { version = "0.86", default-features = false, features = ["max-performance", "merge", "sha1", "sha256", "status", "tree-editor", "worktree-mutation"] }
+gix = { version = "0.86", default-features = false, features = ["max-performance", "merge", "revision", "sha1", "sha256", "status", "tree-editor", "worktree-mutation"] }
 globset = "0.4"
 indexmap = { version = "2", features = ["serde"] }
 json5 = "1"

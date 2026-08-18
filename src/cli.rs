@@ -31,6 +31,14 @@ pub struct Opts {
     #[arg(long, default_value = "true", value_name = "NUM|BOOL", value_parser = parse_concurrent)]
     pub concurrent: usize,
 
+    /// Lint the files changed in a revision range instead of the staged files.
+    ///
+    /// Takes any range `git diff` does - `main...HEAD` for everything on the branch since it
+    /// diverged, or a single revision such as `HEAD~3` to compare against HEAD. Results are staged,
+    /// as in the default mode.
+    #[arg(long, value_name = "REVSPEC")]
+    pub diff: Option<String>,
+
     /// Control stash scope; each value includes the previous.
     #[arg(long, value_enum, default_value_t)]
     pub stash: StashScope,

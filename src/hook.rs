@@ -5,17 +5,20 @@ use anyhow::{Context, Result, anyhow, bail};
 use gix::bstr::{BString, ByteSlice};
 use gix::discover::upwards;
 
+use crate::report::{Reporter, Status};
+
 const BEGIN: &str = "# stagelint begin";
 const END: &str = "# stagelint end";
 
-pub fn install(force: bool) -> Result<()> {
+pub fn install(force: bool, root: &Reporter) -> Result<()> {
     let repo = match gix::discover(std::env::current_dir()?) {
         Ok(repo) => repo,
         Err(gix::discover::Error::Discover(upwards::Error::NoGitRepository { path })) => {
-            eprintln!(
-                "stagelint: no git repository in {}; skipping hook installation",
+            root.add(format!(
+                "No git repository in {}; skipping hook installation",
                 path.display()
-            );
+            ))
+            .status(Status::Warn);
             return Ok(());
         }
         Err(e) => return Err(e.into()),
@@ -78,7 +81,11 @@ pub fn install(force: bool) -> Result<()> {
         }
         fs::write(&hook_path, &updated)
             .with_context(|| format!("failed to write {}", hook_path.display()))?;
-        eprintln!("Installed pre-commit hook at {}", hook_path.display());
+        root.add(format!(
+            "Installed pre-commit hook at {}",
+            hook_path.display()
+        ))
+        .status(Status::Done);
     }
 
     #[cfg(unix)]

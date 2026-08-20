@@ -140,8 +140,13 @@ whole tree, and the default leaves your uncommitted work in place for it to trip
 
 ### `--quiet`
 
-Suppresses warnings, such as the notice printed when no task matches the staged files. Command
-output and errors are unaffected.
+Prints only the output of failed commands and errors: no task tree, no warnings. Cannot be combined
+with `--verbose`.
+
+### `--verbose`
+
+Prints the output of every command and keeps the task tree fully expanded. By default only failed
+commands have their output shown, so a passing run is just the task tree.
 
 ## How it works
 

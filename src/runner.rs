@@ -1,285 +1,247 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 
 use command_group::AsyncCommandGroup;
 use tokio::io::AsyncReadExt;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use crate::config::{Cmd, Task};
+use crate::report::{Reporter, Status};
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("failed to parse command: {command}")]
-    Parse {
-        command: String,
-        #[source]
-        source: shell_words::ParseError,
-    },
-    #[error("empty command")]
-    Empty,
     #[error("failed to create async runtime")]
     Runtime(#[source] io::Error),
-    #[error("{0} command(s) failed")]
-    CommandsFailed(usize),
+    #[error("failed")]
+    Failed,
     #[error("cancelled")]
     Cancelled,
+    #[error(transparent)]
+    Panicked(tokio::task::JoinError),
 }
 
-/// A single command of a task pipeline.
-pub struct Command {
-    pub command: String,
-    pub pass_filenames: bool,
-}
-
-struct Cmd {
-    command: String,
-    program: String,
-    args: Vec<String>,
-    pass_filenames: bool,
-}
-
-struct CommandResult {
-    name: String,
-    status: Result<process::ExitStatus, io::Error>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    cancelled: bool,
-}
-
-struct TaskOutcome {
-    task: usize,
-    commands: Vec<CommandResult>,
-}
-
-struct Task {
-    commands: Vec<Cmd>,
-    /// Appended to the argv of each command with `pass_filenames`.
-    files: Vec<OsString>,
-    cwd: PathBuf,
-    /// Tasks whose pending count drops when this one finishes.
-    dependents: Vec<usize>,
-    /// Unfinished predecessors; ready to start at zero.
-    pending: usize,
-    started: bool,
-}
-
-pub struct Runner {
-    tasks: Vec<Task>,
-    /// Last task to claim each file; the next claimant starts after it.
-    last_writer: HashMap<OsString, usize>,
+/// Run every task of every config, drawing the tree under `tasks`. Tasks sharing files never
+/// run concurrently; they start in declaration order.
+pub fn run(
+    tasks: &Reporter,
+    configs: BTreeMap<PathBuf, Vec<Task>>,
     continue_on_error: bool,
     concurrent: usize,
-    cancel: CancellationToken,
-    running: CancellationToken,
-}
-
-impl Runner {
-    pub fn new(continue_on_error: bool, concurrent: usize, cancel: CancellationToken) -> Self {
-        let running = cancel.child_token();
-        Runner {
-            tasks: Vec::new(),
-            last_writer: HashMap::new(),
-            continue_on_error,
-            concurrent,
-            cancel,
-            running,
-        }
-    }
-
-    /// Parse command strings and build a task pipeline.
-    /// `files` is appended to each command with `pass_filenames` and the commands run in `cwd`.
-    /// Tasks sharing files never run concurrently: each starts after the previous claimant of its
-    /// files, in insertion order.
-    pub fn add(
-        &mut self,
-        commands: impl IntoIterator<Item = Command>,
-        files: Vec<OsString>,
-        cwd: PathBuf,
-    ) -> Result<(), Error> {
-        let commands = commands.into_iter();
-        let mut resolved = Vec::with_capacity(commands.size_hint().0);
-        for Command {
-            command,
-            pass_filenames,
-        } in commands
-        {
-            let mut args = shell_words::split(&command).map_err(|e| Error::Parse {
-                command: command.clone(),
-                source: e,
-            })?;
-            if args.is_empty() {
-                return Err(Error::Empty);
-            }
-            let program = args.remove(0);
-            if program.is_empty() {
-                return Err(Error::Empty);
-            }
-
-            // CreateProcess appends only `.exe` to bare names; npm tools ship as `.cmd` shims.
-            #[cfg(windows)]
-            let program = which::which(&program)
-                .ok()
-                .and_then(|p| p.into_os_string().into_string().ok())
-                .unwrap_or(program);
-
-            resolved.push(Cmd {
-                command,
-                program,
-                args,
-                pass_filenames,
-            });
-        }
-        if resolved.is_empty() {
-            return Ok(());
-        }
-
-        let mut after: Vec<usize> = files
-            .iter()
-            .filter_map(|file| self.last_writer.get(file).copied())
-            .collect();
-        after.sort_unstable();
-        after.dedup();
-
-        let id = self.tasks.len();
-        for file in &files {
-            self.last_writer.insert(file.clone(), id);
-        }
-        self.tasks.push(Task {
-            commands: resolved,
-            files,
-            cwd,
-            dependents: Vec::new(),
-            pending: after.len(),
-            started: false,
-        });
-        for &predecessor in &after {
-            self.tasks[predecessor].dependents.push(id);
-        }
-
-        Ok(())
-    }
-
-    pub fn run(self) -> Result<(), Error> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(Error::Runtime)?
-            .block_on(self.run_async())
-    }
-
-    async fn run_async(mut self) -> Result<(), Error> {
+    cancel: &CancellationToken,
+) -> Result<(), Error> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(Error::Runtime)?;
+    let groups = plan(tasks, configs);
+    let running = cancel.child_token();
+    let permits = Arc::new(Semaphore::new(if concurrent == 0 {
+        Semaphore::MAX_PERMITS
+    } else {
+        concurrent
+    }));
+    runtime.block_on(async {
         let mut set = JoinSet::new();
-        let mut error_count = 0usize;
-        // Dependencies are resolved; holding a key per file would waste the run's lifetime.
-        self.last_writer = HashMap::new();
-
-        self.fill(&mut set);
-
-        while let Some(r) = set.join_next().await {
-            let outcome = match r {
-                Ok(o) => o,
-                Err(e) => {
-                    eprintln!("stagelint: task panicked: {e}");
-                    error_count += 1;
-                    // A panic is a bug, not a command failure; continue_on_error does not apply.
-                    self.running.cancel();
-                    continue;
-                }
-            };
-
-            for result in &outcome.commands {
-                print_output(&result.stdout, &result.stderr);
-                let name = &result.name;
-                match &result.status {
-                    Ok(s) if s.success() => {}
-                    _ if result.cancelled => eprintln!("stagelint: command cancelled: `{name}`"),
-                    Ok(s) => {
-                        eprintln!("stagelint: command failed: `{name}` ({s})");
-                        error_count += 1;
-                    }
-                    Err(e) => {
-                        eprintln!("stagelint: failed to run `{name}`: {e}");
-                        error_count += 1;
-                    }
-                }
-            }
-
-            if error_count > 0 && !self.continue_on_error {
-                self.running.cancel();
-            }
-            let dependents = std::mem::take(&mut self.tasks[outcome.task].dependents);
-            for dependent in dependents {
-                self.tasks[dependent].pending -= 1;
-            }
-            self.fill(&mut set);
+        for group in groups {
+            let (permits, running) = (permits.clone(), running.clone());
+            set.spawn(group.run(permits, running, continue_on_error));
         }
 
-        if self.cancel.is_cancelled() {
+        let mut worst = Status::Done;
+        let mut panic = None;
+        while let Some(joined) = set.join_next().await {
+            match joined.and_then(|status| status) {
+                Ok(status) => worst = worst.max(status),
+                Err(e) => {
+                    // A panic is a bug, not a command failure; continue_on_error does not apply.
+                    running.cancel();
+                    panic.get_or_insert(e);
+                }
+            }
+        }
+
+        if let Some(e) = panic {
+            return Err(Error::Panicked(e));
+        }
+        if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        if error_count > 0 {
-            return Err(Error::CommandsFailed(error_count));
+        if worst == Status::Failed {
+            return Err(Error::Failed);
         }
         Ok(())
-    }
+    })
+}
 
-    fn fill(&mut self, set: &mut JoinSet<TaskOutcome>) {
-        for task in 0..self.tasks.len() {
-            if self.concurrent != 0 && set.len() >= self.concurrent {
-                return;
+/// Create the rows under `tasks`, in tree order, and the groups of jobs that drive them.
+fn plan(tasks: &Reporter, configs: BTreeMap<PathBuf, Vec<Task>>) -> Vec<Group> {
+    let mut groups = Vec::with_capacity(configs.len());
+    for (path, config) in configs {
+        let row = tasks.add(path.display().to_string());
+        let mut jobs: Vec<Job> = Vec::with_capacity(config.len());
+        // Last job to claim each file; the next claimant starts after it.
+        let mut last_writer: HashMap<OsString, usize> = HashMap::new();
+        for task in config {
+            let n = task.files.len();
+            let glob = row
+                .add(task.pattern)
+                .note(format!("{n} file{}", if n == 1 { "" } else { "s" }));
+            let commands = task
+                .commands
+                .into_iter()
+                .map(|cmd| {
+                    let row = glob.add(&cmd.line);
+                    (cmd, row)
+                })
+                .collect();
+            let mut predecessors: Vec<usize> = task
+                .files
+                .iter()
+                .filter_map(|file| last_writer.get(file).copied())
+                .collect();
+            predecessors.sort_unstable();
+            predecessors.dedup();
+            for file in &task.files {
+                last_writer.insert(file.clone(), jobs.len());
             }
-            if !self.tasks[task].started && self.tasks[task].pending == 0 {
-                self.spawn_task(set, task);
-                self.tasks[task].started = true;
+            let (done, _) = watch::channel(());
+            jobs.push(Job {
+                row: glob,
+                commands,
+                files: task.files,
+                cwd: task.cwd,
+                after: predecessors
+                    .iter()
+                    .map(|&p| jobs[p].done.subscribe())
+                    .collect(),
+                done,
+            });
+        }
+        groups.push(Group { row, jobs });
+    }
+    groups
+}
+
+/// One config's row and the jobs under it.
+struct Group {
+    row: Reporter,
+    jobs: Vec<Job>,
+}
+
+impl Group {
+    /// Run the jobs and settle the row to the worst of them.
+    async fn run(
+        self,
+        permits: Arc<Semaphore>,
+        running: CancellationToken,
+        continue_on_error: bool,
+    ) -> Result<Status, tokio::task::JoinError> {
+        let mut set = JoinSet::new();
+        for job in self.jobs {
+            let (row, permits, running) = (self.row.clone(), permits.clone(), running.clone());
+            set.spawn(job.run(row, permits, running, continue_on_error));
+        }
+        let mut worst = Status::Done;
+        let mut panic = None;
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(status) => worst = worst.max(status),
+                Err(e) => {
+                    running.cancel();
+                    panic.get_or_insert(e);
+                }
             }
         }
-    }
-
-    fn spawn_task(&mut self, set: &mut JoinSet<TaskOutcome>, task: usize) {
-        // Cancellation must not start a doomed task.
-        if self.running.is_cancelled() {
-            return;
+        if let Some(e) = panic {
+            return Err(e);
         }
+        self.row.status(worst);
+        Ok(worst)
+    }
+}
 
-        // Nothing reads these again, so hand them to the task rather than copying.
-        let commands = std::mem::take(&mut self.tasks[task].commands);
-        let files = std::mem::take(&mut self.tasks[task].files);
-        let cwd = std::mem::take(&mut self.tasks[task].cwd);
-        let running = self.running.clone();
-        let continue_on_error = self.continue_on_error;
+/// One pattern's commands, each with its row.
+struct Job {
+    row: Reporter,
+    commands: Vec<(Cmd, Reporter)>,
+    files: Vec<OsString>,
+    cwd: PathBuf,
+    /// Completion signals from the jobs this one must follow; a closed channel skips this job.
+    after: Vec<watch::Receiver<()>>,
+    /// Signals this job finished. A panic drops it unsent, closing the channel.
+    done: watch::Sender<()>,
+}
 
-        set.spawn(async move {
-            let mut results = Vec::with_capacity(commands.len());
-            for cmd in commands {
-                // Don't spawn a command a pending cancellation would instantly kill.
-                if running.is_cancelled() {
-                    break;
-                }
-                let result = run_command(cmd, &files, &cwd, &running).await;
-                let failed = !matches!(&result.status, Ok(s) if s.success());
-                results.push(result);
-                if failed && !continue_on_error {
-                    break;
+impl Job {
+    /// Run the commands in order after the predecessors; returns the worst status.
+    async fn run(
+        mut self,
+        group: Reporter,
+        permits: Arc<Semaphore>,
+        running: CancellationToken,
+        continue_on_error: bool,
+    ) -> Status {
+        let mut worst = Status::Done;
+        let mut commands = self.commands.into_iter().peekable();
+        let ready = async {
+            for rx in &mut self.after {
+                rx.changed().await.ok()?;
+            }
+            permits.acquire().await.ok()
+        };
+        if let Some(_permit) = ready.await {
+            group.status(Status::Running);
+            self.row.status(Status::Running);
+            // Don't spawn a command a pending cancellation would instantly kill.
+            while let Some((cmd, row)) = commands.next_if(|_| !running.is_cancelled()) {
+                row.status(Status::Running);
+                let (status, output) = run_command(&cmd, &self.files, &self.cwd, &running).await;
+                row.output(output).status(status);
+                worst = worst.max(status);
+                if worst == Status::Failed && !continue_on_error {
+                    running.cancel();
                 }
             }
-            TaskOutcome {
-                task,
-                commands: results,
-            }
-        });
+        }
+        for (_, row) in commands {
+            row.status(Status::Cancelled);
+            worst = Status::Cancelled.max(worst);
+        }
+        self.row.status(worst);
+        self.done.send_replace(());
+        worst
     }
 }
 
 /// Run one command to completion, killing and draining it if `running` is cancelled mid-flight.
+/// Returns how it ended with its output, stdout then stderr.
 async fn run_command(
-    cmd: Cmd,
+    cmd: &Cmd,
     files: &[OsString],
     cwd: &Path,
     running: &CancellationToken,
-) -> CommandResult {
-    let mut proc = tokio::process::Command::new(&cmd.program);
+) -> (Status, Vec<u8>) {
+    // `CreateProcess` only appends `.exe`, so `.cmd` and `.bat` shims need a full path.
+    #[cfg(windows)]
+    let program = &tokio::task::spawn_blocking({
+        let name = cmd.program.clone();
+        move || which::which(name).ok()
+    })
+    .await
+    .ok()
+    .flatten()
+    .and_then(|p| p.into_os_string().into_string().ok())
+    .unwrap_or_else(|| cmd.program.clone());
+    #[cfg(not(windows))]
+    let program = &cmd.program;
+
+    let mut proc = tokio::process::Command::new(program);
     proc.args(&cmd.args)
         .args(if cmd.pass_filenames { files } else { &[] })
         .current_dir(cwd)
@@ -290,13 +252,7 @@ async fn run_command(
     let mut child = match proc.group_spawn() {
         Ok(child) => child,
         Err(e) => {
-            return CommandResult {
-                name: cmd.command,
-                status: Err(e),
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-                cancelled: false,
-            };
+            return (Status::Failed, format!("failed to run: {e}\n").into_bytes());
         }
     };
 
@@ -308,16 +264,17 @@ async fn run_command(
         let mut out = Vec::new();
         let mut err = Vec::new();
         let _ = tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
-        (out, err)
+        out.extend_from_slice(&err);
+        out
     };
     tokio::pin!(read);
 
     let mut cancelled = false;
     let mut handled = false;
-    let (stdout, stderr) = loop {
+    let mut output = loop {
         tokio::select! {
             biased;
-            bufs = &mut read => break bufs,
+            output = &mut read => break output,
             () = running.cancelled(), if !handled => {
                 handled = true;
                 // A process already exiting is no cancellation; keep its real status.
@@ -327,59 +284,157 @@ async fn run_command(
         }
     };
 
-    let status = child.wait().await;
-    CommandResult {
-        name: cmd.command,
-        status,
-        stdout,
-        stderr,
-        cancelled,
-    }
-}
-
-fn print_output(stdout: &[u8], stderr: &[u8]) {
-    if !stdout.is_empty() {
-        io::stdout().write_all(stdout).ok();
-    }
-    if !stderr.is_empty() {
-        io::stderr().write_all(stderr).ok();
-    }
+    let status = match child.wait().await {
+        Ok(status) if status.success() => Status::Done,
+        Ok(status) if cancelled && (cfg!(windows) || status.code().is_none()) => Status::Cancelled,
+        Err(_) if cancelled => Status::Cancelled,
+        Ok(status) => {
+            output.extend_from_slice(format!("{status}\n").as_bytes());
+            Status::Failed
+        }
+        Err(e) => {
+            output.extend_from_slice(format!("failed to run: {e}\n").as_bytes());
+            Status::Failed
+        }
+    };
+    (status, output)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+    use crate::report::Level;
 
-    fn runner_with(command: &str) -> Result<Runner, Error> {
-        let mut runner = Runner::new(false, 0, CancellationToken::new());
-        runner.add(
-            [Command {
-                command: command.to_owned(),
-                pass_filenames: true,
-            }],
-            Vec::new(),
-            PathBuf::from("."),
-        )?;
-        Ok(runner)
+    /// A plain-mode reporter whose log can be read back.
+    fn reporter() -> (Reporter, Arc<Mutex<Vec<u8>>>) {
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Buf {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        console::set_colors_enabled_stderr(false);
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let root = Reporter::custom(
+            Level::Normal,
+            indicatif::ProgressDrawTarget::hidden(),
+            Box::new(Buf(buf.clone())),
+            None,
+        );
+        (root, buf)
     }
 
-    #[test]
-    fn quoted_empty_program_rejected() {
-        assert!(matches!(runner_with("''"), Err(Error::Empty)));
-        assert!(matches!(runner_with("   "), Err(Error::Empty)));
+    fn task(pattern: &str, lines: &[&str], files: &[&str]) -> Task {
+        Task {
+            pattern: pattern.to_owned(),
+            commands: lines
+                .iter()
+                .map(|line| {
+                    let mut args = shell_words::split(line).unwrap();
+                    Cmd {
+                        line: (*line).to_owned(),
+                        program: args.remove(0),
+                        args,
+                        pass_filenames: false,
+                    }
+                })
+                .collect(),
+            files: files.iter().map(OsString::from).collect(),
+            cwd: PathBuf::from("."),
+        }
     }
 
-    #[test]
-    fn unbalanced_quotes_rejected() {
-        assert!(matches!(
-            runner_with("echo 'unterminated"),
-            Err(Error::Parse { .. })
-        ));
+    fn lines(buf: &Mutex<Vec<u8>>) -> Vec<String> {
+        String::from_utf8(buf.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 
     #[test]
     fn command_not_found_fails() {
-        let runner = runner_with("stagelint-no-such-program").expect("add");
-        assert!(matches!(runner.run(), Err(Error::CommandsFailed(1))));
+        let (root, buf) = reporter();
+        let configs = BTreeMap::from([(
+            PathBuf::from("cfg"),
+            vec![task("*", &["stagelint-no-such-program"], &[])],
+        )]);
+        let result = run(&root, configs, false, 0, &CancellationToken::new());
+        assert!(matches!(result, Err(Error::Failed)));
+        let log = lines(&buf);
+        let failed = log
+            .iter()
+            .position(|l| l == "[FAILED] * > stagelint-no-such-program")
+            .expect("failed line");
+        assert!(
+            log.get(failed + 1)
+                .is_some_and(|l| l.starts_with("failed to run: ")),
+            "{log:?}"
+        );
+        assert_eq!(log.last().unwrap(), "[FAILED] cfg");
+    }
+
+    /// A config row starts with its first task and settles after its last, as its tasks did.
+    #[test]
+    fn config_row_follows_its_tasks() {
+        let (root, buf) = reporter();
+        let configs = BTreeMap::from([(
+            PathBuf::from("cfg"),
+            vec![task("*.a", &["true"], &[]), task("*.b", &["true"], &[])],
+        )]);
+        run(&root, configs, false, 1, &CancellationToken::new()).expect("run");
+        let log = lines(&buf);
+        assert_eq!(log.first().unwrap(), "[STARTED] cfg");
+        assert_eq!(log.last().unwrap(), "[COMPLETED] cfg");
+        assert_eq!(log.iter().filter(|l| l.ends_with("] cfg")).count(), 2);
+    }
+
+    /// A failure stops the run: later commands are cancelled, the config and the run fail.
+    #[test]
+    fn failure_cancels_the_rest() {
+        let (root, buf) = reporter();
+        let configs = BTreeMap::from([(
+            PathBuf::from("cfg"),
+            vec![task("*.a", &["false", "true"], &[])],
+        )]);
+        let result = run(&root, configs, false, 0, &CancellationToken::new());
+        assert!(matches!(result, Err(Error::Failed)));
+        let log = lines(&buf);
+        assert!(log.contains(&"[FAILED] *.a > false".to_owned()), "{log:?}");
+        assert!(
+            log.contains(&"[CANCELLED] *.a > true".to_owned()),
+            "{log:?}"
+        );
+        assert_eq!(log.last().unwrap(), "[FAILED] cfg");
+    }
+
+    /// Tasks that share a file run one after the other, in declaration order.
+    #[test]
+    fn shared_files_serialise_tasks() {
+        let (root, buf) = reporter();
+        let configs = BTreeMap::from([(
+            PathBuf::from("cfg"),
+            vec![
+                task("*.a", &["sleep 0.2"], &["x"]),
+                task("*.b", &["true"], &["x"]),
+            ],
+        )]);
+        run(&root, configs, false, 0, &CancellationToken::new()).expect("run");
+        let log = lines(&buf);
+        let done_a = log
+            .iter()
+            .position(|l| l == "[COMPLETED] *.a > sleep 0.2")
+            .unwrap_or_else(|| panic!("*.a never completed: {log:?}"));
+        let start_b = log
+            .iter()
+            .position(|l| l == "[STARTED] *.b > true")
+            .unwrap_or_else(|| panic!("*.b never started: {log:?}"));
+        assert!(done_a < start_b, "{log:?}");
     }
 }

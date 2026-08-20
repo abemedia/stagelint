@@ -43,9 +43,13 @@ pub struct Opts {
     #[arg(long, value_enum, default_value_t)]
     pub stash: StashScope,
 
-    /// Suppress warnings.
-    #[arg(long)]
+    /// Print only the output of failed commands and errors.
+    #[arg(long, conflicts_with = "verbose")]
     pub quiet: bool,
+
+    /// Show the output of every command, not only of those that failed.
+    #[arg(long)]
+    pub verbose: bool,
 }
 
 #[derive(Clone, Default, ValueEnum)]

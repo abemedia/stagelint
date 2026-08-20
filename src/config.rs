@@ -33,14 +33,28 @@ pub enum Error {
         source: json5::Error,
     },
     #[error("invalid config {path}: {message}")]
-    Invalid { path: PathBuf, message: String },
+    Invalid {
+        path: PathBuf,
+        message: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
 }
 
 /// One runner task per config pattern with matching files.
 pub struct Task {
-    pub commands: Vec<CommandObject>,
+    pub pattern: String,
+    pub commands: Vec<Cmd>,
     pub files: Vec<OsString>,
     pub cwd: PathBuf,
+}
+
+/// A command split with POSIX shell rules; `line` is it as written.
+pub struct Cmd {
+    pub line: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub pass_filenames: bool,
 }
 
 #[derive(Deserialize)]
@@ -65,11 +79,13 @@ fn default_true() -> bool {
 }
 
 /// Group `paths` by their nearest config file, load each, and match its patterns.
-/// Tasks are ordered by config path, then by pattern declaration order.
+///
+/// Keyed by repo-relative config path; configs whose patterns match nothing are omitted, and each
+/// config's tasks keep pattern declaration order.
 pub fn resolve<'a>(
     paths: impl IntoIterator<Item = &'a Path>,
     workdir: &Path,
-) -> Result<Vec<Task>, Error> {
+) -> Result<BTreeMap<PathBuf, Vec<Task>>, Error> {
     let mut cache = HashMap::new();
     let mut by_config: BTreeMap<PathBuf, Vec<&Path>> = BTreeMap::new();
     for path in paths {
@@ -79,11 +95,12 @@ pub fn resolve<'a>(
         }
     }
 
-    let mut tasks = Vec::new();
-    for (config_path, paths) in &by_config {
-        let cfg = load_file(&workdir.join(config_path))?;
+    let mut resolved = BTreeMap::new();
+    for (config_path, paths) in by_config {
+        let cfg = load_file(&workdir.join(&config_path))?;
         let prefix = config_path.parent().unwrap_or(Path::new(""));
 
+        let mut tasks = Vec::new();
         for (pattern, entry) in cfg {
             // Bare patterns match basenames at any depth.
             let glob = if pattern.contains('/') {
@@ -113,14 +130,40 @@ pub fn resolve<'a>(
                 continue;
             }
 
+            let mut commands = Vec::with_capacity(entry.len());
+            for obj in entry {
+                let mut args = shell_words::split(&obj.command).map_err(|e| Error::Invalid {
+                    path: workdir.join(&config_path),
+                    message: format!("invalid command in pattern \"{pattern}\""),
+                    source: Some(Box::new(e)),
+                })?;
+                if args.first().is_none_or(String::is_empty) {
+                    return Err(Error::Invalid {
+                        path: workdir.join(&config_path),
+                        message: format!("empty command in pattern \"{pattern}\""),
+                        source: None,
+                    });
+                }
+                commands.push(Cmd {
+                    line: obj.command,
+                    program: args.remove(0),
+                    args,
+                    pass_filenames: obj.pass_filenames,
+                });
+            }
+
             tasks.push(Task {
-                commands: entry,
+                pattern,
+                commands,
                 files,
                 cwd: workdir.join(prefix),
             });
         }
+        if !tasks.is_empty() {
+            resolved.insert(config_path, tasks);
+        }
     }
-    Ok(tasks)
+    Ok(resolved)
 }
 
 const CONFIG_FILES: &[&str] = &[
@@ -205,6 +248,7 @@ fn load_file(path: &Path) -> Result<Config, Error> {
         return Err(Error::Invalid {
             path: path.to_owned(),
             message: "no patterns configured".into(),
+            source: None,
         });
     }
 
@@ -219,6 +263,7 @@ fn load_file(path: &Path) -> Result<Config, Error> {
         return Err(Error::Invalid {
             path: path.to_owned(),
             message,
+            source: None,
         });
     }
 
@@ -393,7 +438,8 @@ mod tests {
         .map(PathBuf::from)
         .collect();
 
-        let tasks = resolve(paths.iter().map(PathBuf::as_path), dir.path()).expect("resolve");
+        let resolved = resolve(paths.iter().map(PathBuf::as_path), dir.path()).expect("resolve");
+        let tasks = &resolved[Path::new(".stagelint.yml")];
         let matched = |task: &Task| -> Vec<String> {
             task.files
                 .iter()
@@ -426,12 +472,54 @@ mod tests {
             .map(PathBuf::from)
             .collect();
 
-        let tasks = resolve(paths.iter().map(PathBuf::as_path), dir.path()).expect("resolve");
+        let resolved = resolve(paths.iter().map(PathBuf::as_path), dir.path()).expect("resolve");
+        let tasks = &resolved[Path::new("packages/web/.stagelint.yml")];
 
         assert_eq!(tasks.len(), 1);
         assert_eq!(
             tasks[0].files,
             [dir.path().join("packages/web/src/a.ts").into_os_string()]
+        );
+    }
+
+    fn resolve_one(config: &str) -> Result<Vec<Task>, Error> {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join(".stagelint.json"), config).expect("write");
+        let mut resolved = resolve([Path::new("a.md")], dir.path())?;
+        Ok(resolved
+            .remove(Path::new(".stagelint.json"))
+            .unwrap_or_default())
+    }
+
+    #[test]
+    fn commands_are_split_into_argv() {
+        let tasks = resolve_one(r#"{"*.md": "prettier --write 'a b'"}"#).expect("resolve");
+        assert_eq!(tasks[0].commands[0].line, "prettier --write 'a b'");
+        assert_eq!(tasks[0].commands[0].program, "prettier");
+        assert_eq!(tasks[0].commands[0].args, ["--write", "a b"]);
+    }
+
+    #[test]
+    fn unbalanced_quotes_rejected() {
+        let Err(err) = resolve_one(r#"{"*.md": "echo 'unterminated"}"#) else {
+            panic!("accepted")
+        };
+        assert!(
+            matches!(&err, Error::Invalid { message, source: Some(_), .. }
+                if message == "invalid command in pattern \"*.md\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn quoted_empty_program_rejected() {
+        let Err(err) = resolve_one(r#"{"*.md": "''"}"#) else {
+            panic!("accepted")
+        };
+        assert!(
+            matches!(&err, Error::Invalid { message, source: None, .. }
+                if message == "empty command in pattern \"*.md\""),
+            "{err}"
         );
     }
 

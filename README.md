@@ -125,6 +125,17 @@ By default the first failing command stops the run and cancels the rest. This ru
 completion and reports all failures together. The commit is still blocked, and the working tree is
 still restored.
 
+### `--diff <REVSPEC>`
+
+Lints the files changed in a revision range instead of the staged files, for `pre-push` hooks and
+CI. Takes any range `git diff` accepts: `main...HEAD` for everything on your branch since it
+diverged, or `HEAD~3` for the last three commits.
+
+Everything else works as in the default mode: the range only decides which files are linted.
+Unstaged edits to partially staged files are still hidden for the run, results are still staged on
+success, and a failed run still restores your working tree. Files in the range that no longer exist
+on disk are skipped.
+
 ### `--stash <partial|tracked|untracked>`
 
 Controls how much of your working tree is hidden while commands run, so they see the content being

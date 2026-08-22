@@ -446,7 +446,7 @@ fn empty_repo_fully_staged() {
 
     assert_eq!(repo.git(&["show", ":hello.txt"]), "HELLO\n");
     assert!(
-        !String::from_utf8_lossy(&output.stderr).contains("no initial commit"),
+        !String::from_utf8_lossy(&output.stderr).contains("[WARN] No initial commit"),
         "nothing is stashed here, so there is no unreferenced backup to warn about"
     );
 }
@@ -518,7 +518,7 @@ fn empty_repo_stash_untracked_restores() {
     assert_eq!(repo.read_file("untracked.txt"), "keep me\n");
     assert_eq!(repo.git(&["show", ":staged.txt"]), "HELLO\n");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("no initial commit"),
+        String::from_utf8_lossy(&output.stderr).contains("[WARN] No initial commit"),
         "a backup no ref points at must be announced"
     );
 }
@@ -1107,10 +1107,10 @@ fn survives_mid_run_stash_ref_drop() {
     assert_eq!(repo.read_file("hello.txt"), "HELLO\ngoodbye\n");
 }
 
-/// A closed stdout must not abort cleanup: the stash is dropped and the unstaged change survives.
+/// Closed output must not abort cleanup: the stash is dropped and the unstaged change survives.
 #[cfg(unix)]
 #[test]
-fn closed_stdout_does_not_leak_stash() {
+fn closed_output_does_not_leak_stash() {
     let repo = TestRepo::new(&json!({"*.txt": "echo OUTPUT"}));
 
     repo.write_file("file.txt", "v1\n");
@@ -1118,7 +1118,8 @@ fn closed_stdout_does_not_leak_stash() {
     repo.write_file("file.txt", "v2\n");
 
     let mut child = repo.stagelint(&[]);
-    drop(child.stdout.take()); // close stdout so the linter output hits a broken pipe
+    // Both, so a broken pipe is hit whichever stream the output goes to.
+    drop((child.stdout.take(), child.stderr.take()));
     assert_success(child);
 
     assert_eq!(repo.read_file("file.txt"), "v2\n");
@@ -1542,7 +1543,7 @@ fn merge_driver_failure_warns_and_skips() {
     let output = assert_success(repo.stagelint(&[]));
 
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("could not apply changes"),
+        String::from_utf8_lossy(&output.stderr).contains("[WARN] Changes staged but not applied"),
         "driver failure should be warned about, got: {}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -1566,7 +1567,7 @@ fn quiet_suppresses_merge_warnings() {
     let output = assert_success(repo.stagelint(&["--quiet"]));
 
     assert!(
-        !String::from_utf8_lossy(&output.stderr).contains("warning"),
+        output.stderr.is_empty(),
         "--quiet must suppress warnings, got: {}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -1980,24 +1981,24 @@ fn concurrent_failure_cancels_running_tasks() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("command cancelled"),
+        stderr.contains("[CANCELLED] .stagelint.json > *.rs > "),
         "sibling not cancelled: {stderr}"
     );
     assert!(
-        stderr.contains("1 command(s) failed"),
-        "killed sibling miscounted: {stderr}"
+        stderr.contains("[FAILED] .stagelint.json > *.md > false\n"),
+        "failure not reported: {stderr}"
     );
 }
 
-/// Two tasks failing concurrently are both reported: the failure racing the cancellation must
-/// not lose its output or its error.
+/// Two tasks failing concurrently are both reported with their output.
+#[cfg(unix)]
 #[test]
 fn concurrent_failures_all_reported() {
     // Each task prints, signals readiness, waits for the other, then fails: both failures are in
     // flight before either completion is processed.
     let repo = TestRepo::new(&json!({
-        "*.md": "sh -c 'echo MD-ERROR; touch .git/linter-1; while [ ! -f .git/linter-2 ]; do sleep 0.01; done; exit 1'",
-        "*.rs": "sh -c 'echo RS-ERROR; touch .git/linter-2; while [ ! -f .git/linter-1 ]; do sleep 0.01; done; exit 1'",
+        "*.md": "sh -c 'echo MD-ERROR; touch .git/linter-1; while [ ! -f .git/linter-2 ]; do :; done; exit 1'",
+        "*.rs": "sh -c 'echo RS-ERROR; touch .git/linter-2; while [ ! -f .git/linter-1 ]; do :; done; exit 1'",
     }));
 
     repo.write_file("file.md", "hello\n");
@@ -2007,20 +2008,32 @@ fn concurrent_failures_all_reported() {
 
     let output = assert_failure(repo.stagelint(&["--concurrent", "2"]));
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for block in [
+        "\nMD-ERROR\nexit status: 1\n",
+        "\nRS-ERROR\nexit status: 1\n",
+    ] {
+        assert!(stderr.contains(block), "missing {block:?} in: {stderr}");
+    }
+}
+
+/// Passing commands stay quiet unless `--verbose` asks for their output.
+#[test]
+fn verbose_shows_passing_output() {
+    let repo = TestRepo::new(&json!({ "*.md": "sh -c 'echo LINT-OK'" }));
+    repo.write_file("file.md", "hello\n");
+    repo.git(&["add", "file.md"]);
+
+    let output = assert_success(repo.stagelint(&[]));
     assert!(
-        stdout.contains("MD-ERROR"),
-        "first failure output lost: {stdout}"
-    );
-    assert!(
-        stdout.contains("RS-ERROR"),
-        "second failure output lost: {stdout}"
+        !String::from_utf8_lossy(&output.stderr).contains("LINT-OK\n"),
+        "passing output should be hidden by default"
     );
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let output = assert_success(repo.stagelint(&["--verbose"]));
     assert!(
-        stderr.contains("command failed: `sh -c 'echo "),
-        "failure should name the full command, got: {stderr}"
+        String::from_utf8_lossy(&output.stderr).contains("LINT-OK\n"),
+        "--verbose should show passing output"
     );
 }
 
@@ -2251,7 +2264,7 @@ fn unmatched_files_pass() {
     let output = assert_success(repo.stagelint(&[]));
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("could not find any staged files matching configured tasks"),
+            .contains("[WARN] Could not find any staged files matching configured tasks"),
         "a run that does nothing must say so"
     );
 
@@ -2301,7 +2314,7 @@ fn unlintable_entries_pass() {
     let output = assert_success(repo.stagelint(&[]));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("could not find any staged files")
+        stderr.contains("[WARN] Could not find any staged files")
             && !stderr.contains("matching configured tasks"),
         "the empty scope must be explained, got: {stderr}"
     );
@@ -2539,7 +2552,7 @@ fn merge_does_not_write_through_symlink() {
     let output = assert_success(repo.stagelint(&[]));
 
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("could not apply changes"),
+        String::from_utf8_lossy(&output.stderr).contains("[WARN] Changes staged but not applied"),
         "the skipped merge must be reported, got: {}",
         String::from_utf8_lossy(&output.stderr)
     );

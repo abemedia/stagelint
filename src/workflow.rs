@@ -17,16 +17,20 @@ use gix::merge::blob::platform::builtin_merge::Pick;
 use gix::merge::blob::{Resolution, ResourceKind, pipeline::WorktreeRoots};
 use gix::objs::Commit;
 use gix::objs::tree::{EntryKind, EntryMode};
+use gix::prelude::ObjectIdExt;
 use gix::refs::Target;
 use gix::refs::log::Line;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::status::plumbing::index_as_worktree::EntryStatus;
 use gix::{Id, ObjectId, Repository};
 
+use crate::report::{self, Reporter};
 use crate::status::Status;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("could not restore the working tree")]
+    Restore,
     #[error("failed to read tree from commit")]
     TreeDecode(#[source] gix::object::commit::Error),
     #[error("failed to create tree editor")]
@@ -142,7 +146,7 @@ pub struct Workflow<'a> {
     dirty: BTreeSet<BString>,
     missing: BTreeSet<BString>,
     stash_tracked: bool,
-    quiet: bool,
+    reporter: &'a Reporter,
     oid: Option<ObjectId>,
     absent: BTreeSet<BString>,
     hidden: BTreeSet<BString>, // dirty paths hidden from the run; all restore rewrites on success
@@ -161,7 +165,7 @@ impl<'a> Workflow<'a> {
         workdir: &'a Path,
         status: Status,
         stash_tracked: bool,
-        quiet: bool,
+        reporter: &'a Reporter,
     ) -> Result<Self, Error> {
         let Status {
             changes,
@@ -220,15 +224,32 @@ impl<'a> Workflow<'a> {
         let oid = if captured.is_empty() && untracked_entries.is_empty() && absent.is_empty() {
             None
         } else {
-            Some(create_stash_commit(
+            if repo.head_commit().is_err() {
+                reporter
+                    .add("No initial commit: if this run is killed, recover your work with `git fsck --lost-found`")
+                    .status(report::Status::Warn);
+            }
+            let phase = reporter
+                .add("Backing up working tree")
+                .status(report::Status::Running);
+            let oid = create_stash_commit(
                 repo,
                 &captured,
                 &untracked_entries,
                 &missing,
                 &changes,
                 &filter_index,
-                quiet,
-            )?)
+            )
+            .inspect_err(|_| {
+                phase.status(report::Status::Failed);
+            })?;
+            phase
+                .title(format!(
+                    "Backed up working tree in stash {}",
+                    oid.attach(repo).shorten_or_id()
+                ))
+                .status(report::Status::Done);
+            Some(oid)
         };
 
         let workflow = Self {
@@ -238,7 +259,7 @@ impl<'a> Workflow<'a> {
             dirty,
             missing,
             stash_tracked,
-            quiet,
+            reporter,
             oid,
             absent,
             hidden,
@@ -260,23 +281,29 @@ impl<'a> Workflow<'a> {
     /// Finish the run: capture its output into the index, restore the working tree, apply the
     /// changes to it, and drop the backup stash.
     pub fn finish(&mut self) -> Result<(), Error> {
-        let merge_bases = update_index(
-            self.repo,
-            self.workdir,
-            &self.scope,
-            &self.dirty,
-            &mut self.filter,
-            &self.filter_index,
-        )?;
-        self.restore(false)?;
-        apply_merges(
-            self.repo,
-            self.workdir,
-            self.quiet,
-            &merge_bases,
-            &mut self.filter,
-        )?;
-        self.cleanup()
+        let phase = self
+            .reporter
+            .add("Restoring working tree")
+            .status(report::Status::Running);
+        let result = (|| {
+            let merge_bases = update_index(
+                self.repo,
+                self.workdir,
+                &self.scope,
+                &self.dirty,
+                &mut self.filter,
+                &self.filter_index,
+            )?;
+            self.restore(false)?;
+            apply_merges(
+                self.repo,
+                self.workdir,
+                &phase,
+                &merge_bases,
+                &mut self.filter,
+            )
+        })();
+        self.settle(&phase, result)
     }
 
     /// Restore the working tree and revert side-effects on clean tracked files.
@@ -321,12 +348,48 @@ impl<'a> Workflow<'a> {
         Ok(())
     }
 
-    /// Drop the backup stash now that the run has succeeded.
-    fn cleanup(&self) -> Result<(), Error> {
-        if let Some(oid) = self.oid {
-            drop_stash(self.repo, oid)?;
-        }
-        Ok(())
+    /// End a phase: drop the backup stash on success, or explain the failure and how to recover.
+    fn settle(&self, phase: &Reporter, result: Result<(), Error>) -> Result<(), Error> {
+        let result = match (result, self.oid) {
+            (Ok(()), Some(oid)) => {
+                if let Err(e) = drop_stash(self.repo, oid) {
+                    let hash = oid.attach(self.repo).shorten_or_id();
+                    phase
+                        .add("Could not drop backup stash")
+                        .output(format!(
+                            "{:#}\n\nFind {hash} in `git stash list` and drop that entry.\n",
+                            anyhow::Error::new(e)
+                        ))
+                        .status(report::Status::Warn);
+                }
+                Ok(())
+            }
+            // Restoring may have left the tree part-way, so the stash stays as the way back.
+            (Err(e), oid) if self.attempted => {
+                phase.output(format!("Error: {:#}\n", anyhow::Error::new(e)));
+                if let Some(oid) = oid {
+                    let hash = oid.attach(self.repo).shorten_or_id();
+                    // Without HEAD the backup has no index parent, so git rejects it as a stash.
+                    phase.output(if self.repo.head_commit().is_ok() {
+                        format!(
+                            "\nYour changes are safe; recover them with `git stash apply --index {hash}`\n"
+                        )
+                    } else {
+                        format!(
+                            "\nYour changes are safe in commit {hash}; recover them with `git checkout {hash} -- :/`\n"
+                        )
+                    });
+                }
+                Err(Error::Restore)
+            }
+            (result, _) => result,
+        };
+        phase.status(if result.is_ok() {
+            report::Status::Done
+        } else {
+            report::Status::Failed
+        });
+        result
     }
 }
 
@@ -336,14 +399,12 @@ impl Drop for Workflow<'_> {
         if self.attempted {
             return;
         }
-        if let Err(e) = self.restore(true) {
-            eprintln!("stagelint: warning: {:#}", anyhow::Error::new(e));
-        } else if let Err(e) = self.cleanup() {
-            eprintln!(
-                "stagelint: warning: failed to drop stash ref: {:#}",
-                anyhow::Error::new(e)
-            );
-        }
+        let phase = self
+            .reporter
+            .add("Reverting to stashed state")
+            .status(report::Status::Running);
+        let result = self.restore(true);
+        self.settle(&phase, result).ok();
     }
 }
 
@@ -438,7 +499,6 @@ fn create_stash_commit(
     missing: &BTreeSet<BString>,
     changes: &[gix::diff::index::Change],
     index: &gix::index::State,
-    quiet: bool,
 ) -> Result<ObjectId, Error> {
     let committer = repo
         .committer()
@@ -545,10 +605,6 @@ fn create_stash_commit(
             deref: false,
         })
         .map_err(Error::RefWrite)?;
-    } else if !quiet {
-        eprintln!(
-            "stagelint: warning: no initial commit: if this run is killed, recover your work with `git fsck --lost-found`"
-        );
     }
 
     Ok(commit_oid)
@@ -913,7 +969,7 @@ fn update_index(
 fn apply_merges(
     repo: &Repository,
     workdir: &Path,
-    quiet: bool,
+    phase: &Reporter,
     merge_bases: &[MergeBase],
     filter: &mut gix::filter::Pipeline<'_>,
 ) -> Result<(), Error> {
@@ -931,30 +987,33 @@ fn apply_merges(
         .map_err(Error::MergeResourceCache)?;
     let options = repo.blob_merge_options().map_err(Error::BlobMergeOptions)?;
     let context = repo.command_context().map_err(Error::CommandContext)?;
-
     let null = ObjectId::null(repo.object_hash());
+
+    let mut skipped_files = Vec::new();
+    let mut skipped_count = 0usize;
+    let mut skipped = |path: &BString, reason: &dyn std::fmt::Display| {
+        skipped_count += 1;
+        writeln!(skipped_files, "{path}: {reason}").ok();
+    };
+
     let mut out = Vec::new();
     for mb in merge_bases {
         let file_path = os_path(workdir, mb.path.as_ref())?;
         let meta = match file_path.symlink_metadata() {
             Ok(meta) => meta,
             Err(e) => {
-                warn_unapplied(quiet, mb.path.as_ref(), e);
+                skipped(&mb.path, &e);
                 continue;
             }
         };
         // Only merge regular files; anything else would read and write through symlinks.
         if !meta.is_file() {
-            warn_unapplied(quiet, mb.path.as_ref(), "not a regular file");
+            skipped(&mb.path, &"not a regular file");
             continue;
         }
 
         if meta.len() > threshold {
-            warn_unapplied(
-                quiet,
-                mb.path.as_ref(),
-                "file exceeds core.bigFileThreshold",
-            );
+            skipped(&mb.path, &"file exceeds core.bigFileThreshold");
             continue;
         }
 
@@ -984,20 +1043,12 @@ fn apply_merges(
         let (pick, resolution) = match prepared.merge(&mut out, Labels::default(), &context) {
             Ok(result) => result,
             Err(e) => {
-                warn_unapplied(
-                    quiet,
-                    mb.path.as_ref(),
-                    format!("{:#}", anyhow::Error::new(e)),
-                );
+                skipped(&mb.path, &format_args!("{:#}", anyhow::Error::new(e)));
                 continue;
             }
         };
         if resolution != Resolution::Complete {
-            warn_unapplied(
-                quiet,
-                mb.path.as_ref(),
-                "they conflict with unstaged changes",
-            );
+            skipped(&mb.path, &"conflicts with unstaged edits");
             continue;
         }
         // Ours means the worktree file already holds the result.
@@ -1008,7 +1059,7 @@ fn apply_merges(
             Ok(Some(bytes)) => bytes,
             Ok(None) => out.as_slice(),
             Err(()) => {
-                warn_unapplied(quiet, mb.path.as_ref(), "merge result unavailable");
+                skipped(&mb.path, &"merge result unavailable");
                 continue;
             }
         };
@@ -1016,14 +1067,17 @@ fn apply_merges(
         write_merged(filter, merged, rela, &file_path)?;
     }
 
-    Ok(())
-}
-
-/// Warn that a merge base was skipped: staged content is updated, the working tree is not.
-fn warn_unapplied(quiet: bool, path: &BStr, reason: impl std::fmt::Display) {
-    if !quiet {
-        eprintln!("stagelint: warning: could not apply changes to {path}: {reason}");
+    if skipped_count > 0 {
+        phase
+            .add("Changes staged but not applied to the working tree")
+            .note(format!(
+                "{skipped_count} file{}",
+                if skipped_count == 1 { "" } else { "s" }
+            ))
+            .output(skipped_files)
+            .status(report::Status::Warn);
     }
+    Ok(())
 }
 
 /// Convert a merge result from git form back to worktree form and write it.

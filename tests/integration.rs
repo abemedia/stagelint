@@ -1097,14 +1097,14 @@ fn survives_mid_run_stash_ref_drop() {
         "*.txt": [UPPERCASE, {"command": "git stash drop", "pass_filenames": false}]
     }));
 
-    repo.write_file("hello.txt", "hello\n");
+    repo.write_file("hello.txt", "hello\nWORLD\n");
     repo.git(&["add", "hello.txt"]);
-    repo.write_file("hello.txt", "hello\ngoodbye\n");
+    repo.write_file("hello.txt", "hello\nWORLD\ngoodbye\n");
 
     assert_success(repo.stagelint(&[]));
 
-    assert_eq!(repo.git(&["show", ":hello.txt"]), "HELLO\n");
-    assert_eq!(repo.read_file("hello.txt"), "HELLO\ngoodbye\n");
+    assert_eq!(repo.git(&["show", ":hello.txt"]), "HELLO\nWORLD\n");
+    assert_eq!(repo.read_file("hello.txt"), "HELLO\nWORLD\ngoodbye\n");
 }
 
 /// Closed output must not abort cleanup: the stash is dropped and the unstaged change survives.
@@ -1173,15 +1173,15 @@ fn stash_round_trip_tracks_executable_bit() {
 fn partial_stage_linter_modifies() {
     let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
 
-    repo.write_file("file.txt", "hello\n");
+    repo.write_file("file.txt", "hello\nWORLD\n");
     repo.git(&["add", "file.txt"]);
-    repo.write_file("file.txt", "hello\nextra line\n");
+    repo.write_file("file.txt", "hello\nWORLD\nextra line\n");
 
     assert_success(repo.stagelint(&[]));
 
-    assert_eq!(repo.git(&["show", ":file.txt"]), "HELLO\n");
+    assert_eq!(repo.git(&["show", ":file.txt"]), "HELLO\nWORLD\n");
 
-    assert_eq!(repo.read_file("file.txt"), "HELLO\nextra line\n");
+    assert_eq!(repo.read_file("file.txt"), "HELLO\nWORLD\nextra line\n");
 }
 
 /// Partially staged file: linter modifies then fails; state is still fully restored.

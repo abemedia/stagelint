@@ -125,6 +125,12 @@ By default the first failing command stops the run and cancels the rest. This ru
 completion and reports all failures together. The commit is still blocked, and the working tree is
 still restored.
 
+### `--diff <REVSPEC>`
+
+Runs commands against the files changed in a revision range instead of the staged files. For
+example, `main...HEAD` for everything since your branch diverged, or `HEAD~3` for the last three
+commits.
+
 ### `--stash <partial|tracked|untracked>`
 
 Controls how much of your working tree is hidden while commands run, so they see the content being

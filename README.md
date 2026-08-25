@@ -40,19 +40,67 @@ Add the hook to your `prepare` script so it installs itself for the whole team:
 }
 ```
 
-`prepare` runs after `npm install`, so nobody has to remember a setup step. `stagelint init` is
-idempotent, and does nothing outside a git repository.
+### Python
 
-### Everything else
+Install it globally:
 
-Download a binary from [Releases](https://github.com/abemedia/stagelint/releases), or install from
-crates.io:
+```sh
+uv tool install stagelint
+```
+
+```sh
+pipx install stagelint
+```
+
+```sh
+python -m pip install --user stagelint
+```
+
+Or add it to your project:
+
+```sh
+uv add --dev stagelint
+```
+
+### Rust
+
+Download a prebuilt binary using `cargo-binstall`:
+
+```sh
+cargo binstall stagelint
+```
+
+Or compile it from source:
 
 ```sh
 cargo install stagelint
 ```
 
-Then install the git pre-commit hook:
+### Homebrew
+
+```sh
+brew install abemedia/tap/stagelint
+```
+
+### WinGet
+
+```sh
+winget install abemedia.stagelint
+```
+
+### Scoop
+
+```sh
+scoop bucket add abemedia https://github.com/abemedia/scoop-bucket
+scoop install stagelint
+```
+
+### Manual install
+
+Download a prebuilt binary or Linux package from the
+[release page](https://github.com/abemedia/stagelint/releases/latest).
+
+## Setting up the hook
 
 ```sh
 stagelint init
@@ -61,10 +109,8 @@ stagelint init
 This creates `.git/hooks/pre-commit` (or respects `core.hooksPath`). Use `--force` to overwrite an
 existing hook.
 
-## Using an existing hook manager
-
-If you use pre-commit, Lefthook, or husky, install stagelint as above, then call `stagelint` from
-your existing hook configuration instead of running `stagelint init`.
+If you already use a hook manager like pre-commit, Lefthook, or husky, call `stagelint` from your
+existing hook configuration instead.
 
 ## Configuration
 
@@ -118,7 +164,7 @@ still restored.
 
 Runs commands against the files changed in a revision range instead of the staged files. For
 example, `main...HEAD` for everything since your branch diverged, or `HEAD~3` for the last three
-commits.
+commits. The commands' changes are staged, as in a normal run.
 
 ### `--stash <partial|tracked|untracked>`
 
@@ -126,7 +172,7 @@ Controls how much of your working tree is hidden while commands run, so they see
 committed rather than your work in progress. Each scope includes the previous, and ignored files are
 never touched.
 
-- `partial` (default) - Only stash unstaged edits to partially staged files
+- `partial` (default) - Only stash unstaged edits to partially staged files.
 - `tracked` - Also stash every other dirty tracked file.
 - `untracked` - Also stash untracked files.
 
@@ -163,7 +209,7 @@ left exactly as staged. No command sees them, and nothing on disk is staged in t
 ## Benchmarks
 
 Each cell is `fully staged / partially staged`, measured on a 1,000-file repository with a no-op
-task so the figures show tool overhead rather than formatter runtime.
+task, on a 2019 MacBook Pro (Intel Core i9-9880H).
 
 | Staged files | stagelint   | Lefthook      | nano-staged   | lint-staged   |
 | ------------ | ----------- | ------------- | ------------- | ------------- |

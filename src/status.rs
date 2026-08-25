@@ -69,7 +69,7 @@ pub fn collect(
 
     let mut changes = Vec::new();
     let mut scope = match diff {
-        Some(spec) => diff_scope(repo, spec)?,
+        Some(spec) => diff_scope(repo, spec, &index)?,
         None => BTreeSet::new(),
     };
     let mut dirty = BTreeSet::new();
@@ -149,7 +149,11 @@ pub fn collect(
 }
 
 /// Regular files changed in `spec` that exist on disk, resolved as `git diff <spec>` would.
-fn diff_scope(repo: &gix::Repository, spec: &str) -> Result<BTreeSet<BString>, Error> {
+fn diff_scope(
+    repo: &gix::Repository,
+    spec: &str,
+    index: &gix::index::State,
+) -> Result<BTreeSet<BString>, Error> {
     let tree = |id: gix::ObjectId| {
         repo.find_object(id)
             .map_err(|e| Error::Revspec(spec.to_owned(), Box::new(e)))?
@@ -186,6 +190,9 @@ fn diff_scope(repo: &gix::Repository, spec: &str) -> Result<BTreeSet<BString>, E
         .for_each_to_obtain_tree(&to, |change| {
             if !matches!(change, gix::object::tree::diff::Change::Deletion { .. })
                 && change.entry_mode().is_blob()
+                && !index
+                    .entry_by_path(change.location())
+                    .is_some_and(|entry| entry.flags.contains(Flags::SKIP_WORKTREE))
                 && workdir
                     .join(gix::path::from_bstr(change.location()))
                     .is_file()

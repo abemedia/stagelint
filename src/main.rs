@@ -15,6 +15,11 @@ use tokio_util::sync::CancellationToken;
 use cli::{Cli, Commands, Opts, StashScope};
 use report::{Level, Reporter, Status};
 
+// musl's mallocng returns pages to the kernel eagerly; mimalloc keeps them, saving ~20%.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 

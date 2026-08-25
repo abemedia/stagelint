@@ -5,66 +5,65 @@ on:
     types: [published]
 
 jobs:
-  build:
-    name: Build (${{ matrix.target }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-24.04-arm
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-          - target: aarch64-pc-windows-msvc
-            os: windows-latest
-    runs-on: ${{ matrix.os }}
+  release:
+    name: Build and publish binaries
+    runs-on: macos-latest # zig can't link darwin without the macOS SDK
     permissions:
       contents: write
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
 
       - name: Cache build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Install musl-tools
-        uses: awalsh128/cache-apt-pkgs-action@v1
-        if: endsWith(matrix.target, '-musl')
-        with:
-          packages: musl-tools
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
 
-      - name: Build and upload to release
-        uses: taiki-e/upload-rust-binary-action@v1
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
         with:
-          bin: stagelint
-          target: ${{ matrix.target }}
-          build-tool: cargo
-          locked: true
-          include: LICENSE,README.md
+          tool: cargo-zigbuild
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4
+
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            stagelint
+            homebrew-tap
+            scoop-bucket
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: ~> v2
+          args: release
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          PERSONAL_ACCESS_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: npm-${{ matrix.target }}
+          name: binaries
           path: |
             target/*/release/stagelint
             target/*/release/stagelint.exe
           if-no-files-found: error
 
-  publish:
+  npm:
     name: Publish to npm
-    needs: build
+    needs: release
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -79,9 +78,8 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: npm-*
+          name: binaries
           path: target/
-          merge-multiple: true
 
       - name: Install cargo-npm
         uses: taiki-e/install-action@v2
@@ -98,3 +96,56 @@ jobs:
         run: |
           cargo npm generate --infer-targets
           cargo npm publish -- --access public --provenance
+
+  wheels:
+    name: Build wheels
+    runs-on: macos-latest # zig can't link darwin without the macOS SDK
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,x86_64-apple-darwin,aarch64-apple-darwin,x86_64-pc-windows-gnu,aarch64-pc-windows-gnullvm
+
+      - name: Cache build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+
+      - name: Install maturin
+        run: pipx install 'maturin[zig]'
+
+      - name: Build wheels
+        run: |
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            maturin build --release --locked --zig --target "$target" --compatibility manylinux_2_17 musllinux_1_2 --out wheels
+          done
+          for target in x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-gnu aarch64-pc-windows-gnullvm; do
+            maturin build --release --locked --zig --target "$target" --out wheels
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels
+          path: wheels/*.whl
+          if-no-files-found: error
+
+  pypi:
+    name: Publish to PyPI
+    needs: [release, wheels]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: wheels
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

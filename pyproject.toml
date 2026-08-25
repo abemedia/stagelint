@@ -1,0 +1,31 @@
+[project]
+name = "stagelint"
+description = "Run commands like linters and formatters on staged git files"
+readme = "README.md"
+requires-python = ">=3.6"
+license = "MIT"
+authors = [{ name = "Adam Bouqdib", email = "adam@abemedia.co.uk" }]
+keywords = ["format", "git", "hooks", "lint", "pre-commit", "staged"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Rust",
+  "Topic :: Software Development :: Quality Assurance",
+  "Topic :: Software Development :: Version Control :: Git",
+]
+dynamic = ["version"]
+
+[project.urls]
+Changelog = "https://github.com/abemedia/stagelint/blob/master/CHANGELOG.md"
+Homepage = "https://stagelint.dev"
+Issues = "https://github.com/abemedia/stagelint/issues"
+Repository = "https://github.com/abemedia/stagelint"
+
+[build-system]
+requires = ["maturin>=1.9.2,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+bindings = "bin"

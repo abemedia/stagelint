@@ -1,0 +1,124 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+report_sizes: true
+
+metadata:
+  mod_timestamp: '{{ .CommitTimestamp }}'
+
+builds:
+  - builder: rust
+    tool: cargo-zigbuild
+    targets:
+      - x86_64-unknown-linux-musl
+      - aarch64-unknown-linux-musl
+      - x86_64-apple-darwin
+      - aarch64-apple-darwin
+      - x86_64-pc-windows-gnu
+      - aarch64-pc-windows-gnullvm
+    flags:
+      - --release
+      - --locked
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  disable: true
+
+archives:
+  - name_template: '{{ .ProjectName }}-{{ .Version }}-{{ .Target }}'
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    builds_info:
+      group: root
+      owner: root
+      mtime: '{{ .CommitDate }}'
+    files:
+      - LICENSE
+      - README.md
+
+nfpms:
+  - file_name_template: '{{ .ConventionalFileName }}'
+    homepage: https://stagelint.dev
+    description: Run commands like linters and formatters on staged git files
+    maintainer: Adam Bouqdib <adam@abemedia.co.uk>
+    license: MIT
+    vendor: abemedia
+    section: devel
+    formats:
+      - apk
+      - deb
+      - rpm
+      - archlinux
+    mtime: '{{ .CommitDate }}'
+    contents:
+      - src: LICENSE
+        dst: /usr/share/doc/stagelint/copyright
+
+homebrew_casks:
+  - repository:
+      owner: abemedia
+      name: homebrew-tap
+    homepage: https://stagelint.dev
+    description: Run commands like linters and formatters on staged git files
+    license: MIT
+    url:
+      verified: github.com/abemedia/stagelint/
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/stagelint"]
+          end
+
+winget:
+  - publisher: abemedia
+    package_identifier: abemedia.stagelint
+    short_description: Run commands like linters and formatters on staged git files
+    license: MIT
+    homepage: https://stagelint.dev
+    publisher_url: https://github.com/abemedia
+    publisher_support_url: https://github.com/abemedia/stagelint/issues
+    release_notes_url: https://github.com/abemedia/stagelint/releases/tag/{{ .Tag }}
+    tags:
+      - git
+      - hooks
+      - pre-commit
+      - lint
+      - format
+      - linter
+      - formatter
+      - developer-tools
+    repository:
+      owner: abemedia
+      name: winget-pkgs
+      branch: stagelint-{{ .Version }}
+      token: '{{ .Env.PERSONAL_ACCESS_TOKEN }}'
+      pull_request:
+        enabled: true
+        base:
+          owner: microsoft
+          name: winget-pkgs
+          branch: master
+
+scoops:
+  - repository:
+      owner: abemedia
+      name: scoop-bucket
+    directory: bucket
+    homepage: https://stagelint.dev
+    description: Run commands like linters and formatters on staged git files
+    license: MIT
+
+signs:
+  - cmd: cosign
+    signature: ${artifact}.sigstore.json
+    output: '{{ not (isEnvSet "CI") }}'
+    artifacts: checksum
+    args:
+      - sign-blob
+      - --bundle=${signature}
+      - ${artifact}
+      - --yes

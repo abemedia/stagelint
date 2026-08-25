@@ -4,9 +4,10 @@ version = "0.1.2"
 edition = "2024"
 rust-version = "1.88"
 description = "Run commands like linters and formatters on staged git files"
+homepage = "https://stagelint.dev"
 repository = "https://github.com/abemedia/stagelint"
 license = "MIT"
-exclude = [".github/"]
+exclude = [".github/", ".goreleaser.yml", "bench/", "pyproject.toml"]
 
 [package.metadata.npm]
 name = "@stagelint/stagelint"

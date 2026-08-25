@@ -2,11 +2,14 @@
 
 Run commands like linters and formatters on staged git files.
 
-- **Safe.** Formatter output is three-way merged into partially staged files, so a conflicting
-  unstaged edit can never abort your commit.
+- **Safe.** Partially staged files are three-way merged, so a conflicting edit never aborts your
+  commit.
 - **Universal.** A single binary with no runtime - the same tool in Node, Python, Go, Rust or a
   polyglot monorepo.
-- **Fast.** Written in Rust, it is 5 to 25 times faster than Lefthook, nano-staged and lint-staged.
+- **Fast.** Written in Rust, it is [5 to 28 times faster](#benchmarks) than Lefthook, nano-staged
+  and lint-staged.
+
+![A pre-commit run: independent globs in parallel, overlapping ones in order](https://vhs.charm.sh/vhs-f7DSt1Dyw2ktDUI7fWabm.gif)
 
 ## Why stagelint?
 
@@ -18,20 +21,6 @@ back. Most tools give up and abort the commit or, worse, commit them along with 
 stagelint stashes the unstaged edits, runs your commands, then three-way merges the result. What you
 staged gets formatted, what you did not stays exactly where you left it, and the commit goes through
 either way.
-
-## Benchmarks
-
-Each cell is `fully staged / partially staged`, measured on a 1,000-file repository with a no-op
-task so the figures show tool overhead rather than formatter runtime.
-
-| Staged files | stagelint   | Lefthook      | nano-staged   | lint-staged   |
-| ------------ | ----------- | ------------- | ------------- | ------------- |
-| 10           | 18ms / 32ms | 162ms / 389ms | 235ms / 325ms | 450ms / 537ms |
-| 100          | 20ms / 77ms | 176ms / 535ms | 258ms / 430ms | 469ms / 683ms |
-
-Partial staging is the expensive path, and the only one where a tool has to hide your unstaged edits
-and restore them afterwards. On a commit where prettier takes two seconds this is noise; it matters
-on small commits and fast formatters, which is most of them. Reproduce with `bench/run.sh`.
 
 ## Getting started
 
@@ -159,19 +148,31 @@ commands have their output shown, so a passing run is just the task tree.
 1. Identifies staged files and detects partially-staged ones
 2. Creates a git stash (based on `--stash` scope) for crash recovery
 3. Overwrites stashed files with their clean index state
-4. Runs formatters on the real working tree with full project context
-5. Updates the git index for staged files modified by formatters
+4. Runs commands on the real working tree with full project context
+5. Updates the git index for staged files the commands modified
 6. Restores stashed files from the stash commit
-7. Three-way merges formatting changes into partially-staged files
+7. Three-way merges the commands' changes into partially-staged files
 8. Drops the stash ref
 
-If a linter fails, the working tree is fully restored and the commit is blocked. On crash (SIGKILL,
-power loss), the stash ref survives - recover with `git stash pop`.
+If a command fails, the working tree is restored and the commit is blocked. On crash (SIGKILL, power
+loss), the stash ref survives - recover with `git stash pop`.
 
-Paths marked `SKIP_WORKTREE` - set by `git sparse-checkout` or by
-`git update-index --skip-worktree` - have no working tree file to read, so they are skipped and left
-exactly as staged. Merges, rebases, and cherry-picks routinely stage such paths, so this is not
-reported.
+Paths marked `SKIP_WORKTREE` - by `git sparse-checkout` or `git update-index --skip-worktree` - are
+left exactly as staged. No command sees them, and nothing on disk is staged in their place.
+
+## Benchmarks
+
+Each cell is `fully staged / partially staged`, measured on a 1,000-file repository with a no-op
+task so the figures show tool overhead rather than formatter runtime.
+
+| Staged files | stagelint   | Lefthook      | nano-staged   | lint-staged   |
+| ------------ | ----------- | ------------- | ------------- | ------------- |
+| 10           | 16ms / 32ms | 160ms / 385ms | 236ms / 323ms | 450ms / 543ms |
+| 100          | 20ms / 76ms | 169ms / 538ms | 258ms / 430ms | 474ms / 696ms |
+
+Partial staging is the expensive path, and the only one where a tool has to hide your unstaged edits
+and restore them afterwards. On a commit where prettier takes two seconds this is noise; it matters
+on small commits and fast formatters, which is most of them. Reproduce with `bench/run.sh`.
 
 ## Thanks
 

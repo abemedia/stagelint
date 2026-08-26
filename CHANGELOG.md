@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/abemedia/stagelint/compare/v0.1.2...v0.1.3) - 2026-08-26
+
+### Fixed
+
+- exclude skip-worktree paths from --diff scope ([#39](https://github.com/abemedia/stagelint/pull/39))
+
+### Other
+
+- synchronise the exiting-task race with fifos ([#44](https://github.com/abemedia/stagelint/pull/44))
+- *(deps)* bump yaml_serde from 0.10.6 to 0.10.7 ([#43](https://github.com/abemedia/stagelint/pull/43))
+- use mimalloc as the global allocator on musl builds ([#41](https://github.com/abemedia/stagelint/pull/41))
+- release with GoReleaser and maturin ([#40](https://github.com/abemedia/stagelint/pull/40))
+- *(readme)* add demo gif, move and re-run benchmarks, tidy copy ([#35](https://github.com/abemedia/stagelint/pull/35))
+
 ## [0.1.2](https://github.com/abemedia/stagelint/compare/v0.1.1...v0.1.2) - 2026-08-24
 
 ### Added

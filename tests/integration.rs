@@ -2029,10 +2029,10 @@ fn concurrent_failure_cancels_running_tasks() {
 #[cfg(unix)]
 #[test]
 fn exiting_task_is_not_reported_as_cancelled() {
-    // Each task signals readiness then waits for the other, so both failures are in flight at once.
+    // Both tasks block until released together, so their failures are in flight at once.
     let repo = TestRepo::new(&json!({
-        "*.md": "sh -c 'echo MD-ERROR; touch .git/linter-1; while [ ! -f .git/linter-2 ] && [ -d .git ]; do :; done; exit 1'",
-        "*.rs": "sh -c 'echo RS-ERROR; touch .git/linter-2; while [ ! -f .git/linter-1 ] && [ -d .git ]; do :; done; exit 1'",
+        "*.md": "sh -c 'echo MD-ERROR; read x < .git/gate-1; exit 1'",
+        "*.rs": "sh -c 'echo RS-ERROR; read x < .git/gate-2; exit 1'",
     }));
 
     repo.write_file("file.md", "hello\n");
@@ -2040,8 +2040,27 @@ fn exiting_task_is_not_reported_as_cancelled() {
     repo.write_file("file.rs", "hello\n");
     repo.git(&["add", "file.rs"]);
 
-    let output = assert_failure(repo.stagelint(&["--concurrent", "2"]));
+    let gates = [repo.root.join(".git/gate-1"), repo.root.join(".git/gate-2")];
+    let status = Command::new("mkfifo")
+        .args(&gates)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success(), "mkfifo failed");
 
+    let child = repo.stagelint(&["--concurrent", "2"]);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let writers: std::io::Result<Vec<_>> = gates.iter().map(fs::File::create).collect();
+        tx.send(writers).ok();
+    });
+    let writers = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("tasks never opened their gates")
+        .expect("open gates");
+    drop(writers); // EOF releases both tasks
+
+    let output = assert_failure(child);
     let stderr = String::from_utf8_lossy(&output.stderr);
     for block in [
         "\nMD-ERROR\nexit status: 1\n",

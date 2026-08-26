@@ -6,8 +6,8 @@ Run commands like linters and formatters on staged git files.
   commit.
 - **Universal.** A single binary with no runtime - the same tool in Node, Python, Go, Rust or a
   polyglot monorepo.
-- **Fast.** Written in Rust, it is [5 to 28 times faster](#benchmarks) than Lefthook, nano-staged
-  and lint-staged.
+- **Fast.** Written in Rust, it is [5 to 30 times faster](#benchmarks) than pre-commit, lint-staged,
+  Lefthook and nano-staged.
 
 ![A pre-commit run: independent globs in parallel, overlapping ones in order](https://vhs.charm.sh/vhs-f7DSt1Dyw2ktDUI7fWabm.gif)
 
@@ -211,10 +211,10 @@ left exactly as staged. No command sees them, and nothing on disk is staged in t
 Each cell is `fully staged / partially staged`, measured on a 1,000-file repository with a no-op
 task, on a 2019 MacBook Pro (Intel Core i9-9880H).
 
-| Staged files | stagelint   | Lefthook      | nano-staged   | lint-staged   |
-| ------------ | ----------- | ------------- | ------------- | ------------- |
-| 10           | 16ms / 32ms | 160ms / 385ms | 236ms / 323ms | 450ms / 543ms |
-| 100          | 20ms / 76ms | 169ms / 538ms | 258ms / 430ms | 474ms / 696ms |
+| Staged files | stagelint   | Lefthook      | nano-staged   | lint-staged   | pre-commit    |
+| ------------ | ----------- | ------------- | ------------- | ------------- | ------------- |
+| 10           | 15ms / 30ms | 152ms / 373ms | 224ms / 311ms | 437ms / 530ms | 450ms / 525ms |
+| 100          | 19ms / 76ms | 163ms / 537ms | 249ms / 425ms | 455ms / 672ms | 486ms / 612ms |
 
 Partial staging is the expensive path, and the only one where a tool has to hide your unstaged edits
 and restore them afterwards. On a commit where prettier takes two seconds this is noise; it matters

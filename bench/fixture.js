@@ -16,6 +16,14 @@ const LEFTHOOK = {
     jobs: [{ name: 'task', glob: '*.txt', stage_fixed: true, run: `true {staged_files}` }],
   },
 }
+const PRE_COMMIT = {
+  repos: [
+    {
+      repo: 'local',
+      hooks: [{ id: 'task', name: 'task', language: 'system', entry: 'true', files: '\\.txt$' }],
+    },
+  ],
+}
 
 const git = (dir, ...args) =>
   execFileSync('git', args, {
@@ -40,6 +48,7 @@ function build(dir, repoFiles, staged, mode) {
   fs.writeFileSync(path.join(dir, '.lintstagedrc.json'), JSON.stringify(TASK))
   fs.writeFileSync(path.join(dir, '.nano-staged.json'), JSON.stringify(TASK))
   fs.writeFileSync(path.join(dir, 'lefthook.json'), JSON.stringify(LEFTHOOK))
+  fs.writeFileSync(path.join(dir, '.pre-commit-config.yaml'), JSON.stringify(PRE_COMMIT))
 
   for (let i = 0; i < repoFiles; i++) {
     fs.writeFileSync(path.join(dir, name(i)), `committed ${i}\n`)
@@ -74,7 +83,7 @@ function stage(dir, staged, mode) {
     git(dir, 'add', '--', ...files)
   }
 
-  // Partial staging is the case all three tools must hide and restore around the run.
+  // Partial staging is the case every tool must hide and restore around the run.
   if (mode === 'partial') {
     for (let i = 0; i < staged; i++) {
       fs.writeFileSync(path.join(dir, name(i)), `staged ${i} ${nonce}\nunstaged ${i} ${nonce}\n`)

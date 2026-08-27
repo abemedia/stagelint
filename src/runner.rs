@@ -327,6 +327,7 @@ mod tests {
             indicatif::ProgressDrawTarget::hidden(),
             Box::new(Buf(buf.clone())),
             None,
+            None,
         );
         (root, buf)
     }

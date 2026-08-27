@@ -1,4 +1,4 @@
-# stagelint
+# stagelint <img src="logo.svg" align="left" width="40" alt="">
 
 Run commands like linters and formatters on staged git files.
 
@@ -42,7 +42,13 @@ Add the hook to your `prepare` script so it installs itself for the whole team:
 
 ### Python
 
-Install it globally:
+Add it to your project:
+
+```sh
+uv add --dev stagelint
+```
+
+Or install it globally:
 
 ```sh
 uv tool install stagelint
@@ -54,12 +60,6 @@ pipx install stagelint
 
 ```sh
 python -m pip install --user stagelint
-```
-
-Or add it to your project:
-
-```sh
-uv add --dev stagelint
 ```
 
 ### Rust
@@ -93,6 +93,12 @@ winget install abemedia.stagelint
 ```sh
 scoop bucket add abemedia https://github.com/abemedia/scoop-bucket
 scoop install stagelint
+```
+
+### mise
+
+```sh
+mise use aqua:abemedia/stagelint
 ```
 
 ### Manual install

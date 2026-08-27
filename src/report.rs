@@ -1,12 +1,12 @@
 //! A nested task logger: one handle per row, any depth, drawn as a live tree when stderr is a
 //! terminal and as a log of status changes otherwise. Callers add rows and set their status.
 
-use std::io::{self, Write};
+use std::io::Write;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use console::{StyledObject, style};
+use console::{StyledObject, Term, style};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 struct Glyphs {
@@ -125,6 +125,8 @@ struct Shared {
     state: Arc<Mutex<State>>,
     /// The redraw thread; `None` when not drawing a tree.
     ticker: Option<(mpsc::Sender<()>, thread::JoinHandle<()>)>,
+    /// Parked while a tree owns the screen, restored on drop; `None` when no tree is drawn.
+    cursor: Option<Term>,
 }
 
 struct State {
@@ -163,21 +165,25 @@ struct Row {
 impl Reporter {
     /// The root handle, drawing to stderr.
     pub fn new(level: Level) -> Reporter {
+        let term = Term::buffered_stderr();
+        let target = ProgressDrawTarget::term(term.clone(), 20);
         Reporter::custom(
             level,
-            ProgressDrawTarget::stderr(),
-            Box::new(io::stderr()),
+            target,
+            Box::new(term.clone()),
             Some(TICK_RATE),
+            Some(term),
         )
     }
 
-    /// A reporter drawing to `target`, or printing to `plain` when it is hidden or `Quiet`.
-    /// Without a `tick` interval nothing advances the spinners; call `tick` instead.
-    pub fn custom(
+    /// The general form: any draw target, any writer for the plain lines and held output. Without a
+    /// `tick` interval nothing advances the spinners; call `tick`.
+    pub(crate) fn custom(
         level: Level,
         target: ProgressDrawTarget,
         plain: Box<dyn Write + Send>,
         tick: Option<Duration>,
+        cursor: Option<Term>,
     ) -> Reporter {
         let progress = MultiProgress::with_draw_target(target);
         let terminal = !progress.is_hidden();
@@ -208,8 +214,16 @@ impl Reporter {
             });
             (tx, handle)
         });
+        let cursor = cursor.filter(|_| tree);
+        if let Some(term) = &cursor {
+            term.hide_cursor().and_then(|()| term.flush()).ok();
+        }
         Reporter {
-            shared: Arc::new(Shared { state, ticker }),
+            shared: Arc::new(Shared {
+                state,
+                ticker,
+                cursor,
+            }),
             id: ROOT,
         }
     }
@@ -287,6 +301,10 @@ impl Drop for Shared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .finish();
+        // `indicatif` parks the cursor mid-row; buffered terminals need the flush to land it.
+        if let Some(term) = &self.cursor {
+            term.show_cursor().and_then(|()| term.flush()).ok();
+        }
     }
 }
 
@@ -597,6 +615,7 @@ fn running_style() -> ProgressStyle {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::sync::{Arc, Mutex};
 
     use indicatif::{InMemoryTerm, ProgressDrawTarget};
@@ -631,6 +650,7 @@ mod tests {
             ProgressDrawTarget::hidden(),
             Box::new(buf.clone()),
             None,
+            None,
         );
         (root, buf)
     }
@@ -641,7 +661,7 @@ mod tests {
         let term = InMemoryTerm::new(20, 60);
         let target = ProgressDrawTarget::term_like(Box::new(term.clone()));
         let buf = Buf::default();
-        let root = Reporter::custom(level, target, Box::new(buf.clone()), None);
+        let root = Reporter::custom(level, target, Box::new(buf.clone()), None, None);
         (root, term, buf)
     }
 
@@ -737,7 +757,7 @@ mod tests {
         let buf = Buf::default();
         let term = InMemoryTerm::new(20, 60);
         let target = ProgressDrawTarget::term_like(Box::new(term.clone()));
-        let root = Reporter::custom(Level::Quiet, target, Box::new(buf.clone()), None);
+        let root = Reporter::custom(Level::Quiet, target, Box::new(buf.clone()), None, None);
         let cmd = root
             .add("cfg")
             .add("*.md")

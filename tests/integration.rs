@@ -8,12 +8,15 @@ use std::time::Duration;
 
 // Core
 
-/// Stagelint succeeds immediately when there are no staged files to process.
+/// An empty scope is a success, whatever the source selects.
 #[test]
-fn no_staged_files_succeeds() {
+fn empty_scope_succeeds() {
     let repo = TestRepo::new(&json!({"*.txt": "false"}));
 
     assert_success(repo.stagelint(&[]));
+    assert_success(repo.stagelint(&["--unstaged"]));
+    assert_success(repo.stagelint(&["--files", "gone.txt"]));
+    assert_success(repo.stagelint(&["--diff", "HEAD...HEAD"]));
 }
 
 /// The linter's output is committed to the index and working tree.
@@ -2090,7 +2093,7 @@ fn verbose_shows_passing_output() {
     );
 }
 
-// Diff
+// Sources
 
 /// A revspec that is not a diff range is rejected.
 #[test]
@@ -2208,6 +2211,156 @@ fn diff_stages_unstaged_edits_in_range() {
 
     assert_eq!(repo.git(&["show", ":file.txt"]), "COMMITTED\nUNSTAGED\n");
     assert_eq!(repo.read_file("file.txt"), "COMMITTED\nUNSTAGED\n");
+}
+
+/// Modified, untracked and partially staged files are linted; a staged file matching the index and
+/// an ignored file are not. The index is left as it was.
+#[test]
+fn unstaged_lints_worktree_changes_without_staging() {
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+
+    repo.write_file(".gitignore", "ignored.txt\n");
+    repo.write_file("modified.txt", "modified\n");
+    repo.write_file("partial.txt", "partial\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "base"]);
+
+    repo.write_file("modified.txt", "modified again\n");
+    repo.write_file("partial.txt", "partial\nstaged\n");
+    repo.git(&["add", "partial.txt"]);
+    repo.write_file("partial.txt", "partial\nstaged\nworking\n");
+    repo.write_file("staged.txt", "staged\n");
+    repo.git(&["add", "staged.txt"]);
+    repo.write_file("untracked.txt", "untracked\n");
+    repo.write_file("ignored.txt", "ignored\n");
+
+    assert_success(repo.stagelint(&["--unstaged"]));
+
+    assert_eq!(repo.read_file("modified.txt"), "MODIFIED AGAIN\n");
+    assert_eq!(repo.read_file("untracked.txt"), "UNTRACKED\n");
+    assert_eq!(repo.read_file("partial.txt"), "PARTIAL\nSTAGED\nWORKING\n");
+    assert_eq!(repo.read_file("staged.txt"), "staged\n");
+    assert_eq!(repo.read_file("ignored.txt"), "ignored\n");
+
+    assert_eq!(repo.git(&["show", ":partial.txt"]), "partial\nstaged\n");
+    assert_eq!(
+        repo.git(&["diff", "--cached", "--name-only"]),
+        "partial.txt\nstaged.txt\n"
+    );
+    assert_eq!(
+        repo.git(&["status", "--porcelain", "untracked.txt"]),
+        "?? untracked.txt\n"
+    );
+}
+
+/// A path in the range with no index entry is skipped: nothing could stage or restore it.
+#[test]
+fn diff_skips_path_missing_from_index() {
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+
+    repo.write_file("a.txt", "one\n");
+    repo.git(&["add", "a.txt"]);
+    repo.git(&["commit", "-m", "base"]);
+    repo.write_file("a.txt", "two\n");
+    repo.git(&["add", "a.txt"]);
+    repo.git(&["commit", "-m", "change"]);
+    repo.git(&["rm", "--cached", "a.txt"]);
+
+    assert_success(repo.stagelint(&["--diff", "HEAD~1..HEAD"]));
+
+    assert_eq!(repo.read_file("a.txt"), "two\n");
+}
+
+/// A file in the range replaced by a symlink is skipped, so a command cannot write through it.
+#[test]
+fn diff_skips_path_replaced_by_symlink() {
+    if !file_symlinks_supported() {
+        return;
+    }
+
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+    repo.git(&["config", "core.symlinks", "true"]);
+
+    // The target does not match the glob, so only a follow-through could change it.
+    repo.write_file("target.md", "secret\n");
+    repo.write_file("a.txt", "one\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-m", "base"]);
+    repo.write_file("a.txt", "two\n");
+    repo.git(&["add", "a.txt"]);
+    repo.git(&["commit", "-m", "change"]);
+
+    fs::remove_file(repo.root.join("a.txt")).expect("remove a.txt");
+    symlink_file("target.md", &repo.root.join("a.txt")).expect("symlink a.txt -> target.md");
+
+    assert_success(repo.stagelint(&["--diff", "HEAD~1..HEAD"]));
+
+    assert_eq!(repo.read_file("target.md"), "secret\n");
+}
+
+/// A type change is judged by the worktree, not the index: a file replaced by a symlink is
+/// skipped so a command cannot write through it, a symlink replaced by a file is linted.
+#[test]
+fn unstaged_follows_worktree_after_type_change() {
+    if !file_symlinks_supported() {
+        return;
+    }
+
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+    repo.git(&["config", "core.symlinks", "true"]);
+
+    // The target does not match the glob, so only a follow-through could change it.
+    repo.write_file("target.md", "secret\n");
+    repo.write_file("now_link.txt", "original\n");
+    symlink_file("target.md", &repo.root.join("now_file.txt")).expect("symlink now_file.txt");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-m", "base"]);
+
+    fs::remove_file(repo.root.join("now_link.txt")).expect("remove now_link.txt");
+    symlink_file("target.md", &repo.root.join("now_link.txt")).expect("symlink now_link.txt");
+    fs::remove_file(repo.root.join("now_file.txt")).expect("remove now_file.txt");
+    repo.write_file("now_file.txt", "real\n");
+
+    assert_success(repo.stagelint(&["--unstaged"]));
+
+    assert_eq!(repo.read_file("target.md"), "secret\n");
+    assert_eq!(repo.read_file("now_file.txt"), "REAL\n");
+}
+
+/// Only named paths are linted, absolute or relative; missing paths and directories are skipped,
+/// and nothing is staged.
+#[test]
+fn files_lints_given_paths() {
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+
+    repo.write_file("top.txt", "top\n");
+    repo.write_file("sub/nested.txt", "nested\n");
+    repo.write_file("sub/other.txt", "other\n");
+    repo.write_file("sub/deeper/deep.txt", "deep\n");
+
+    let mut cmd = repo.stagelint_cmd();
+    let output = cmd
+        .args([
+            "--files",
+            repo.root.join("top.txt").to_str().expect("utf8 path"),
+            "nested.txt",
+            "deeper",
+            "gone.txt",
+        ])
+        .current_dir(repo.root.join("sub"))
+        .output()
+        .expect("run stagelint");
+    assert!(
+        output.status.success(),
+        "stagelint failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(repo.read_file("top.txt"), "TOP\n");
+    assert_eq!(repo.read_file("sub/nested.txt"), "NESTED\n");
+    assert_eq!(repo.read_file("sub/other.txt"), "other\n");
+    assert_eq!(repo.read_file("sub/deeper/deep.txt"), "deep\n");
+    assert_eq!(repo.git(&["diff", "--cached", "--name-only"]), "");
 }
 
 // Config

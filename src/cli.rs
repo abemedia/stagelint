@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
@@ -22,6 +24,7 @@ pub enum Commands {
 
 /// Run commands like linters and formatters on staged git files.
 #[derive(Args)]
+#[expect(clippy::struct_excessive_bools, reason = "one field per CLI flag")]
 pub struct Opts {
     /// Run all tasks to completion even if one fails, then report all errors together.
     #[arg(long)]
@@ -36,11 +39,26 @@ pub struct Opts {
     /// Takes any range `git diff` does - `main...HEAD` for everything on the branch since it
     /// diverged, or a single revision such as `HEAD~3` to compare against HEAD. Results are staged,
     /// as in the default mode.
-    #[arg(long, value_name = "REVSPEC")]
+    #[arg(long, value_name = "REVSPEC", group = "source")]
     pub diff: Option<String>,
 
+    /// Lint the files modified in the working tree, including untracked ones.
+    ///
+    /// Nothing is stashed and nothing is staged: the commands see the working tree as it is, and
+    /// their changes are left there.
+    #[arg(long, group = "source")]
+    pub unstaged: bool,
+
+    /// Lint the given paths instead of the staged files.
+    ///
+    /// A path is skipped rather than failing the run if it does not exist, is a directory or a
+    /// symlink, or lies outside the repository. Ignored files are linted like any other. Nothing
+    /// is stashed and nothing is staged, as with `--unstaged`.
+    #[arg(long, value_name = "PATHS", num_args = 1.., group = "source")]
+    pub files: Vec<PathBuf>,
+
     /// Control stash scope; each value includes the previous.
-    #[arg(long, value_enum, default_value_t)]
+    #[arg(long, value_enum, default_value_t, conflicts_with_all = ["unstaged", "files"])]
     pub stash: StashScope,
 
     /// Print only the output of failed commands and errors.
@@ -85,6 +103,22 @@ mod tests {
         assert!(Cli::try_parse_from(["stagelint", "--quiet", "init"]).is_err());
         assert!(Cli::try_parse_from(["stagelint", "--concurrent", "false", "init"]).is_err());
         assert!(Cli::try_parse_from(["stagelint", "init", "--force"]).is_ok());
+    }
+
+    #[test]
+    fn sources_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from(["stagelint", "--diff", "HEAD~1", "--unstaged"]).is_err());
+        assert!(Cli::try_parse_from(["stagelint", "--diff", "HEAD~1", "--files", "a"]).is_err());
+        assert!(Cli::try_parse_from(["stagelint", "--unstaged", "--files", "a"]).is_err());
+        assert!(Cli::try_parse_from(["stagelint", "--unstaged"]).is_ok());
+    }
+
+    /// Nothing is stashed for the sources that stage nothing, so asking is a mistake.
+    #[test]
+    fn stash_rejects_sources_that_stage_nothing() {
+        assert!(Cli::try_parse_from(["stagelint", "--unstaged", "--stash", "tracked"]).is_err());
+        assert!(Cli::try_parse_from(["stagelint", "--files", "a", "--stash", "tracked"]).is_err());
+        assert!(Cli::try_parse_from(["stagelint", "--stash", "tracked"]).is_ok());
     }
 
     #[test]

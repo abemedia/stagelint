@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use cli::{Cli, Commands, Opts, StashScope};
 use report::{Level, Reporter, Status};
+use status::Source;
 
 // musl's mallocng returns pages to the kernel eagerly; mimalloc keeps them, saving ~20%.
 #[cfg(target_env = "musl")]
@@ -62,15 +63,25 @@ fn run(opts: &Opts, root: &Reporter) -> Result<()> {
 
     let stash_tracked = matches!(opts.stash, StashScope::Tracked | StashScope::Untracked);
     let stash_untracked = matches!(opts.stash, StashScope::Untracked);
-    let scope = if opts.diff.is_some() {
-        "changed"
+    let source = if let Some(spec) = opts.diff.as_deref() {
+        Source::Diff(spec)
+    } else if opts.unstaged {
+        Source::Unstaged
+    } else if !opts.files.is_empty() {
+        Source::Files(&opts.files)
     } else {
-        "staged"
+        Source::Staged
+    };
+    let noun = match source {
+        Source::Staged => "staged",
+        Source::Diff(_) => "changed",
+        Source::Unstaged => "unstaged",
+        Source::Files(_) => "given",
     };
 
-    let status = status::collect(&repo, stash_untracked, opts.diff.as_deref())?;
+    let status = status::collect(&repo, stash_untracked, source)?;
     if status.scope.is_empty() {
-        root.add(format!("Could not find any {scope} files"))
+        root.add(format!("Could not find any {noun} files"))
             .status(Status::Warn);
         return Ok(());
     }
@@ -87,23 +98,33 @@ fn run(opts: &Opts, root: &Reporter) -> Result<()> {
     let configs = config::resolve(paths, &workdir)?;
     if configs.is_empty() {
         root.add(format!(
-            "Could not find any {scope} files matching configured tasks"
+            "Could not find any {noun} files matching configured tasks"
         ))
         .status(Status::Warn);
         return Ok(());
     }
 
-    // Once we start stashing, Ctrl+C must not kill the process or it could result in data-loss.
+    // Cancelling rather than dying settles the tree, restores the cursor and protects the stash.
     let cancel = CancellationToken::new();
     ctrlc::set_handler({
         let c = cancel.clone();
         move || c.cancel()
     })?;
 
-    let mut workflow = workflow::Workflow::new(&repo, &workdir, status, stash_tracked, root)?;
+    let mut workflow = if source.stages_results() {
+        Some(workflow::Workflow::new(
+            &repo,
+            &workdir,
+            status,
+            stash_tracked,
+            root,
+        )?)
+    } else {
+        None
+    };
 
     let tasks = root
-        .add(format!("Running tasks for {scope} files"))
+        .add(format!("Running tasks for {noun} files"))
         .status(Status::Running);
     let result = runner::run(
         &tasks,
@@ -119,7 +140,9 @@ fn run(opts: &Opts, root: &Reporter) -> Result<()> {
     });
     result?;
 
-    workflow.finish()?;
+    if let Some(workflow) = &mut workflow {
+        workflow.finish()?;
+    }
 
     Ok(())
 }

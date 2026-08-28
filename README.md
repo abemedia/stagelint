@@ -172,11 +172,22 @@ Runs commands against the files changed in a revision range instead of the stage
 example, `main...HEAD` for everything since your branch diverged, or `HEAD~3` for the last three
 commits. The commands' changes are staged, as in a normal run.
 
+### `--unstaged`, `-u`
+
+Runs commands against the files modified in your working tree, including untracked ones, instead of
+the staged files. Nothing is hidden and nothing is staged: the commands see the working tree as it
+is and their changes are left there.
+
+### `--files <PATHS>...`
+
+Runs commands against the given paths instead of the staged files. A path that no longer exists is
+skipped rather than failing the run. Nothing is hidden and nothing is staged, as with `--unstaged`.
+
 ### `--stash <partial|tracked|untracked>`
 
 Controls how much of your working tree is hidden while commands run, so they see the content being
 committed rather than your work in progress. Each scope includes the previous, and ignored files are
-never touched.
+never touched. Rejected with `--unstaged` and `--files`, which hide nothing.
 
 - `partial` (default) - Only stash unstaged edits to partially staged files.
 - `tracked` - Also stash every other dirty tracked file.

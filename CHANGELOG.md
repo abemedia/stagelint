@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/abemedia/stagelint/compare/v0.1.3...v0.1.4) - 2026-08-28
+
+### Added
+
+- *(init)* support run flags ([#58](https://github.com/abemedia/stagelint/pull/58))
+- *(cli)* add short flags for --unstaged, --quiet and --verbose ([#55](https://github.com/abemedia/stagelint/pull/55))
+- *(cli)* add --unstaged and --files sources ([#50](https://github.com/abemedia/stagelint/pull/50))
+
+### Fixed
+
+- *(stash)* create a stash before the first commit ([#53](https://github.com/abemedia/stagelint/pull/53))
+- *(runner)* cancel commands that close their own output ([#52](https://github.com/abemedia/stagelint/pull/52))
+- *(report)* hide the cursor while the task tree is drawn ([#49](https://github.com/abemedia/stagelint/pull/49))
+
+### Other
+
+- add stagelint config and justfile ([#57](https://github.com/abemedia/stagelint/pull/57))
+- *(readme)* document coding agent hooks and negation patterns, remove WinGet install ([#56](https://github.com/abemedia/stagelint/pull/56))
+- *(readme)* document --unstaged and --files ([#51](https://github.com/abemedia/stagelint/pull/51))
+- retry the flaky exiting-task race ([#54](https://github.com/abemedia/stagelint/pull/54))
+- *(readme)* add logo and mise install ([#48](https://github.com/abemedia/stagelint/pull/48))
+- add pre-commit to the comparative benchmark ([#47](https://github.com/abemedia/stagelint/pull/47))
+- *(readme)* document new install channels, tweak copy ([#42](https://github.com/abemedia/stagelint/pull/42))
+
 ## [0.1.3](https://github.com/abemedia/stagelint/compare/v0.1.2...v0.1.3) - 2026-08-26
 
 ### Fixed

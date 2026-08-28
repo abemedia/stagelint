@@ -10,7 +10,7 @@ use crate::report::{Reporter, Status};
 const BEGIN: &str = "# stagelint begin";
 const END: &str = "# stagelint end";
 
-pub fn install(force: bool, root: &Reporter) -> Result<()> {
+pub fn install(force: bool, flags: &[BString], root: &Reporter) -> Result<()> {
     let repo = match gix::discover(std::env::current_dir()?) {
         Ok(repo) => repo,
         Err(gix::discover::Error::Discover(upwards::Error::NoGitRepository { path })) => {
@@ -51,7 +51,7 @@ pub fn install(force: bool, root: &Reporter) -> Result<()> {
         .map(|rel| Path::new(".").join(rel))
         .or_else(|| which::which("stagelint").ok())
         .unwrap_or(exe);
-    let section = section(&command);
+    let section = section(&command, flags);
 
     let existing = fs::symlink_metadata(&hook_path);
     let previous = existing
@@ -109,7 +109,7 @@ fn replace_section(hook: &[u8], section: &[u8]) -> Option<BString> {
     Some(out)
 }
 
-fn section(command: &Path) -> BString {
+fn section(command: &Path, flags: &[BString]) -> BString {
     let command = gix::path::into_bstr(command);
     // git's bundled sh reads backslashes as escapes.
     #[cfg(windows)]
@@ -117,21 +117,40 @@ fn section(command: &Path) -> BString {
 
     // Not `exec`: user lines after ours must run.
     let mut section = BString::from(BEGIN);
-    section.extend_from_slice(b"\n'");
-    section.extend_from_slice(&command.replace(b"'", br"'\''"));
-    section.extend_from_slice(b"' \"$@\" || exit $?\n");
+    section.push(b'\n');
+    quote(&command, &mut section);
+    for flag in flags {
+        section.push(b' ');
+        quote(flag, &mut section);
+    }
+    section.extend_from_slice(b" \"$@\" || exit $?\n");
     section.extend_from_slice(END.as_bytes());
     section.push(b'\n');
     section
 }
 
+/// Single-quote a word for sh unless every byte is safe bare.
+fn quote(word: &[u8], out: &mut BString) {
+    if !word.is_empty()
+        && word
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(b))
+    {
+        out.extend_from_slice(word);
+        return;
+    }
+    out.push(b'\'');
+    out.extend_from_slice(&word.replace(b"'", br"'\''"));
+    out.push(b'\'');
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BEGIN, END, replace_section, section};
+    use super::{BEGIN, BString, END, replace_section, section};
     use std::path::Path;
 
-    fn command_of(command: &str) -> String {
-        section(Path::new(command))
+    fn command_of(command: &str, flags: &[BString]) -> String {
+        section(Path::new(command), flags)
             .to_string()
             .lines()
             .nth(1)
@@ -141,20 +160,45 @@ mod tests {
             .to_owned()
     }
 
+    #[test]
+    fn safe_command_is_left_bare() {
+        assert_eq!(
+            command_of("./node_modules/@stagelint/darwin-arm64/stagelint", &[]),
+            "./node_modules/@stagelint/darwin-arm64/stagelint"
+        );
+    }
+
+    #[test]
+    fn command_with_a_space_is_quoted_whole() {
+        assert_eq!(
+            command_of("/Applications/My Tools/stagelint", &[]),
+            "'/Applications/My Tools/stagelint'"
+        );
+    }
+
     /// sh ends a single-quoted word at the first quote; the escape closes and reopens around it.
     #[test]
     fn apostrophe_is_escaped() {
         assert_eq!(
-            command_of("/home/o'brien/bin/stagelint"),
+            command_of("/home/o'brien/bin/stagelint", &[]),
             r"'/home/o'\''brien/bin/stagelint'"
         );
     }
 
     #[test]
-    fn relative_command_is_quoted_whole() {
+    fn flags_follow_the_command() {
         assert_eq!(
-            command_of("./node_modules/@stagelint/darwin-arm64/stagelint"),
-            "'./node_modules/@stagelint/darwin-arm64/stagelint'"
+            command_of("stagelint", &["--stash".into(), "tracked".into()]),
+            "stagelint --stash tracked"
+        );
+    }
+
+    /// A flag cannot end the word and start a second one of its own.
+    #[test]
+    fn flag_apostrophe_is_escaped() {
+        assert_eq!(
+            command_of("stagelint", &["'; rm -rf /; '".into()]),
+            r"stagelint ''\''; rm -rf /; '\'''"
         );
     }
 
@@ -165,7 +209,7 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let command = Path::new(OsStr::from_bytes(b"/tmp/dir-\xff/stagelint"));
-        let section = section(command);
+        let section = section(command, &[]);
         assert!(
             section.contains(&b'\xff'),
             "the raw byte should reach the hook: {section:?}"

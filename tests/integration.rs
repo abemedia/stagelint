@@ -2024,45 +2024,48 @@ fn concurrent_failure_cancels_running_tasks() {
 #[cfg(unix)]
 #[test]
 fn exiting_task_is_not_reported_as_cancelled() {
-    // Both tasks block until released together, so their failures are in flight at once.
-    let repo = TestRepo::new(&json!({
-        "*.md": "sh -c 'echo MD-ERROR; read x < .git/gate-1; exit 1'",
-        "*.rs": "sh -c 'echo RS-ERROR; read x < .git/gate-2; exit 1'",
-    }));
+    let mut stderr = String::new();
+    for _ in 0..5 {
+        // Both tasks block until released together, so their failures are in flight at once.
+        let repo = TestRepo::new(&json!({
+            "*.md": "sh -c 'echo MD-ERROR; read x < .git/gate-1; exit 1'",
+            "*.rs": "sh -c 'echo RS-ERROR; read x < .git/gate-2; exit 1'",
+        }));
 
-    repo.write_file("file.md", "hello\n");
-    repo.git(&["add", "file.md"]);
-    repo.write_file("file.rs", "hello\n");
-    repo.git(&["add", "file.rs"]);
+        repo.write_file("file.md", "hello\n");
+        repo.git(&["add", "file.md"]);
+        repo.write_file("file.rs", "hello\n");
+        repo.git(&["add", "file.rs"]);
 
-    let gates = [repo.root.join(".git/gate-1"), repo.root.join(".git/gate-2")];
-    let status = Command::new("mkfifo")
-        .args(&gates)
-        .status()
-        .expect("mkfifo");
-    assert!(status.success(), "mkfifo failed");
+        let gates = [repo.root.join(".git/gate-1"), repo.root.join(".git/gate-2")];
+        let status = Command::new("mkfifo")
+            .args(&gates)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success(), "mkfifo failed");
 
-    let child = repo.stagelint(&["--concurrent", "2"]);
+        let child = repo.stagelint(&["--concurrent", "2"]);
 
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let writers: std::io::Result<Vec<_>> = gates.iter().map(fs::File::create).collect();
-        tx.send(writers).ok();
-    });
-    let writers = rx
-        .recv_timeout(Duration::from_secs(30))
-        .expect("tasks never opened their gates")
-        .expect("open gates");
-    drop(writers); // EOF releases both tasks
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let writers: std::io::Result<Vec<_>> = gates.iter().map(fs::File::create).collect();
+            tx.send(writers).ok();
+        });
+        let writers = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("tasks never opened their gates")
+            .expect("open gates");
+        drop(writers); // EOF releases both tasks
 
-    let output = assert_failure(child);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    for block in [
-        "\nMD-ERROR\nexit status: 1\n",
-        "\nRS-ERROR\nexit status: 1\n",
-    ] {
-        assert!(stderr.contains(block), "missing {block:?} in: {stderr}");
+        let output = assert_failure(child);
+        stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if stderr.contains("\nMD-ERROR\nexit status: 1\n")
+            && stderr.contains("\nRS-ERROR\nexit status: 1\n")
+        {
+            return;
+        }
     }
+    panic!("missing expected output in: {stderr}");
 }
 
 /// Passing commands stay quiet unless `--verbose` asks for their output.

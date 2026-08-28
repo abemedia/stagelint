@@ -46,7 +46,7 @@ pub struct Opts {
     ///
     /// Nothing is stashed and nothing is staged: the commands see the working tree as it is, and
     /// their changes are left there.
-    #[arg(long, group = "source")]
+    #[arg(short, long, group = "source")]
     pub unstaged: bool,
 
     /// Lint the given paths instead of the staged files.
@@ -62,11 +62,11 @@ pub struct Opts {
     pub stash: StashScope,
 
     /// Print only the output of failed commands and errors.
-    #[arg(long, conflicts_with = "verbose")]
+    #[arg(short, long, conflicts_with = "verbose")]
     pub quiet: bool,
 
     /// Show the output of every command, not only of those that failed.
-    #[arg(long)]
+    #[arg(short, long)]
     pub verbose: bool,
 }
 

@@ -185,12 +185,12 @@ never touched.
 Widen it when a command reads files it was not given - a type-checker or `go vet ./...` sees your
 whole tree, and the default leaves your uncommitted work in place for it to trip over.
 
-### `--quiet`
+### `--quiet`, `-q`
 
 Prints only the output of failed commands and errors: no task tree, no warnings. Cannot be combined
 with `--verbose`.
 
-### `--verbose`
+### `--verbose`, `-v`
 
 Prints the output of every command and keeps the task tree fully expanded. By default only failed
 commands have their output shown, so a passing run is just the task tree.

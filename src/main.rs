@@ -9,7 +9,6 @@ mod workflow;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, anyhow};
-use clap::Parser;
 use tokio_util::sync::CancellationToken;
 
 use cli::{Cli, Commands, Opts, StashScope};
@@ -31,7 +30,7 @@ fn main() -> ExitCode {
     };
     let root = Reporter::new(level);
     let result = match cli.command {
-        Some(Commands::Init { force }) => hook::install(force, &root),
+        Some(Commands::Init { force, flags }) => hook::install(force, &flags, &root),
         None => run(&cli.opts, &root),
     };
 

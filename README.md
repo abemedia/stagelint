@@ -119,6 +119,12 @@ stagelint init
 This creates `.git/hooks/pre-commit` (or respects `core.hooksPath`). Use `--force` to overwrite an
 existing hook.
 
+Pass any [CLI flag](#cli-flags) after `--` for the hook to run stagelint with:
+
+```sh
+stagelint init -- --stash tracked
+```
+
 If you already use a hook manager like pre-commit, Lefthook, or husky, call `stagelint` from your
 existing hook configuration instead.
 

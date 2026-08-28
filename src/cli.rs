@@ -1,6 +1,9 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::builder::{OsStringValueParser, TypedValueParser as _};
+use clap::{Args, Command, Parser, Subcommand, ValueEnum};
+use gix::bstr::{BString, ByteVec};
 
 #[derive(Parser)]
 #[command(version, about, args_conflicts_with_subcommands = true)]
@@ -12,6 +15,27 @@ pub struct Cli {
     pub opts: Opts,
 }
 
+impl Cli {
+    /// Parse arguments, checking hook flags against the run grammar.
+    pub fn parse() -> Self {
+        let cli = <Self as Parser>::parse();
+        if let Some(Commands::Init { flags, .. }) = &cli.command
+            && let Err(e) = Opts::augment_args(Command::new("stagelint"))
+                .bin_name("stagelint init --")
+                .try_get_matches_from(
+                    std::iter::once(OsString::from("stagelint")).chain(
+                        flags
+                            .iter()
+                            .map(|flag| flag.to_vec().into_os_string_lossy()),
+                    ),
+                )
+        {
+            e.exit();
+        }
+        cli
+    }
+}
+
 #[derive(Subcommand)]
 pub enum Commands {
     /// Install the pre-commit hook.
@@ -19,6 +43,16 @@ pub enum Commands {
         /// Overwrite an existing pre-commit hook.
         #[arg(long)]
         force: bool,
+
+        /// Flags the hook runs stagelint with.
+        ///
+        /// Any flag accepted by a normal run is written into the hook and applies to every commit.
+        #[arg(
+            last = true,
+            allow_hyphen_values = true,
+            value_parser = OsStringValueParser::new().try_map(to_bstring)
+        )]
+        flags: Vec<BString>,
     },
 }
 
@@ -79,6 +113,13 @@ pub enum StashScope {
     Tracked,
     /// Also stash untracked files.
     Untracked,
+}
+
+/// Take the bytes before clap's UTF-8 check, since a path argument need not be valid UTF-8.
+fn to_bstring(flag: OsString) -> Result<BString, String> {
+    Vec::from_os_string(flag)
+        .map(BString::from)
+        .map_err(|_| "argument is not valid UTF-8".to_owned())
 }
 
 fn parse_concurrent(s: &str) -> Result<usize, String> {

@@ -3164,7 +3164,7 @@ fn init_uses_relative_path_in_worktree() {
     );
 
     let hook = repo.read_file(".git/hooks/pre-commit");
-    let expected = format!("'./tools/{name}'");
+    let expected = format!("./tools/{name}");
     assert!(hook.contains(&expected), "want {expected} in: {hook}");
 }
 
@@ -3188,7 +3188,7 @@ fn init_uses_path_entry_outside_worktree() {
     );
 
     let hook = repo.read_file(".git/hooks/pre-commit");
-    let expected = format!("'{}'", on_path.display().to_string().replace('\\', "/"));
+    let expected = on_path.display().to_string().replace('\\', "/");
     assert!(hook.contains(&expected), "want {expected} in: {hook}");
 }
 
@@ -3207,10 +3207,7 @@ fn init_uses_own_path_without_path_entry() {
     );
 
     let hook = repo.read_file(".git/hooks/pre-commit");
-    let expected = format!(
-        "'{}'",
-        stagelint_exe().display().to_string().replace('\\', "/")
-    );
+    let expected = stagelint_exe().display().to_string().replace('\\', "/");
     assert!(hook.contains(&expected), "want {expected} in: {hook}");
 }
 

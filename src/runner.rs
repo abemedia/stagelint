@@ -277,20 +277,29 @@ async fn run_command(
 
     let mut cancelled = false;
     let mut handled = false;
-    let mut output = loop {
-        tokio::select! {
+    let mut drained = false;
+    let mut output = Vec::new();
+    // EOF is not the child exiting: a process can close its descriptors and keep running.
+    let exit = loop {
+        let interrupted = tokio::select! {
             biased;
-            output = &mut read => break output.unwrap_or_default(),
-            () = running.cancelled(), if !handled => {
-                handled = true;
-                // A process already exiting is no cancellation; keep its real status.
-                cancelled = child.try_wait().ok().flatten().is_none();
-                child.start_kill().ok();
+            bytes = &mut read, if !drained => {
+                output = bytes.unwrap_or_default();
+                drained = true;
+                false
             }
+            exit = child.wait(), if drained => break exit,
+            () = running.cancelled(), if !handled => true,
+        };
+        if interrupted {
+            handled = true;
+            // A process already exiting is no cancellation; keep its real status.
+            cancelled = child.try_wait().ok().flatten().is_none();
+            child.start_kill().ok();
         }
     };
 
-    let status = match child.wait().await {
+    let status = match exit {
         Ok(status) if status.success() => Status::Done,
         Ok(status) if cancelled && (cfg!(windows) || status.code().is_none()) => Status::Cancelled,
         Err(_) if cancelled => Status::Cancelled,

@@ -82,11 +82,15 @@ cargo install stagelint
 brew install abemedia/tap/stagelint
 ```
 
+<!-- Pending https://github.com/microsoft/winget-pkgs/pull/424271
+
 ### WinGet
 
 ```sh
 winget install abemedia.stagelint
 ```
+
+-->
 
 ### Scoop
 
@@ -144,6 +148,9 @@ Create `.stagelint.yml`, `.stagelint.yaml`, `.stagelint.json`, `.stagelint.jsonc
 Matching files are always appended as arguments unless `pass_filenames: false` is set. Commands run
 from the directory of the config file that declared them, and receive absolute paths.
 
+Negation patterns such as `!(*.ts)` are not supported, and match nothing rather than failing, so a
+task configured with one never runs.
+
 Commands are split using POSIX shell rules on all platforms, so quote any argument containing spaces
 or backslashes.
 
@@ -151,6 +158,29 @@ or backslashes.
 
 Place config files at any level in the repo. Each staged file uses the closest config file walking
 up toward the root.
+
+## Coding agent hooks
+
+Run your linters and formatters over a coding agent's edits, so anything that fails goes back to the
+agent to fix rather than landing on you at review.
+
+For Claude Code, add this to `.claude/settings.json` to run it when the agent finishes a turn:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [{ "type": "command", "command": "stagelint --unstaged --quiet || exit 2" }]
+      }
+    ]
+  }
+}
+```
+
+The `--unstaged` flag runs commands against the working tree rather than the index, and `--quiet`
+reduces output to save tokens. Exit code 2 turns a failure into a blocking error, which is what
+feeds stderr back to the model.
 
 ## CLI flags
 

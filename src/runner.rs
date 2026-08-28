@@ -192,7 +192,12 @@ impl Job {
             for rx in &mut self.after {
                 rx.changed().await.ok()?;
             }
-            permits.acquire().await.ok()
+            tokio::select! {
+                // Cancelled wins a tie, so a cancelled task never starts on a free permit.
+                biased;
+                () = running.cancelled() => None,
+                permit = permits.acquire() => permit.ok(),
+            }
         };
         if let Some(_permit) = ready.await {
             group.status(Status::Running);

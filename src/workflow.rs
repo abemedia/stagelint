@@ -39,8 +39,8 @@ pub enum Error {
     TreeEdit(#[source] gix::objs::tree::editor::Error),
     #[error("failed to write edited tree")]
     TreeEditorWrite(#[source] gix::object::tree::editor::write::Error),
-    #[error("failed to write commit")]
-    CommitWrite(#[source] gix::object::write::Error),
+    #[error("failed to write object")]
+    ObjectWrite(#[source] gix::object::write::Error),
     #[error("failed to create stash ref")]
     RefWrite(#[source] gix::reference::edit::Error),
     #[error("failed to delete stash ref")]
@@ -224,11 +224,6 @@ impl<'a> Workflow<'a> {
         let oid = if captured.is_empty() && untracked_entries.is_empty() && absent.is_empty() {
             None
         } else {
-            if repo.head_commit().is_err() {
-                reporter
-                    .add("No initial commit: if this run is killed, recover your work with `git fsck --lost-found`")
-                    .status(report::Status::Warn);
-            }
             let phase = reporter
                 .add("Backing up working tree")
                 .status(report::Status::Running);
@@ -369,16 +364,9 @@ impl<'a> Workflow<'a> {
                 phase.output(format!("Error: {:#}\n", anyhow::Error::new(e)));
                 if let Some(oid) = oid {
                     let hash = oid.attach(self.repo).shorten_or_id();
-                    // Without HEAD the backup has no index parent, so git rejects it as a stash.
-                    phase.output(if self.repo.head_commit().is_ok() {
-                        format!(
-                            "\nYour changes are safe; recover them with `git stash apply --index {hash}`\n"
-                        )
-                    } else {
-                        format!(
-                            "\nYour changes are safe in commit {hash}; recover them with `git checkout {hash} -- :/`\n"
-                        )
-                    });
+                    phase.output(format!(
+                        "\nYour changes are safe; recover them with `git stash apply --index {hash}`\n"
+                    ));
                 }
                 Err(Error::Restore)
             }
@@ -491,7 +479,7 @@ fn checkout_worktree(
     Ok(())
 }
 
-/// Build the stash commit and write refs/stash (if HEAD exists).
+/// Build the stash commit and write refs/stash.
 fn create_stash_commit(
     repo: &Repository,
     captured: &[StashEntry],
@@ -509,7 +497,7 @@ fn create_stash_commit(
 
     let head = repo.head_commit().ok();
 
-    // Build the w_tree: HEAD overlaid with every dirty file and all worktree deletions.
+    // Build the w_tree: the base overlaid with every dirty file and all worktree deletions.
     let base_tree = match &head {
         Some(commit) => commit.tree().map_err(Error::TreeDecode)?,
         None => repo.empty_tree(),
@@ -539,33 +527,40 @@ fn create_stash_commit(
     }
     let stash_tree_oid = editor.write().map_err(Error::TreeEditorWrite)?.detach();
 
-    let mut parents: Vec<ObjectId> = Vec::new();
-    if let Some(commit) = &head {
-        parents.push(commit.id);
+    // parent[0]: HEAD, or a parentless empty-tree commit - a stash needs two parents.
+    let base = if let Some(commit) = &head {
+        commit.id
+    } else {
+        let tree = repo
+            .write_object(gix::objs::Tree::default())
+            .map_err(Error::ObjectWrite)?
+            .detach();
+        write_commit(repo, &committer, tree, &[], "stagelint: empty base")?
+    };
 
-        // parent[1]: index commit - tree is the current staged state.
-        // git stash pop uses this as the merge base for staged changes; using HEAD tree instead
-        // would produce wrong 3-way merge results for partially-staged files.
-        let mut editor = base_tree.edit().map_err(Error::TreeEditInit)?;
-        for change in changes {
-            if let gix::diff::index::Change::Deletion { .. } = change {
-                editor.remove(change.location()).map_err(Error::TreeEdit)?;
-            } else if let Some(mode) = change.entry_mode().to_tree_entry_mode() {
-                editor
-                    .upsert(change.location(), mode.kind(), change.id().to_owned())
-                    .map_err(Error::TreeEdit)?;
-            }
+    // parent[1]: index commit - tree is the current staged state.
+    // git stash pop uses this as the merge base for staged changes; using the base tree instead
+    // would produce wrong 3-way merge results for partially-staged files.
+    let mut editor = base_tree.edit().map_err(Error::TreeEditInit)?;
+    for change in changes {
+        if let gix::diff::index::Change::Deletion { .. } = change {
+            editor.remove(change.location()).map_err(Error::TreeEdit)?;
+        } else if let Some(mode) = change.entry_mode().to_tree_entry_mode() {
+            editor
+                .upsert(change.location(), mode.kind(), change.id().to_owned())
+                .map_err(Error::TreeEdit)?;
         }
-        let index_tree_oid = editor.write().map_err(Error::TreeEditorWrite)?.detach();
-        let index_commit_oid = write_commit(
-            repo,
-            &committer,
-            index_tree_oid,
-            &[commit.id],
-            "stagelint: index on HEAD",
-        )?;
-        parents.push(index_commit_oid);
     }
+    let index_tree_oid = editor.write().map_err(Error::TreeEditorWrite)?.detach();
+    let index_commit_oid = write_commit(
+        repo,
+        &committer,
+        index_tree_oid,
+        &[base],
+        "stagelint: index state",
+    )?;
+
+    let mut parents = vec![base, index_commit_oid];
 
     // parent[2]: untracked commit
     if !untracked_entries.is_empty() {
@@ -589,23 +584,20 @@ fn create_stash_commit(
         "stagelint automatic backup",
     )?;
 
-    // Skip on empty repos - git stash pop can't handle orphan commits.
-    if head.is_some() {
-        repo.edit_reference(RefEdit {
-            change: Change::Update {
-                log: LogChange {
-                    mode: RefLog::AndReference,
-                    force_create_reflog: true,
-                    message: "stagelint automatic backup".into(),
-                },
-                expected: PreviousValue::Any,
-                new: Target::Object(commit_oid),
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: true,
+                message: "stagelint automatic backup".into(),
             },
-            name: "refs/stash".try_into().expect("valid ref name"),
-            deref: false,
-        })
-        .map_err(Error::RefWrite)?;
-    }
+            expected: PreviousValue::Any,
+            new: Target::Object(commit_oid),
+        },
+        name: "refs/stash".try_into().expect("valid ref name"),
+        deref: false,
+    })
+    .map_err(Error::RefWrite)?;
 
     Ok(commit_oid)
 }
@@ -628,7 +620,7 @@ fn write_commit(
     };
     repo.write_object(&commit)
         .map(Id::detach)
-        .map_err(Error::CommitWrite)
+        .map_err(Error::ObjectWrite)
 }
 
 /// Check out indexed content over stashed files, as `git checkout-index` would.

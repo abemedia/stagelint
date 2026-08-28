@@ -445,13 +445,9 @@ fn empty_repo_fully_staged() {
     repo.write_file("hello.txt", "hello\n");
     repo.git(&["add", "hello.txt"]);
 
-    let output = assert_success(repo.stagelint(&[]));
+    assert_success(repo.stagelint(&[]));
 
     assert_eq!(repo.git(&["show", ":hello.txt"]), "HELLO\n");
-    assert!(
-        !String::from_utf8_lossy(&output.stderr).contains("[WARN] No initial commit"),
-        "nothing is stashed here, so there is no unreferenced backup to warn about"
-    );
 }
 
 /// On an empty repo, partial staging works correctly.
@@ -516,14 +512,10 @@ fn empty_repo_stash_untracked_restores() {
 
     repo.write_file("untracked.txt", "keep me\n");
 
-    let output = assert_success(repo.stagelint(&["--stash", "untracked"]));
+    assert_success(repo.stagelint(&["--stash", "untracked"]));
 
     assert_eq!(repo.read_file("untracked.txt"), "keep me\n");
     assert_eq!(repo.git(&["show", ":staged.txt"]), "HELLO\n");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("[WARN] No initial commit"),
-        "a backup no ref points at must be announced"
-    );
 }
 
 /// SIGTERM mid-run cancels the linter and restores the repo with no stash left behind.
@@ -3387,4 +3379,42 @@ fn crash_staged_deletion_recoverable() {
     repo.git(&["stash", "pop"]);
 
     assert_eq!(repo.read_file("gone.txt"), "content\n");
+}
+
+/// Crash before the first commit: stash ref survives; `git stash pop --index` restores the run.
+#[test]
+fn crash_empty_repo_recoverable() {
+    let repo = TestRepo::empty();
+    let config_str = serde_json::to_string(&json!({"*.txt": sentinel(1)})).unwrap();
+    repo.write_file(".stagelint.json", &config_str);
+    repo.git(&["add", ".stagelint.json"]);
+
+    repo.write_file("staged.txt", "content\n");
+    repo.git(&["add", "staged.txt"]);
+    repo.write_file("untracked.txt", "untracked content\n");
+
+    let mut child = repo.stagelint(&["--stash", "untracked"]);
+    assert!(repo.wait_sentinel(1, Duration::from_secs(10)));
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let stash_list = repo.git(&["stash", "list"]);
+    assert!(
+        stash_list.contains("stash@{0}"),
+        "stash ref should survive crash for recovery: {stash_list}"
+    );
+    assert!(
+        !repo.root.join("untracked.txt").exists(),
+        "untracked file should still be hidden"
+    );
+
+    repo.git(&["stash", "pop", "--index"]);
+
+    assert_eq!(repo.read_file("untracked.txt"), "untracked content\n");
+    assert_eq!(repo.git(&["show", ":staged.txt"]), "content\n");
+    assert!(
+        repo.git(&["ls-files", "untracked.txt"]).is_empty(),
+        "untracked.txt should not be in the index after recovery"
+    );
+    assert!(repo.git(&["stash", "list"]).is_empty());
 }

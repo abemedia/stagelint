@@ -128,6 +128,7 @@ fn run(opts: &Opts, root: &Reporter) -> Result<()> {
     let result = runner::run(
         &tasks,
         configs,
+        &workdir,
         opts.continue_on_error,
         opts.concurrent,
         &cancel,

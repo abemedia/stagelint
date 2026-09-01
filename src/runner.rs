@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::OsString;
+use std::env;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -30,6 +31,7 @@ pub enum Error {
 pub fn run(
     tasks: &Reporter,
     configs: BTreeMap<PathBuf, Vec<Task>>,
+    workdir: &Path,
     continue_on_error: bool,
     concurrent: usize,
     cancel: &CancellationToken,
@@ -38,7 +40,7 @@ pub fn run(
         .enable_all()
         .build()
         .map_err(Error::Runtime)?;
-    let groups = plan(tasks, configs);
+    let groups = plan(tasks, configs, workdir);
     let running = cancel.child_token();
     let permits = Arc::new(Semaphore::new(if concurrent == 0 {
         Semaphore::MAX_PERMITS
@@ -79,7 +81,9 @@ pub fn run(
 }
 
 /// Create the rows under `tasks`, in tree order, and the groups of jobs that drive them.
-fn plan(tasks: &Reporter, configs: BTreeMap<PathBuf, Vec<Task>>) -> Vec<Group> {
+fn plan(tasks: &Reporter, configs: BTreeMap<PathBuf, Vec<Task>>, workdir: &Path) -> Vec<Group> {
+    let inherited = env::var_os("PATH");
+    let mut paths: HashMap<PathBuf, Option<OsString>> = HashMap::new();
     let mut groups = Vec::with_capacity(configs.len());
     for (path, config) in configs {
         let row = tasks.add(path.display().to_string());
@@ -87,6 +91,10 @@ fn plan(tasks: &Reporter, configs: BTreeMap<PathBuf, Vec<Task>>) -> Vec<Group> {
         // Last job to claim each file; the next claimant starts after it.
         let mut last_writer: HashMap<OsString, usize> = HashMap::new();
         for task in config {
+            let local = paths
+                .entry(task.cwd.clone())
+                .or_insert_with(|| local_path(&task.cwd, workdir, inherited.as_deref()))
+                .clone();
             let n = task.files.len();
             let glob = row
                 .add(task.pattern)
@@ -115,6 +123,7 @@ fn plan(tasks: &Reporter, configs: BTreeMap<PathBuf, Vec<Task>>) -> Vec<Group> {
                 commands,
                 files: task.files,
                 cwd: task.cwd,
+                path: local,
                 after: predecessors
                     .iter()
                     .map(|&p| jobs[p].done.subscribe())
@@ -125,6 +134,26 @@ fn plan(tasks: &Reporter, configs: BTreeMap<PathBuf, Vec<Task>>) -> Vec<Group> {
         groups.push(Group { row, jobs });
     }
     groups
+}
+
+/// Project-local tool directories from `cwd` up to `workdir`, nearest first, then inherited PATH.
+fn local_path(cwd: &Path, workdir: &Path, inherited: Option<&OsStr>) -> Option<OsString> {
+    #[cfg(windows)]
+    const LOCAL_BIN: &[&str] = &["node_modules/.bin", "vendor/bin", ".venv/Scripts"];
+    #[cfg(not(windows))]
+    const LOCAL_BIN: &[&str] = &["node_modules/.bin", "vendor/bin", ".venv/bin"];
+
+    let dirs: Vec<PathBuf> = cwd
+        .ancestors()
+        .take_while(|dir| dir.starts_with(workdir))
+        .flat_map(|dir| LOCAL_BIN.iter().map(move |name| dir.join(name)))
+        .filter(|dir| dir.is_dir())
+        .collect();
+    if dirs.is_empty() {
+        return None;
+    }
+    let inherited = inherited.into_iter().flat_map(env::split_paths);
+    env::join_paths(dirs.into_iter().chain(inherited)).ok()
 }
 
 /// One config's row and the jobs under it.
@@ -171,6 +200,7 @@ struct Job {
     commands: Vec<(Cmd, Reporter)>,
     files: Vec<OsString>,
     cwd: PathBuf,
+    path: Option<OsString>,
     /// Completion signals from the jobs this one must follow; a closed channel skips this job.
     after: Vec<watch::Receiver<()>>,
     /// Signals this job finished. A panic drops it unsent, closing the channel.
@@ -199,13 +229,15 @@ impl Job {
                 permit = permits.acquire() => permit.ok(),
             }
         };
+        let path = self.path.as_deref();
         if let Some(_permit) = ready.await {
             group.status(Status::Running);
             self.row.status(Status::Running);
             // Don't spawn a command a pending cancellation would instantly kill.
             while let Some((cmd, row)) = commands.next_if(|_| !running.is_cancelled()) {
                 row.status(Status::Running);
-                let (status, output) = run_command(&cmd, &self.files, &self.cwd, &running).await;
+                let (status, output) =
+                    run_command(&cmd, &self.files, &self.cwd, path, &running).await;
                 row.output(output).status(status);
                 worst = worst.max(status);
                 if worst == Status::Failed && !continue_on_error {
@@ -229,13 +261,16 @@ async fn run_command(
     cmd: &Cmd,
     files: &[OsString],
     cwd: &Path,
+    path: Option<&OsStr>,
     running: &CancellationToken,
 ) -> (Status, Vec<u8>) {
     // `CreateProcess` only appends `.exe`, so `.cmd` and `.bat` shims need a full path.
     #[cfg(windows)]
     let program = &tokio::task::spawn_blocking({
         let name = cmd.program.clone();
-        move || which::which(name).ok()
+        let path = path.map_or_else(|| env::var_os("PATH"), |path| Some(path.to_os_string()));
+        let cwd = cwd.to_path_buf();
+        move || which::which_in(name, path, cwd).ok()
     })
     .await
     .ok()
@@ -258,6 +293,9 @@ async fn run_command(
             .stdin(process::Stdio::null())
             .stdout(out)
             .stderr(err);
+        if let Some(path) = path {
+            proc.env("PATH", path);
+        }
         match proc.group_spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -317,6 +355,7 @@ async fn run_command(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::Mutex;
 
     use super::*;
@@ -381,7 +420,14 @@ mod tests {
             PathBuf::from("cfg"),
             vec![task("*", &["stagelint-no-such-program"], &[])],
         )]);
-        let result = run(&root, configs, false, 0, &CancellationToken::new());
+        let result = run(
+            &root,
+            configs,
+            Path::new("."),
+            false,
+            0,
+            &CancellationToken::new(),
+        );
         assert!(matches!(result, Err(Error::Failed)));
         let log = lines(&buf);
         let failed = log
@@ -404,7 +450,15 @@ mod tests {
             PathBuf::from("cfg"),
             vec![task("*.a", &["true"], &[]), task("*.b", &["true"], &[])],
         )]);
-        run(&root, configs, false, 1, &CancellationToken::new()).expect("run");
+        run(
+            &root,
+            configs,
+            Path::new("."),
+            false,
+            1,
+            &CancellationToken::new(),
+        )
+        .expect("run");
         let log = lines(&buf);
         assert_eq!(log.first().unwrap(), "[STARTED] cfg");
         assert_eq!(log.last().unwrap(), "[COMPLETED] cfg");
@@ -419,7 +473,14 @@ mod tests {
             PathBuf::from("cfg"),
             vec![task("*.a", &["false", "true"], &[])],
         )]);
-        let result = run(&root, configs, false, 0, &CancellationToken::new());
+        let result = run(
+            &root,
+            configs,
+            Path::new("."),
+            false,
+            0,
+            &CancellationToken::new(),
+        );
         assert!(matches!(result, Err(Error::Failed)));
         let log = lines(&buf);
         assert!(log.contains(&"[FAILED] *.a > false".to_owned()), "{log:?}");
@@ -428,6 +489,89 @@ mod tests {
             "{log:?}"
         );
         assert_eq!(log.last().unwrap(), "[FAILED] cfg");
+    }
+
+    #[test]
+    fn local_path_walks_ancestors_within_the_worktree() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let root = workspace.path().join("repo");
+        let cwd = root.join("packages/app");
+        fs::create_dir_all(cwd.join("vendor/bin")).expect("create vendor/bin");
+        fs::create_dir_all(root.join("node_modules/.bin")).expect("create .bin");
+        // Above the worktree root.
+        fs::create_dir_all(workspace.path().join("node_modules/.bin")).expect("create outer .bin");
+
+        let inherited = env::join_paths(["/usr/bin", "/bin"]).expect("join");
+        let path = local_path(&cwd, &root, Some(&inherited)).expect("path");
+        let dirs: Vec<PathBuf> = env::split_paths(&path).collect();
+        assert_eq!(
+            dirs,
+            [
+                cwd.join("vendor/bin"),
+                root.join("node_modules/.bin"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/bin"),
+            ],
+            "{dirs:?}"
+        );
+    }
+
+    /// `None` leaves the child's PATH unset rather than empty, which `execvp` treats differently.
+    #[test]
+    fn local_path_without_local_dirs_is_none() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let root = workspace.path();
+        let inherited = OsStr::new("/usr/bin:/bin");
+        assert_eq!(local_path(root, root, Some(inherited)), None);
+        assert_eq!(local_path(root, root, None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commands_resolve_against_local_bin() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let root = workspace.path().join("repo");
+        let cwd = root.join("packages/app");
+        fs::create_dir_all(&cwd).expect("create package");
+        let bin = root.join("node_modules/.bin");
+        fs::create_dir_all(&bin).expect("create .bin");
+        let tool = bin.join("stagelint-fake-linter");
+        fs::write(&tool, "#!/bin/sh\nexit 0\n").expect("write tool");
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let mut task = task("*", &["stagelint-fake-linter"], &[]);
+        task.cwd = cwd;
+        let (tasks, buf) = reporter();
+        let configs = BTreeMap::from([(PathBuf::from("cfg"), vec![task])]);
+        run(&tasks, configs, &root, false, 0, &CancellationToken::new()).expect("run");
+        assert_eq!(lines(&buf).last().unwrap(), "[COMPLETED] cfg");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commands_ignore_local_bin_above_the_worktree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let root = workspace.path().join("repo");
+        let cwd = root.join("packages/app");
+        fs::create_dir_all(&cwd).expect("create package");
+        // Above the worktree root.
+        let bin = workspace.path().join("node_modules/.bin");
+        fs::create_dir_all(&bin).expect("create .bin");
+        let tool = bin.join("stagelint-fake-linter");
+        fs::write(&tool, "#!/bin/sh\nexit 0\n").expect("write tool");
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let mut task = task("*", &["stagelint-fake-linter"], &[]);
+        task.cwd = cwd;
+        let (tasks, buf) = reporter();
+        let configs = BTreeMap::from([(PathBuf::from("cfg"), vec![task])]);
+        let result = run(&tasks, configs, &root, false, 0, &CancellationToken::new());
+        assert!(matches!(result, Err(Error::Failed)));
+        assert_eq!(lines(&buf).last().unwrap(), "[FAILED] cfg");
     }
 
     /// Tasks that share a file run one after the other, in declaration order.
@@ -441,7 +585,15 @@ mod tests {
                 task("*.b", &["true"], &["x"]),
             ],
         )]);
-        run(&root, configs, false, 0, &CancellationToken::new()).expect("run");
+        run(
+            &root,
+            configs,
+            Path::new("."),
+            false,
+            0,
+            &CancellationToken::new(),
+        )
+        .expect("run");
         let log = lines(&buf);
         let done_a = log
             .iter()

@@ -165,6 +165,12 @@ or backslashes.
 Place config files at any level in the repo. Each staged file uses the closest config file walking
 up toward the root.
 
+### Locally installed tools
+
+Commands resolve to the tools installed in your project where available. Any `node_modules/.bin`,
+`.venv/bin` (`.venv/Scripts` on Windows) or `vendor/bin` directory in the config file's directory,
+or in any directory above it up to the repository root, is added to `PATH`.
+
 ## Coding agent hooks
 
 Run your linters and formatters over a coding agent's edits, so anything that fails goes back to the

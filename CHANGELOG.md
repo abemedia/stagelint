@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/abemedia/stagelint/compare/v0.1.4...v0.1.5) - 2026-09-05
+
+### Added
+
+- *(runner)* add project-local tool directories to PATH ([#60](https://github.com/abemedia/stagelint/pull/60))
+
 ## [0.1.4](https://github.com/abemedia/stagelint/compare/v0.1.3...v0.1.4) - 2026-08-28
 
 ### Added

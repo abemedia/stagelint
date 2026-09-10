@@ -1949,6 +1949,61 @@ fn continue_on_error_runs_pipeline_after_spawn_failure() {
     );
 }
 
+/// A limit too small for the file list runs the command once per chunk, in file order.
+#[test]
+fn max_arg_length_splits_files_across_runs() {
+    let repo = TestRepo::new(&json!({"*.txt": "sh -c 'echo \"$@\" >> args.log' _"}));
+
+    for i in 0..4 {
+        repo.write_file(&format!("file{i}.txt"), "content\n");
+    }
+    repo.git(&["add", "."]);
+
+    assert_success(repo.stagelint(&["--max-arg-length", "1"]));
+
+    let log = repo.read_file("args.log");
+    let runs: Vec<&str> = log.lines().collect();
+    assert_eq!(runs.len(), 4, "one run per file: {log}");
+    for (i, run) in runs.iter().enumerate() {
+        assert!(run.ends_with(&format!("file{i}.txt")), "{log}");
+    }
+}
+
+/// The limit never splits a command that takes no filenames.
+#[test]
+fn max_arg_length_ignores_pass_filenames_false() {
+    let repo = TestRepo::new(&json!({
+        "*.txt": {"command": "sh -c 'echo run >> runs.log'", "pass_filenames": false}
+    }));
+
+    for i in 0..4 {
+        repo.write_file(&format!("file{i}.txt"), "content\n");
+    }
+    repo.git(&["add", "."]);
+
+    assert_success(repo.stagelint(&["--max-arg-length", "1"]));
+
+    assert_eq!(repo.read_file("runs.log"), "run\n");
+}
+
+/// A failed chunk stops the remaining ones, unless `--continue-on-error`.
+#[test]
+fn max_arg_length_failed_chunk_stops_the_rest() {
+    let repo = TestRepo::new(&json!({"*.txt": "sh -c 'echo \"$@\" >> args.log; exit 1' _"}));
+
+    for i in 0..4 {
+        repo.write_file(&format!("file{i}.txt"), "content\n");
+    }
+    repo.git(&["add", "."]);
+
+    assert_failure(repo.stagelint(&["--max-arg-length", "1"]));
+    assert_eq!(repo.read_file("args.log").lines().count(), 1);
+
+    fs::remove_file(repo.root.join("args.log")).expect("remove log");
+    assert_failure(repo.stagelint(&["--max-arg-length", "1", "--continue-on-error"]));
+    assert_eq!(repo.read_file("args.log").lines().count(), 4);
+}
+
 /// `--concurrent 2` caps running tasks at two: the third starts only when a slot frees.
 #[test]
 fn concurrent_cap_limits_running_tasks() {

@@ -68,6 +68,18 @@ pub struct Opts {
     #[arg(long, default_value = "true", value_name = "NUM|BOOL", value_parser = parse_concurrent)]
     pub concurrent: usize,
 
+    /// Split a command into chunks when its arguments would exceed this length.
+    ///
+    /// The length is in bytes, or UTF-16 characters on Windows, and is detected from the system
+    /// unless given. Commands with `pass_filenames: false` are never split.
+    #[arg(
+        long,
+        default_value_t = 0,
+        hide_default_value = true,
+        value_name = "NUM"
+    )]
+    pub max_arg_length: usize,
+
     /// Lint the files changed in a revision range instead of the staged files.
     ///
     /// Takes any range `git diff` does - `main...HEAD` for everything on the branch since it

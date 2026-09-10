@@ -131,6 +131,7 @@ fn run(opts: &Opts, root: &Reporter) -> Result<()> {
         &workdir,
         opts.continue_on_error,
         opts.concurrent,
+        opts.max_arg_length,
         &cancel,
     );
     tasks.status(match &result {

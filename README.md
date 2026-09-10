@@ -208,6 +208,12 @@ By default the first failing command stops the run and cancels the rest. This ru
 completion and reports all failures together. The commit is still blocked, and the working tree is
 still restored.
 
+### `--max-arg-length <N>`
+
+Overrides the command-line length the system allows, in bytes or UTF-16 characters on Windows. A
+command whose arguments would exceed it is split into chunks and run once per chunk, one after
+another. Commands with `pass_filenames: false` are never split.
+
 ### `--diff <REVSPEC>`
 
 Runs commands against the files changed in a revision range instead of the staged files. For

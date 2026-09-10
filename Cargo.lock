@@ -2341,6 +2341,7 @@ dependencies = [
  "indexmap 2.14.1",
  "indicatif",
  "json5",
+ "libc",
  "mimalloc",
  "serde",
  "serde_json",

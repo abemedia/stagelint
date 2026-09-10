@@ -34,6 +34,7 @@ pub fn run(
     workdir: &Path,
     continue_on_error: bool,
     concurrent: usize,
+    max_arg_length: usize,
     cancel: &CancellationToken,
 ) -> Result<(), Error> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -51,7 +52,7 @@ pub fn run(
         let mut set = JoinSet::new();
         for group in groups {
             let (permits, running) = (permits.clone(), running.clone());
-            set.spawn(group.run(permits, running, continue_on_error));
+            set.spawn(group.run(permits, running, continue_on_error, max_arg_length));
         }
 
         let mut worst = Status::Done;
@@ -156,6 +157,77 @@ fn local_path(cwd: &Path, workdir: &Path, inherited: Option<&OsStr>) -> Option<O
     env::join_paths(dirs.into_iter().chain(inherited)).ok()
 }
 
+/// Length `arg` adds to a command line: bytes, or UTF-16 units on Windows, overhead included.
+fn arg_len(arg: &OsStr) -> usize {
+    #[cfg(windows)]
+    let len = std::os::windows::ffi::OsStrExt::encode_wide(arg).count();
+    #[cfg(not(windows))]
+    let len = arg.len();
+    len + 1 + size_of::<usize>()
+}
+
+/// Length of arguments `program` can be started with.
+#[cfg(windows)]
+fn arg_max(program: &OsStr) -> usize {
+    // A batch file runs through `cmd.exe`, whose line is shorter and re-expanded in the script.
+    let batch = Path::new(program)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
+    (if batch { 8191 } else { 32_767 }) - 1024 // Leave a margin for re-expansion.
+}
+
+/// Length of arguments `program` can be started with.
+#[cfg(unix)]
+fn arg_max(_program: &OsStr) -> usize {
+    use std::sync::LazyLock;
+
+    static BUDGET: LazyLock<usize> = LazyLock::new(|| {
+        const ARG_MAX: usize = 128 * 1024;
+        let env_size: usize = env::vars_os()
+            .map(|(key, value)| key.len() + value.len() + 2 + size_of::<usize>())
+            .sum();
+        // The kernel allows a quarter of the stack rlimit, which not every libc reports.
+        #[cfg(target_os = "linux")]
+        let reported = {
+            let mut stack = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe { libc::getrlimit(libc::RLIMIT_STACK, &raw mut stack) };
+            ARG_MAX.max(usize::try_from(stack.rlim_cur / 4).unwrap_or(usize::MAX))
+        };
+        #[cfg(not(target_os = "linux"))]
+        let reported =
+            usize::try_from(unsafe { libc::sysconf(libc::_SC_ARG_MAX) }).unwrap_or(ARG_MAX);
+        reported
+            .saturating_sub(env_size)
+            .saturating_sub(4096)
+            .clamp(4096, 2 * 1024 * 1024)
+    });
+    *BUDGET
+}
+
+/// Split `files` into runs that fit `limit` after `overhead`.
+/// Always yields at least one run, and an oversized file gets one to itself.
+fn chunks(files: &[OsString], overhead: usize, limit: usize) -> impl Iterator<Item = &[OsString]> {
+    let budget = limit.saturating_sub(overhead);
+    let mut rest = Some(files);
+    std::iter::from_fn(move || {
+        let files = rest.take()?;
+        let mut used = 0;
+        let fit = files
+            .iter()
+            .take_while(|file| {
+                used += arg_len(file);
+                used <= budget
+            })
+            .count();
+        let (chunk, tail) = files.split_at(fit.max(1).min(files.len()));
+        rest = (!tail.is_empty()).then_some(tail);
+        Some(chunk)
+    })
+}
+
 /// One config's row and the jobs under it.
 struct Group {
     row: Reporter,
@@ -169,11 +241,12 @@ impl Group {
         permits: Arc<Semaphore>,
         running: CancellationToken,
         continue_on_error: bool,
+        max_arg_length: usize,
     ) -> Result<Status, tokio::task::JoinError> {
         let mut set = JoinSet::new();
         for job in self.jobs {
             let (row, permits, running) = (self.row.clone(), permits.clone(), running.clone());
-            set.spawn(job.run(row, permits, running, continue_on_error));
+            set.spawn(job.run(row, permits, running, continue_on_error, max_arg_length));
         }
         let mut worst = Status::Done;
         let mut panic = None;
@@ -215,6 +288,7 @@ impl Job {
         permits: Arc<Semaphore>,
         running: CancellationToken,
         continue_on_error: bool,
+        max_arg_length: usize,
     ) -> Status {
         let mut worst = Status::Done;
         let mut commands = self.commands.into_iter().peekable();
@@ -236,13 +310,69 @@ impl Job {
             // Don't spawn a command a pending cancellation would instantly kill.
             while let Some((cmd, row)) = commands.next_if(|_| !running.is_cancelled()) {
                 row.status(Status::Running);
-                let (status, output) =
-                    run_command(&cmd, &self.files, &self.cwd, path, &running).await;
-                row.output(output).status(status);
-                worst = worst.max(status);
-                if worst == Status::Failed && !continue_on_error {
-                    running.cancel();
+                // `CreateProcess` only appends `.exe`, so `.cmd` and `.bat` shims need a full path.
+                #[cfg(windows)]
+                let resolved = tokio::task::spawn_blocking({
+                    let name = cmd.program.clone();
+                    let path =
+                        path.map_or_else(|| env::var_os("PATH"), |path| Some(path.to_os_string()));
+                    let cwd = self.cwd.clone();
+                    move || which::which_in(name, path, cwd).ok()
+                })
+                .await
+                .ok()
+                .flatten()
+                .map_or_else(|| cmd.program.clone().into(), PathBuf::into_os_string);
+                #[cfg(windows)]
+                let program = resolved.as_os_str();
+                #[cfg(not(windows))]
+                let program = OsStr::new(&cmd.program);
+
+                let limit = if max_arg_length == 0 {
+                    arg_max(program)
+                } else {
+                    max_arg_length
+                };
+                let files: &[OsString] = if cmd.pass_filenames { &self.files } else { &[] };
+                let overhead = std::iter::once(program)
+                    .chain(cmd.args.iter().map(OsStr::new))
+                    .map(arg_len)
+                    .sum::<usize>();
+                let chunked: Vec<&[OsString]> = chunks(files, overhead, limit).collect();
+                let total = chunked.len();
+                // A single chunk is the command itself, so it keeps the command's own row.
+                let rows: Vec<Reporter> = if total > 1 {
+                    chunked
+                        .iter()
+                        .enumerate()
+                        .map(|(i, chunk)| {
+                            let n = chunk.len();
+                            row.add(format!("chunk {}/{total}", i + 1))
+                                .note(format!("{n} file{}", if n == 1 { "" } else { "s" }))
+                        })
+                        .collect()
+                } else {
+                    vec![row.clone()]
+                };
+
+                let mut status = Status::Done;
+                let mut pending = chunked.into_iter().zip(&rows).peekable();
+                while let Some((chunk, chunk_row)) = pending.next_if(|_| !running.is_cancelled()) {
+                    chunk_row.status(Status::Running);
+                    let (chunk_status, output) =
+                        run_command(program, &cmd.args, chunk, &self.cwd, path, &running).await;
+                    chunk_row.output(output).status(chunk_status);
+                    status = status.max(chunk_status);
+                    if status == Status::Failed && !continue_on_error {
+                        running.cancel();
+                    }
                 }
+                for (_, chunk_row) in pending {
+                    chunk_row.status(Status::Cancelled);
+                    status = Status::Cancelled.max(status);
+                }
+                row.status(status);
+                worst = worst.max(status);
             }
         }
         for (_, row) in commands {
@@ -258,27 +388,13 @@ impl Job {
 /// Run one command to completion, killing and draining it if `running` is cancelled mid-flight.
 /// Returns how it ended with its output, both streams interleaved as the child wrote them.
 async fn run_command(
-    cmd: &Cmd,
+    program: &OsStr,
+    args: &[String],
     files: &[OsString],
     cwd: &Path,
     path: Option<&OsStr>,
     running: &CancellationToken,
 ) -> (Status, Vec<u8>) {
-    // `CreateProcess` only appends `.exe`, so `.cmd` and `.bat` shims need a full path.
-    #[cfg(windows)]
-    let program = &tokio::task::spawn_blocking({
-        let name = cmd.program.clone();
-        let path = path.map_or_else(|| env::var_os("PATH"), |path| Some(path.to_os_string()));
-        let cwd = cwd.to_path_buf();
-        move || which::which_in(name, path, cwd).ok()
-    })
-    .await
-    .ok()
-    .flatten()
-    .map_or_else(|| cmd.program.clone().into(), PathBuf::into_os_string);
-    #[cfg(not(windows))]
-    let program = &cmd.program;
-
     // One pipe for both streams, so writes arrive in the order the child made them.
     let (mut reader, out, err) = match io::pipe().and_then(|(r, w)| Ok((r, w.try_clone()?, w))) {
         Ok(pipe) => pipe,
@@ -287,8 +403,8 @@ async fn run_command(
 
     let mut child = {
         let mut proc = tokio::process::Command::new(program);
-        proc.args(&cmd.args)
-            .args(if cmd.pass_filenames { files } else { &[] })
+        proc.args(args)
+            .args(files)
             .current_dir(cwd)
             .stdin(process::Stdio::null())
             .stdout(out)
@@ -426,6 +542,7 @@ mod tests {
             Path::new("."),
             false,
             0,
+            0,
             &CancellationToken::new(),
         );
         assert!(matches!(result, Err(Error::Failed)));
@@ -456,6 +573,7 @@ mod tests {
             Path::new("."),
             false,
             1,
+            0,
             &CancellationToken::new(),
         )
         .expect("run");
@@ -478,6 +596,7 @@ mod tests {
             configs,
             Path::new("."),
             false,
+            0,
             0,
             &CancellationToken::new(),
         );
@@ -545,7 +664,16 @@ mod tests {
         task.cwd = cwd;
         let (tasks, buf) = reporter();
         let configs = BTreeMap::from([(PathBuf::from("cfg"), vec![task])]);
-        run(&tasks, configs, &root, false, 0, &CancellationToken::new()).expect("run");
+        run(
+            &tasks,
+            configs,
+            &root,
+            false,
+            0,
+            0,
+            &CancellationToken::new(),
+        )
+        .expect("run");
         assert_eq!(lines(&buf).last().unwrap(), "[COMPLETED] cfg");
     }
 
@@ -569,7 +697,15 @@ mod tests {
         task.cwd = cwd;
         let (tasks, buf) = reporter();
         let configs = BTreeMap::from([(PathBuf::from("cfg"), vec![task])]);
-        let result = run(&tasks, configs, &root, false, 0, &CancellationToken::new());
+        let result = run(
+            &tasks,
+            configs,
+            &root,
+            false,
+            0,
+            0,
+            &CancellationToken::new(),
+        );
         assert!(matches!(result, Err(Error::Failed)));
         assert_eq!(lines(&buf).last().unwrap(), "[FAILED] cfg");
     }
@@ -591,6 +727,7 @@ mod tests {
             Path::new("."),
             false,
             0,
+            0,
             &CancellationToken::new(),
         )
         .expect("run");
@@ -604,5 +741,30 @@ mod tests {
             .position(|l| l == "[STARTED] *.b > true")
             .unwrap_or_else(|| panic!("*.b never started: {log:?}"));
         assert!(done_a < start_b, "{log:?}");
+    }
+
+    /// A run takes every file that fits the budget, and a file landing exactly on it still fits.
+    #[test]
+    fn chunks_pack_up_to_the_budget() {
+        let files = ["a", "bb", "ccc", "d"].map(OsString::from);
+        let limit = 5 + arg_len(&files[0]) + arg_len(&files[1]);
+        let runs: Vec<&[OsString]> = chunks(&files, 5, limit).collect();
+        assert_eq!(runs, [&files[..2], &files[2..3], &files[3..]]);
+    }
+
+    /// A file too long for the limit still gets a run, alone, so the run never stalls.
+    #[test]
+    fn chunks_never_split_below_one_file() {
+        let files = ["long-name", "x"].map(OsString::from);
+        let runs: Vec<&[OsString]> = chunks(&files, 0, 1).collect();
+        assert_eq!(runs, [&files[..1], &files[1..]]);
+    }
+
+    /// A `pass_filenames: false` command passes no files and must still run exactly once.
+    #[test]
+    fn chunks_yield_one_empty_run_for_no_files() {
+        let runs: Vec<&[OsString]> = chunks(&[], 0, 1).collect();
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].is_empty());
     }
 }

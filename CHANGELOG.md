@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/abemedia/stagelint/compare/v0.1.5...v0.1.6) - 2026-09-10
+
+### Added
+
+- *(runner)* split commands whose arguments exceed the system limit ([#63](https://github.com/abemedia/stagelint/pull/63))
+
+### Other
+
+- *(deps)* bump libc from 0.2.186 to 0.2.189 ([#67](https://github.com/abemedia/stagelint/pull/67))
+
 ## [0.1.5](https://github.com/abemedia/stagelint/compare/v0.1.4...v0.1.5) - 2026-09-05
 
 ### Added

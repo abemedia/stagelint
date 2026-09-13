@@ -101,7 +101,7 @@ pub fn resolve<'a>(
         let prefix = config_path.parent().unwrap_or(Path::new(""));
 
         let mut tasks = Vec::new();
-        for (pattern, entry) in cfg {
+        for (pattern, commands) in cfg {
             // Bare patterns match basenames at any depth.
             let anchored = pattern.strip_prefix("./").or(pattern.strip_prefix('/'));
             let glob = match anchored {
@@ -129,28 +129,6 @@ pub fn resolve<'a>(
 
             if files.is_empty() {
                 continue;
-            }
-
-            let mut commands = Vec::with_capacity(entry.len());
-            for obj in entry {
-                let mut args = shell_words::split(&obj.command).map_err(|e| Error::Invalid {
-                    path: workdir.join(&config_path),
-                    message: format!("invalid command in pattern \"{pattern}\""),
-                    source: Some(Box::new(e)),
-                })?;
-                if args.first().is_none_or(String::is_empty) {
-                    return Err(Error::Invalid {
-                        path: workdir.join(&config_path),
-                        message: format!("empty command in pattern \"{pattern}\""),
-                        source: None,
-                    });
-                }
-                commands.push(Cmd {
-                    line: obj.command,
-                    program: args.remove(0),
-                    args,
-                    pass_filenames: obj.pass_filenames,
-                });
             }
 
             tasks.push(Task {
@@ -221,7 +199,7 @@ type ConfigAs = serde_with::MapPreventDuplicates<
 >;
 type ConfigWrap = serde_with::de::DeserializeAsWrap<Config, ConfigAs>;
 
-fn load_file(path: &Path) -> Result<Config, Error> {
+fn load_file(path: &Path) -> Result<IndexMap<String, Vec<Cmd>>, Error> {
     let content = fs::read_to_string(path).map_err(|e| Error::Read {
         path: path.to_owned(),
         source: e,
@@ -253,31 +231,54 @@ fn load_file(path: &Path) -> Result<Config, Error> {
         });
     }
 
-    for (pattern, commands) in &cfg {
-        let message = if matches!(pattern.as_str(), "" | "/" | "./") {
-            format!("pattern \"{pattern}\" matches nothing")
-        } else if commands.is_empty() {
-            format!("pattern \"{pattern}\" has no commands")
-        } else if commands.iter().any(|obj| obj.command.trim().is_empty()) {
-            format!("empty command in pattern \"{pattern}\"")
-        } else {
-            continue;
-        };
-        return Err(Error::Invalid {
-            path: path.to_owned(),
-            message,
-            source: None,
-        });
+    let mut config = IndexMap::with_capacity(cfg.len());
+    for (pattern, entry) in cfg {
+        if matches!(pattern.as_str(), "" | "/" | "./") {
+            return Err(Error::Invalid {
+                path: path.to_owned(),
+                message: format!("pattern \"{pattern}\" matches nothing"),
+                source: None,
+            });
+        }
+        if entry.is_empty() {
+            return Err(Error::Invalid {
+                path: path.to_owned(),
+                message: format!("pattern \"{pattern}\" has no commands"),
+                source: None,
+            });
+        }
+        let mut commands = Vec::with_capacity(entry.len());
+        for obj in entry {
+            let mut args = shell_words::split(&obj.command).map_err(|e| Error::Invalid {
+                path: path.to_owned(),
+                message: format!("invalid command in pattern \"{pattern}\""),
+                source: Some(Box::new(e)),
+            })?;
+            if args.first().is_none_or(String::is_empty) {
+                return Err(Error::Invalid {
+                    path: path.to_owned(),
+                    message: format!("empty command in pattern \"{pattern}\""),
+                    source: None,
+                });
+            }
+            commands.push(Cmd {
+                line: obj.command,
+                program: args.remove(0),
+                args,
+                pass_filenames: obj.pass_filenames,
+            });
+        }
+        config.insert(pattern, commands);
     }
 
-    Ok(cfg)
+    Ok(config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn load(name: &str, content: &str) -> Result<Config, Error> {
+    fn load(name: &str, content: &str) -> Result<IndexMap<String, Vec<Cmd>>, Error> {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join(name);
         fs::write(&path, content).expect("write");
@@ -291,7 +292,7 @@ mod tests {
         let cfg = load(".stagelint.yml", r#""*.go": "gofmt -w""#).expect("load");
         let cmds = &cfg["*.go"];
         assert_eq!(cmds.len(), 1);
-        assert_eq!(cmds[0].command, "gofmt -w");
+        assert_eq!(cmds[0].line, "gofmt -w");
         assert!(cmds[0].pass_filenames);
     }
 
@@ -308,8 +309,8 @@ mod tests {
         .expect("load");
         let cmds = &cfg["*.md"];
         assert_eq!(cmds.len(), 2);
-        assert_eq!(cmds[0].command, "prettier --write");
-        assert_eq!(cmds[1].command, "markdownlint");
+        assert_eq!(cmds[0].line, "prettier --write");
+        assert_eq!(cmds[1].line, "markdownlint");
     }
 
     #[test]
@@ -322,7 +323,7 @@ mod tests {
             }"#,
         )
         .expect("load");
-        assert_eq!(cfg["*.go"][0].command, "go vet ./...");
+        assert_eq!(cfg["*.go"][0].line, "go vet ./...");
         assert!(!cfg["*.go"][0].pass_filenames);
         assert!(
             cfg["*.md"][0].pass_filenames,
@@ -344,9 +345,9 @@ mod tests {
         .expect("load");
         let cmds = &cfg["*.go"];
         assert_eq!(cmds.len(), 2);
-        assert_eq!(cmds[0].command, "goimports -w");
+        assert_eq!(cmds[0].line, "goimports -w");
         assert!(cmds[0].pass_filenames);
-        assert_eq!(cmds[1].command, "golangci-lint run --fix");
+        assert_eq!(cmds[1].line, "golangci-lint run --fix");
         assert!(!cmds[1].pass_filenames);
     }
 
@@ -362,8 +363,8 @@ mod tests {
             }"#,
         )
         .expect("load");
-        assert_eq!(cfg["*.go"][0].command, "gofmt -w");
-        assert_eq!(cfg["*.md"][0].command, "markdownlint");
+        assert_eq!(cfg["*.go"][0].line, "gofmt -w");
+        assert_eq!(cfg["*.md"][0].line, "markdownlint");
     }
 
     #[test]
@@ -520,7 +521,7 @@ mod tests {
 
     #[test]
     fn unbalanced_quotes_rejected() {
-        let Err(err) = resolve_one(r#"{"*.md": "echo 'unterminated"}"#) else {
+        let Err(err) = load(".stagelint.json", r#"{"*.md": "echo 'unterminated"}"#) else {
             panic!("accepted")
         };
         assert!(
@@ -532,7 +533,7 @@ mod tests {
 
     #[test]
     fn quoted_empty_program_rejected() {
-        let Err(err) = resolve_one(r#"{"*.md": "''"}"#) else {
+        let Err(err) = load(".stagelint.json", r#"{"*.md": "''"}"#) else {
             panic!("accepted")
         };
         assert!(
@@ -613,6 +614,6 @@ mod tests {
         .expect("write json");
         let found = find(dir.path(), Path::new(""), &mut HashMap::new()).expect("find");
         let cfg = load_file(&dir.path().join(found)).expect("load");
-        assert_eq!(cfg["*.go"][0].command, "from-yml");
+        assert_eq!(cfg["*.go"][0].line, "from-yml");
     }
 }

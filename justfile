@@ -16,6 +16,8 @@ ready: fmt lint test
 # Format code
 fmt:
     cargo fmt --all
+    dprint fmt
+    tombi format
 
 # Lint with clippy
 lint:

@@ -33,6 +33,43 @@ fn formats_staged_file() {
     assert_eq!(repo.read_file("hello.txt"), "HELLO WORLD\n");
 }
 
+/// The linter's output reaches the committed tree when the index held a valid cache tree for it.
+#[test]
+fn formatted_file_invalidates_cache_tree() {
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+
+    repo.write_file("a/b/nested.txt", "hello\n");
+    repo.git(&["add", "a/b/nested.txt"]);
+    repo.git(&["write-tree"]);
+
+    assert_success(repo.stagelint(&[]));
+
+    let tree = repo.git(&["write-tree"]);
+    let blob = format!("{}:a/b/nested.txt", tree.trim());
+    assert_eq!(repo.git(&["cat-file", "-p", &blob]), "HELLO\n");
+}
+
+/// A file the linter deletes leaves the committed tree when the index held a valid cache tree.
+#[test]
+fn deleted_file_invalidates_cache_tree() {
+    let repo = TestRepo::new(&json!({"*.txt": "sh -c 'rm \"$@\"' _"}));
+
+    repo.write_file("a/b/doomed.txt", "goodbye\n");
+    repo.write_file("a/b/kept.md", "stays\n");
+    repo.git(&["add", "a"]);
+    repo.git(&["write-tree"]);
+
+    assert_success(repo.stagelint(&[]));
+
+    let tree = repo.git(&["write-tree"]);
+    let files = repo.git(&["ls-tree", "-r", "--name-only", tree.trim()]);
+    assert!(
+        !files.lines().any(|f| f == "a/b/doomed.txt"),
+        "the deletion should reach the tree, not a stale cached subtree: {files}"
+    );
+    assert!(files.lines().any(|f| f == "a/b/kept.md"));
+}
+
 /// Running from a repo subdirectory behaves identically to running from the root.
 #[test]
 fn runs_from_subdirectory() {

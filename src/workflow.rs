@@ -880,6 +880,9 @@ fn update_index(
                 ) =>
             {
                 index.remove_entry_at_index(pos);
+                if let Some(tree) = index.tree_mut() {
+                    invalidate_tree_path(tree, path.as_ref());
+                }
                 changed = true;
                 continue;
             }
@@ -926,15 +929,14 @@ fn update_index(
             if let Ok(stat) = entry::Stat::from_fs(&meta) {
                 entry.stat = stat;
             }
+            if let Some(tree) = index.tree_mut() {
+                invalidate_tree_path(tree, path.as_ref());
+            }
             changed = true;
         }
     }
 
     if changed {
-        // gix writes the tree cache as-is, without invalidating it for modified entries; drop it
-        // so a later commit cannot reuse stale subtrees. This is the documented practice until a
-        // gix-index API rework: https://github.com/GitoxideLabs/gitoxide/issues/2421
-        index.remove_tree();
         let mut writer = std::io::BufWriter::with_capacity(64 * 1024, lock);
         index
             .write_to(&mut writer, write::Options::default())
@@ -951,6 +953,29 @@ fn update_index(
     }
 
     Ok(merge_bases)
+}
+
+/// Invalidate the cached trees along `path`, as git's `cache_tree_invalidate_path` does.
+fn invalidate_tree_path(tree: &mut gix::index::extension::Tree, path: &BStr) {
+    let mut node = tree;
+    let mut rest: &[u8] = path;
+    loop {
+        node.num_entries = None;
+        let Some(slash) = rest.find_byte(b'/') else {
+            node.children.retain(|child| child.name.as_slice() != rest);
+            return;
+        };
+        let name = &rest[..slash];
+        rest = &rest[slash + 1..];
+        let Some(child) = node
+            .children
+            .iter_mut()
+            .find(|child| child.name.as_slice() == name)
+        else {
+            return;
+        };
+        node = child;
+    }
 }
 
 /// Apply the captured changes to the restored working tree via three-way merge.
@@ -1184,5 +1209,55 @@ fn remove_if_exists(path: &Path) -> Result<(), std::io::Error> {
             Ok(())
         }
         result => result,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gix::index::extension::Tree;
+
+    fn tree(name: &str, children: Vec<Tree>) -> Tree {
+        Tree {
+            name: name.as_bytes().into(),
+            id: ObjectId::null(gix::hash::Kind::Sha1),
+            num_entries: Some(1),
+            children,
+        }
+    }
+
+    /// Only the trees along the path are invalidated; siblings keep their cached ids.
+    #[test]
+    fn invalidate_tree_path_touches_only_the_path() {
+        let mut root = tree(
+            "",
+            vec![tree("a", vec![tree("b", vec![])]), tree("c", vec![])],
+        );
+
+        invalidate_tree_path(&mut root, "a/b/file.txt".into());
+
+        assert_eq!(root.num_entries, None);
+        assert_eq!(root.children[0].num_entries, None);
+        assert_eq!(root.children[0].children[0].num_entries, None);
+        assert_eq!(root.children[1].num_entries, Some(1));
+    }
+
+    /// A path naming a cached subtree removes it, as when a file replaces a directory.
+    #[test]
+    fn invalidate_tree_path_removes_a_replaced_directory() {
+        let mut root = tree(
+            "",
+            vec![tree("a", vec![tree("b", vec![]), tree("c", vec![])])],
+        );
+
+        invalidate_tree_path(&mut root, "a/b".into());
+
+        let names: Vec<_> = root.children[0]
+            .children
+            .iter()
+            .map(|t| t.name.as_slice())
+            .collect();
+        assert_eq!(names, [b"c"]);
+        assert_eq!(root.children[0].num_entries, None);
     }
 }

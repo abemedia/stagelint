@@ -1,4 +1,4 @@
-# stagelint <img src="logo.svg" align="left" width="40" alt="">
+# stagelint <img src="https://stagelint.dev/logo.svg" align="left" width="40" alt="">
 
 Run commands like linters and formatters on staged git files.
 
@@ -13,14 +13,16 @@ Run commands like linters and formatters on staged git files.
 
 ## Why stagelint?
 
-Running formatters before a commit is easy until you stage part of a file. You add the hunks you
+Running formatters before a commit is easy until you stage part of a file. You stage the hunks you
 want and leave the rest in your working tree - a debug line, a half-finished function. A formatter
-rewrites the whole file, so its output has to be reconciled with the edits you deliberately held
-back. Most tools give up and abort the commit or, worse, commit them along with the fix.
+rewrites the whole file, so its output has to be reconciled with your unstaged changes. Most tools
+give up and abort the commit or, worse, commit them along with the fix.
 
 stagelint stashes the unstaged edits, runs your commands, then three-way merges the result. What you
 staged gets formatted, what you did not stays exactly where you left it, and the commit goes through
 either way.
+
+**[Read the documentation](https://stagelint.dev)**
 
 ## Getting started
 
@@ -30,7 +32,8 @@ either way.
 npm install --save-dev @stagelint/stagelint
 ```
 
-Add the hook to your `prepare` script so it installs itself for the whole team:
+If you do not already use a hook manager, add the hook to your `prepare` script so it installs
+itself for the whole team:
 
 ```json
 {
@@ -42,24 +45,8 @@ Add the hook to your `prepare` script so it installs itself for the whole team:
 
 ### Python
 
-Add it to your project:
-
-```sh
-uv add --dev stagelint
-```
-
-Or install it globally:
-
-```sh
-uv tool install stagelint
-```
-
 ```sh
 pipx install stagelint
-```
-
-```sh
-python -m pip install --user stagelint
 ```
 
 ### Rust
@@ -82,49 +69,28 @@ cargo install stagelint
 brew install abemedia/tap/stagelint
 ```
 
-<!-- Pending https://github.com/microsoft/winget-pkgs/pull/424271
+### Install script
 
-### WinGet
-
-```sh
-winget install abemedia.stagelint
-```
-
--->
-
-### Scoop
+Download, verify and install a prebuilt binary:
 
 ```sh
-scoop bucket add abemedia https://github.com/abemedia/scoop-bucket
-scoop install stagelint
+curl -fsSL https://stagelint.dev/install.sh | sh
 ```
 
-### Nix
+It installs to `/usr/local/bin` when that is writable, otherwise to `~/.local/bin`. Set
+`STAGELINT_INSTALL_DIR` to choose the directory, or `STAGELINT_VERSION` to install a specific
+version.
 
-With flakes:
+### Other methods
 
-```sh
-nix profile add github:abemedia/nur-packages#stagelint
-```
-
-Or without flakes:
-
-```sh
-nix-env -f https://github.com/abemedia/nur-packages/archive/master.tar.gz -iA stagelint
-```
-
-### mise
-
-```sh
-mise use aqua:abemedia/stagelint
-```
-
-### Manual install
-
-Download a prebuilt binary or Linux package from the
-[release page](https://github.com/abemedia/stagelint/releases/latest).
+See the [installation docs](https://stagelint.dev/installation) for more ways to install
+**stagelint**, including Scoop, Nix and mise.
 
 ## Setting up the hook
+
+If you already use a hook manager like pre-commit, Lefthook, or husky, call `stagelint` from its
+configuration rather than running `stagelint init`. See the
+[hook manager docs](https://stagelint.dev/hook-managers/) for how to set up each one.
 
 ```sh
 stagelint init
@@ -133,14 +99,13 @@ stagelint init
 This creates `.git/hooks/pre-commit` (or respects `core.hooksPath`). Use `--force` to overwrite an
 existing hook.
 
-Pass any [CLI flag](#cli-flags) after `--` for the hook to run stagelint with:
+Pass any CLI flag after `--` for the hook to run stagelint with:
 
 ```sh
 stagelint init -- --stash tracked
 ```
 
-If you already use a hook manager like pre-commit, Lefthook, or husky, call `stagelint` from your
-existing hook configuration instead.
+See the [CLI reference](https://stagelint.dev/cli) for the full list of supported flags.
 
 ## Configuration
 
@@ -181,116 +146,63 @@ up toward the root.
 
 ### Locally installed tools
 
-Commands resolve to the tools installed in your project where available. Any `node_modules/.bin`,
-`.venv/bin` (`.venv/Scripts` on Windows) or `vendor/bin` directory in the config file's directory,
-or in any directory above it up to the repository root, is added to `PATH`.
+Commands resolve to the tools installed in your project, so there is no need for `npx` or `uv run`.
+Any `node_modules/.bin`, `.venv/bin` (`.venv/Scripts` on Windows) or `vendor/bin` directory in the
+config file's directory, or in any directory above it up to the repository root, is added to `PATH`.
 
-## Coding agent hooks
+## Coding agents
 
-Run your linters and formatters over a coding agent's edits, so anything that fails goes back to the
-agent to fix rather than landing on you at review.
-
-For Claude Code, add this to `.claude/settings.json` to run it when the agent finishes a turn:
+The same config runs over a coding agent's edits and hands failures back for the agent to fix. For
+Claude Code, add this to `.claude/settings.json`:
 
 ```json
 {
   "hooks": {
     "Stop": [
       {
-        "hooks": [{ "type": "command", "command": "stagelint --unstaged --quiet || exit 2" }]
+        "hooks": [
+          {
+            "type": "command",
+            "command": "stagelint --unstaged --quiet || exit 2"
+          }
+        ]
       }
     ]
   }
 }
 ```
 
-The `--unstaged` flag runs commands against the working tree rather than the index, and `--quiet`
-reduces output to save tokens. Exit code 2 turns a failure into a blocking error, which is what
-feeds stderr back to the model.
+See the [agent hook docs](https://stagelint.dev/agent-hooks/) for how to set up other agents.
 
-## CLI flags
+## Continuous integration
 
-### `--concurrent <true|false|N>`
+Check every pull request, including commits that skipped the hook. In GitHub Actions, add the
+[stagelint action](https://github.com/abemedia/stagelint-action) to a workflow:
 
-`true` runs every task at once, `false` runs them one at a time, and a number caps how many run
-together. Tasks whose globs match the same file are always serialised regardless, in the order the
-patterns are declared.
+```yaml
+name: stagelint
 
-### `--continue-on-error`
+on:
+  pull_request:
+  push:
+    branches: [main]
 
-By default the first failing command stops the run and cancels the rest. This runs everything to
-completion and reports all failures together. The commit is still blocked, and the working tree is
-still restored.
+permissions:
+  contents: read
 
-### `--max-arg-length <N>`
+jobs:
+  stagelint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
 
-Overrides the command-line length the system allows, in bytes or UTF-16 characters on Windows. A
-command whose arguments would exceed it is split into chunks and run once per chunk, one after
-another. Commands with `pass_filenames: false` are never split.
+      # Install the tools your stagelint config runs.
 
-### `--diff <REVSPEC>`
+      - uses: abemedia/stagelint-action@v1
+```
 
-Runs commands against the files changed in a revision range instead of the staged files. For
-example, `main...HEAD` for everything since your branch diverged, or `HEAD~3` for the last three
-commits. Nothing is hidden and nothing is staged: the commands see the working tree as it is and
-their changes are left there.
-
-### `--unstaged`, `-u`
-
-Runs commands against the files modified in your working tree, including untracked ones, instead of
-the staged files. Nothing is hidden and nothing is staged: the commands see the working tree as it
-is and their changes are left there.
-
-### `--files <PATHS>...`
-
-Runs commands against the given paths instead of the staged files. Nothing is hidden and nothing is
-staged.
-
-### `--all`, `-a`
-
-Runs commands against every file instead of just the staged files. Ignored files, symlinks,
-submodules, skip-worktree paths and files deleted from the working tree are skipped. Nothing is
-hidden and nothing is staged.
-
-### `--stash <partial|tracked|untracked>`
-
-Controls how much of your working tree is hidden while commands run, so they see the content being
-committed rather than your work in progress. Each scope includes the previous, and ignored files are
-never touched. Rejected with `--diff`, `--unstaged`, `--files` and `--all`, which hide nothing.
-
-- `partial` (default) - Only stash unstaged edits to partially staged files.
-- `tracked` - Also stash every other dirty tracked file.
-- `untracked` - Also stash untracked files.
-
-Widen it when a command reads files it was not given - a type-checker or `go vet ./...` sees your
-whole tree, and the default leaves your uncommitted work in place for it to trip over.
-
-### `--quiet`, `-q`
-
-Prints only the output of failed commands and errors: no task tree, no warnings. Cannot be combined
-with `--verbose`.
-
-### `--verbose`, `-v`
-
-Prints the output of every command and keeps the task tree fully expanded. By default only failed
-commands have their output shown, so a passing run is just the task tree.
-
-## How it works
-
-1. Identifies staged files and detects partially-staged ones
-2. Creates a git stash (based on `--stash` scope) for crash recovery
-3. Overwrites stashed files with their clean index state
-4. Runs commands on the real working tree with full project context
-5. Updates the git index for staged files the commands modified
-6. Restores stashed files from the stash commit
-7. Three-way merges the commands' changes into partially-staged files
-8. Drops the stash ref
-
-If a command fails, the working tree is restored and the commit is blocked. On crash (SIGKILL, power
-loss), the stash ref survives - recover with `git stash pop`.
-
-Paths marked `SKIP_WORKTREE` - by `git sparse-checkout` or `git update-index --skip-worktree` - are
-left exactly as staged. No command sees them, and nothing on disk is staged in their place.
+See the [CI docs](https://stagelint.dev/ci/) for the action's options and instructions for other CI
+providers.
 
 ## Benchmarks
 

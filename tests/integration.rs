@@ -3303,6 +3303,101 @@ fn init_uses_own_path_without_path_entry() {
     assert!(hook.contains(&expected), "want {expected} in: {hook}");
 }
 
+// Worktrees
+
+/// In a linked worktree, the hook and the stash go to the shared git dir, not the worktree's.
+#[test]
+fn linked_worktree_round_trip() {
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE, "*.bad": "false"}));
+
+    repo.write_file("dirty.txt", "base\n");
+    repo.git(&["add", "dirty.txt"]);
+    repo.git(&["commit", "-m", "add dirty.txt"]);
+
+    // `refs/stash` is shared, so stagelint must stack on this stash and leave it behind.
+    repo.write_file("dirty.txt", "user work\n");
+    repo.git(&["stash", "push", "-m", "user stash"]);
+    let user_stash = repo.git(&["rev-parse", "refs/stash"]);
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let wt = temp.path().join("feat");
+    let wt_path = wt.to_str().expect("utf-8 worktree path");
+    repo.git(&["worktree", "add", "-b", "feat", wt_path]);
+    assert!(
+        wt.join(".git").is_file(),
+        "a linked worktree's .git should be a file"
+    );
+
+    assert_success(
+        repo.stagelint_cmd()
+            .current_dir(&wt)
+            .arg("init")
+            .spawn()
+            .expect("spawn stagelint"),
+    );
+    assert!(
+        repo.root.join(".git/hooks/pre-commit").is_file(),
+        "the hook belongs in the shared hooks dir"
+    );
+
+    fs::write(wt.join("new.txt"), "hello\n").expect("write new.txt");
+    repo.git(&["-C", wt_path, "add", "new.txt"]);
+    fs::write(wt.join("dirty.txt"), "base\nmy edits\n").expect("write dirty.txt");
+
+    assert_success(
+        repo.stagelint_cmd()
+            .current_dir(&wt)
+            .args(["--stash", "tracked"])
+            .spawn()
+            .expect("spawn stagelint"),
+    );
+
+    assert_eq!(repo.git(&["-C", wt_path, "show", ":new.txt"]), "HELLO\n");
+    assert_eq!(
+        fs::read_to_string(wt.join("new.txt")).expect("read new.txt"),
+        "HELLO\n"
+    );
+    assert_eq!(
+        fs::read_to_string(wt.join("dirty.txt")).expect("read dirty.txt"),
+        "base\nmy edits\n",
+        "the stashed edit should be restored"
+    );
+
+    let stashes = repo.git(&["stash", "list"]);
+    assert!(
+        stashes.contains("user stash") && stashes.lines().count() == 1,
+        "only the user's stash should remain, got: {stashes}"
+    );
+    assert_eq!(
+        repo.git(&["rev-parse", "refs/stash"]),
+        user_stash,
+        "refs/stash should point back at the user's stash"
+    );
+
+    fs::write(wt.join("broken.bad"), "x\n").expect("write broken.bad");
+    repo.git(&["-C", wt_path, "add", "broken.bad"]);
+
+    assert_failure(
+        repo.stagelint_cmd()
+            .current_dir(&wt)
+            .args(["--stash", "tracked"])
+            .spawn()
+            .expect("spawn stagelint"),
+    );
+
+    assert_eq!(
+        fs::read_to_string(wt.join("dirty.txt")).expect("read dirty.txt"),
+        "base\nmy edits\n",
+        "a failed run should leave the user's edits alone"
+    );
+    assert_eq!(repo.git(&["-C", wt_path, "show", ":broken.bad"]), "x\n");
+    assert_eq!(
+        repo.git(&["stash", "list"]),
+        stashes,
+        "a failed run should drop its own stash"
+    );
+}
+
 // Crash recovery
 
 /// The stash snapshots the full worktree: dirty edits and deletions survive a crash.

@@ -88,33 +88,37 @@ pub fn collect(
     let index = repo
         .index_or_empty()
         .map_err(|e| Error::Status(Box::new(e)))?;
-    let iter = repo
+    let platform = repo
         .status(gix::progress::Discard)
         .map_err(|e| Error::Status(Box::new(e)))?
         .index(index.clone().into())
         .index_worktree_rewrites(rewrites)
         .untracked_files(untracked_files)
         .tree_index_track_renames(status::tree_index::TrackRenames::Disabled)
-        .index_worktree_submodules(None)
-        .into_iter(Vec::<BString>::new())
-        .map_err(|e| Error::Status(Box::new(e)))?;
+        .index_worktree_submodules(None);
 
-    let mut result = Status {
-        scope: match source {
-            Source::Diff(spec) => diff_scope(repo, workdir, spec, &index)?,
-            _ => BTreeSet::new(),
-        },
-        ..Status::default()
-    };
-    for item in iter {
-        match item.map_err(|e| Error::Status(Box::new(e)))? {
-            status::Item::TreeIndex(change) => {
-                // Only a run that stashes reads what `tree_index` records.
-                if stashing {
-                    tree_index(change, source, &index, &mut result);
-                }
+    let mut result = Status::default();
+    // Only a run that stashes reads what `tree_index` records.
+    if stashing {
+        let iter = platform
+            .into_iter(Vec::<BString>::new())
+            .map_err(|e| Error::Status(Box::new(e)))?;
+        if let Source::Diff(spec) = source {
+            result.scope = diff_scope(repo, workdir, spec, &index)?;
+        }
+        for item in iter {
+            match item.map_err(|e| Error::Status(Box::new(e)))? {
+                status::Item::TreeIndex(change) => tree_index(change, source, &index, &mut result),
+                status::Item::IndexWorktree(item) => index_worktree(item, source, &mut result),
             }
-            status::Item::IndexWorktree(item) => index_worktree(item, source, &mut result),
+        }
+    } else {
+        let iter = platform
+            .into_index_worktree_iter(Vec::<BString>::new())
+            .map_err(|e| Error::Status(Box::new(e)))?;
+        for item in iter {
+            let item = item.map_err(|e| Error::Status(Box::new(e)))?;
+            index_worktree(item, source, &mut result);
         }
     }
     Ok(result)

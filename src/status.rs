@@ -18,8 +18,6 @@ pub enum Error {
     NotARange(String),
     #[error("failed to resolve the working directory")]
     Workdir(#[source] std::io::Error),
-    #[error("bare repository")]
-    BareRepo,
 }
 
 /// Where the file set comes from.
@@ -63,12 +61,12 @@ pub struct Status {
 /// `dirty`.
 pub fn collect(
     repo: &gix::Repository,
+    workdir: &Path,
     walk_untracked: bool,
     source: Source<'_>,
 ) -> Result<Status, Error> {
     // Named paths are the scope, so no status pass is needed.
     if let Source::Files(paths) = source {
-        let workdir = repo.workdir().ok_or(Error::BareRepo)?;
         return Ok(Status {
             scope: file_scope(workdir, paths)?,
             ..Status::default()
@@ -103,7 +101,7 @@ pub fn collect(
 
     let mut result = Status {
         scope: match source {
-            Source::Diff(spec) => diff_scope(repo, spec, &index)?,
+            Source::Diff(spec) => diff_scope(repo, workdir, spec, &index)?,
             _ => BTreeSet::new(),
         },
         ..Status::default()
@@ -152,35 +150,40 @@ fn file_scope(workdir: &Path, paths: &[PathBuf]) -> Result<BTreeSet<BString>, Er
 /// Regular files changed in `spec` that exist on disk, resolved as `git diff <spec>` would.
 fn diff_scope(
     repo: &gix::Repository,
+    workdir: &Path,
     spec: &str,
     index: &gix::index::State,
 ) -> Result<BTreeSet<BString>, Error> {
-    let tree = |id: gix::ObjectId| {
-        repo.find_object(id)
-            .map_err(|e| Error::Revspec(spec.to_owned(), Box::new(e)))?
-            .peel_to_tree()
-            .map_err(|e| Error::Revspec(spec.to_owned(), Box::new(e)))
-    };
     let (from, to) = match repo
         .rev_parse(spec)
         .map_err(|e| Error::Revspec(spec.to_owned(), Box::new(e)))?
         .detach()
     {
-        gix::revision::plumbing::Spec::Range { from, to } => (tree(from)?, tree(to)?),
+        gix::revision::plumbing::Spec::Range { from, to } => (from, to),
         gix::revision::plumbing::Spec::Merge { theirs, ours } => {
             let base = repo
                 .merge_base(theirs, ours)
                 .map_err(|e| Error::Revspec(spec.to_owned(), Box::new(e)))?;
-            (tree(base.detach())?, tree(ours)?)
+            (base.detach(), ours)
         }
-        gix::revision::plumbing::Spec::Include(from) => (
-            tree(from)?,
-            repo.head_tree()
-                .map_err(|e| Error::Revspec(spec.to_owned(), Box::new(e)))?,
-        ),
+        gix::revision::plumbing::Spec::Include(from) => {
+            let head = repo
+                .head_id()
+                .map_err(|e| Error::Revspec(spec.to_owned(), Box::new(e)))?;
+            (from, head.detach())
+        }
         _ => return Err(Error::NotARange(spec.to_owned())),
     };
-    let workdir = repo.workdir().ok_or(Error::BareRepo)?;
+    let from = repo
+        .find_object(from)
+        .map_err(|e| Error::Revspec(spec.to_owned(), Box::new(e)))?
+        .peel_to_tree()
+        .map_err(|e| Error::Revspec(spec.to_owned(), Box::new(e)))?;
+    let to = repo
+        .find_object(to)
+        .map_err(|e| Error::Revspec(spec.to_owned(), Box::new(e)))?
+        .peel_to_tree()
+        .map_err(|e| Error::Revspec(spec.to_owned(), Box::new(e)))?;
 
     let mut scope = BTreeSet::new();
     from.changes()

@@ -2,3 +2,5 @@
   - rustfmt --edition 2024
   - command: cargo clippy --all-targets -- -D warnings
     pass_filenames: false
+'*.toml': tombi format
+'*': dprint fmt --allow-no-files

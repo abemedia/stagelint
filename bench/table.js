@@ -31,7 +31,7 @@ const out = [
   line(['Staged files', ...tools]),
   line(['---', ...tools.map(() => '---')]),
   ...rows.map((staged) =>
-    line([staged, ...tools.map((t) => modes.map((m) => ms(mean(t, staged, m))).join(' / '))]),
+    line([staged, ...tools.map((t) => modes.map((m) => ms(mean(t, staged, m))).join(' / '))])
   ),
 ]
 

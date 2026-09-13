@@ -103,10 +103,11 @@ pub fn resolve<'a>(
         let mut tasks = Vec::new();
         for (pattern, entry) in cfg {
             // Bare patterns match basenames at any depth.
-            let glob = if pattern.contains('/') {
-                pattern.clone()
-            } else {
-                format!("**/{pattern}")
+            let anchored = pattern.strip_prefix("./").or(pattern.strip_prefix('/'));
+            let glob = match anchored {
+                Some(rest) => rest.to_string(),
+                None if pattern.contains('/') => pattern.clone(),
+                None => format!("**/{pattern}"),
             };
             let matcher = globset::GlobBuilder::new(&glob)
                 .literal_separator(true)
@@ -253,7 +254,9 @@ fn load_file(path: &Path) -> Result<Config, Error> {
     }
 
     for (pattern, commands) in &cfg {
-        let message = if commands.is_empty() {
+        let message = if matches!(pattern.as_str(), "" | "/" | "./") {
+            format!("pattern \"{pattern}\" matches nothing")
+        } else if commands.is_empty() {
             format!("pattern \"{pattern}\" has no commands")
         } else if commands.iter().any(|obj| obj.command.trim().is_empty()) {
             format!("empty command in pattern \"{pattern}\"")
@@ -392,6 +395,14 @@ mod tests {
     }
 
     #[test]
+    fn degenerate_pattern_rejected() {
+        for pattern in ["", "/", "./"] {
+            let cfg = format!("\"{pattern}\": eslint\n");
+            assert!(load(".stagelint.yml", &cfg).is_err(), "pattern {pattern:?}");
+        }
+    }
+
+    #[test]
     fn empty_config_rejected() {
         assert!(load(".stagelint.yml", "").is_err(), "empty yaml file");
         assert!(load(".stagelint.json", "{}").is_err(), "empty json map");
@@ -421,7 +432,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         fs::write(
             dir.path().join(".stagelint.yml"),
-            "\"*.txt\": \"a\"\n\"cmd*.go\": \"b\"\n\"sub/*.md\": \"c\"\n",
+            concat!(
+                "\"*.txt\": \"a\"\n",
+                "\"cmd*.go\": \"b\"\n",
+                "\"sub/*.md\": \"c\"\n",
+                "\"./*.txt\": \"d\"\n",
+                "\"/sub/*.md\": \"e\"\n",
+            ),
         )
         .expect("write");
 
@@ -453,10 +470,12 @@ mod tests {
                 .collect()
         };
 
-        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks.len(), 5);
         assert_eq!(matched(&tasks[0]), ["root.txt", "sub/nested.txt"]);
         assert_eq!(matched(&tasks[1]), ["pkg/cmdfoo.go"]);
         assert_eq!(matched(&tasks[2]), ["sub/notes.md"]);
+        assert_eq!(matched(&tasks[3]), ["root.txt"]);
+        assert_eq!(matched(&tasks[4]), ["sub/notes.md"]);
     }
 
     /// An anchored pattern is relative to its own config, not the repo root.

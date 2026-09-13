@@ -78,7 +78,7 @@ fn run(opts: &Opts, root: &Reporter) -> Result<()> {
         Source::Files(_) => "given",
     };
 
-    let status = status::collect(&repo, stash_untracked, source)?;
+    let status = status::collect(&repo, &workdir, stash_untracked, source)?;
     if status.scope.is_empty() {
         root.add(format!("Could not find any {noun} files"))
             .status(Status::Warn);

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -369,7 +369,7 @@ impl Job {
                 }
                 for (_, chunk_row) in pending {
                     chunk_row.status(Status::Cancelled);
-                    status = Status::Cancelled.max(status);
+                    status = status.max(Status::Cancelled);
                 }
                 row.status(status);
                 worst = worst.max(status);
@@ -377,7 +377,7 @@ impl Job {
         }
         for (_, row) in commands {
             row.status(Status::Cancelled);
-            worst = Status::Cancelled.max(worst);
+            worst = worst.max(Status::Cancelled);
         }
         self.row.status(worst);
         self.done.send_replace(());
@@ -458,11 +458,11 @@ async fn run_command(
         Ok(status) if cancelled && (cfg!(windows) || status.code().is_none()) => Status::Cancelled,
         Err(_) if cancelled => Status::Cancelled,
         Ok(status) => {
-            output.extend_from_slice(format!("{status}\n").as_bytes());
+            writeln!(output, "{status}").ok();
             Status::Failed
         }
         Err(e) => {
-            output.extend_from_slice(format!("failed to run: {e}\n").as_bytes());
+            writeln!(output, "failed to run: {e}").ok();
             Status::Failed
         }
     };

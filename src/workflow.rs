@@ -266,7 +266,7 @@ impl<'a> Workflow<'a> {
             repo,
             workdir,
             &workflow.hidden,
-            &untracked_entries,
+            &untracked,
             &workflow.absent,
             &workflow.filter_index,
         )?;
@@ -631,21 +631,19 @@ fn checkout_index(
     repo: &Repository,
     workdir: &Path,
     hidden: &BTreeSet<BString>,
-    untracked_entries: &[StashEntry],
+    untracked: &BTreeSet<BString>,
     staged_absent: &BTreeSet<BString>,
     index: &gix::index::State,
 ) -> Result<(), Error> {
     // Deletions first: an untracked file can occupy the parent path of an absent index entry.
-    for entry in untracked_entries {
-        let file_path = os_path(workdir, entry.path.as_ref())?;
+    for path in untracked {
+        let file_path = os_path(workdir, path.as_ref())?;
         remove_if_exists(&file_path).map_err(|e| Error::FileDelete {
             path: file_path,
             source: e,
         })?;
     }
 
-    // Hidden files get their indexed content; absent staged files are recreated from it so they
-    // exist during the run (restore deletes them again).
     let mut to_write = Vec::new();
     for path in hidden.iter().chain(staged_absent) {
         let Some(entry) = index.entry_by_path_and_stage(path.as_ref(), Stage::Unconflicted) else {
@@ -667,21 +665,16 @@ fn apply_stash(
 ) -> Result<(), Error> {
     let stash_obj = repo.find_object(stash_oid).map_err(Error::ObjectFind)?;
     let stash_commit = stash_obj.into_commit();
-    let parents: Vec<ObjectId> = stash_commit.parent_ids().map(Id::detach).collect();
     let stash_tree_oid = stash_commit
         .tree_id()
         .map_err(|e| Error::TreeDecode(e.into()))?
         .detach();
+    let untracked_oid = stash_commit.parent_ids().nth(2).map(Id::detach);
 
-    // Stash parents: [HEAD, index, untracked?], or [untracked?] on an empty repo (>=2 means HEAD+index).
-    let has_head = parents.len() >= 2;
     apply_stash_tree(repo, workdir, stash_tree_oid, manifest)?;
-
-    let untracked_idx = if has_head { 2 } else { 0 };
-    if let Some(&untracked_oid) = parents.get(untracked_idx) {
-        apply_stash_untracked(repo, workdir, untracked_oid)?;
+    if let Some(oid) = untracked_oid {
+        apply_stash_untracked(repo, workdir, oid)?;
     }
-
     Ok(())
 }
 
@@ -804,12 +797,10 @@ fn drop_stash(repo: &Repository, oid: ObjectId) -> Result<(), Error> {
     })?;
 
     if let Some(last) = last_oid {
-        ref_lock
-            .write_all(format!("{}\n", last.to_hex()).as_bytes())
-            .map_err(|e| Error::FileWrite {
-                path: ref_lock.lock_path().to_path_buf(),
-                source: e,
-            })?;
+        writeln!(ref_lock, "{last}").map_err(|e| Error::FileWrite {
+            path: ref_lock.lock_path().to_path_buf(),
+            source: e,
+        })?;
         ref_lock.commit().map_err(|e| Error::FileWrite {
             path: ref_path,
             source: e.error,
@@ -894,23 +885,23 @@ fn update_index(
             }
         };
 
-        // Mode before stat, as `git status` does: a chmod only changes ctime, so with
-        // `core.trustctime=false` a clean stat would hide it.
-        let mode_change =
-            index.entries()[pos]
-                .mode
-                .change_to_match_fs(&meta, caps.symlink, caps.executable_bit);
+        let entry = &index.entries()[pos];
 
-        let entry_stat = index.entries()[pos].stat;
+        // Mode first: a chmod only changes ctime, which `core.trustctime=false` ignores.
+        let mode_change = entry
+            .mode
+            .change_to_match_fs(&meta, caps.symlink, caps.executable_bit);
+
+        let stat = entry::Stat::from_fs(&meta).ok();
         if mode_change.is_none()
-            && let Ok(s) = entry::Stat::from_fs(&meta)
-            && s.matches(&entry_stat, stat_options)
-            && !entry_stat.is_racy(index.timestamp(), stat_options)
+            && let Some(s) = stat
+            && s.matches(&entry.stat, stat_options)
+            && !entry.stat.is_racy(index.timestamp(), stat_options)
         {
             continue;
         }
 
-        let original_oid = index.entries()[pos].id;
+        let original_oid = entry.id;
         let (new_oid, _) = hash_blob(filter, filter_index, workdir, path.as_ref())?;
 
         if new_oid != original_oid || mode_change.is_some() {
@@ -926,7 +917,7 @@ fn update_index(
             if let Some(change) = mode_change {
                 entry.mode = change.apply(entry.mode);
             }
-            if let Ok(stat) = entry::Stat::from_fs(&meta) {
+            if let Some(stat) = stat {
                 entry.stat = stat;
             }
             if let Some(tree) = index.tree_mut() {
@@ -1034,7 +1025,7 @@ fn apply_merges(
             continue;
         }
 
-        let rela = mb.path.as_bytes().as_bstr();
+        let rela = mb.path.as_bstr();
         let sides = [
             (null, ResourceKind::CurrentOrOurs),
             (mb.base_oid, ResourceKind::CommonAncestorOrBase),
@@ -1152,25 +1143,16 @@ fn restore_clean_tracked(
         let gix::status::index_worktree::Item::Modification {
             entry,
             rela_path,
-            status,
+            status: EntryStatus::Change(_),
             ..
         } = item
         else {
             continue;
         };
-        if !matches!(status, EntryStatus::Change(_)) {
-            continue;
-        }
-
         // Submodules have no file content to restore.
-        if entry.mode == entry::Mode::COMMIT {
+        if entry.mode == entry::Mode::COMMIT || skip.contains(rela_path.as_bstr()) {
             continue;
         }
-
-        if skip.contains(rela_path.as_bstr()) {
-            continue;
-        }
-
         to_write.push(StashEntry::from_index_entry(rela_path, &entry));
     }
 

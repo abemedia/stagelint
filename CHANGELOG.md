@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/abemedia/stagelint/compare/v0.1.6...v0.1.7) - 2026-09-14
+
+### Added
+
+- *(cli)* add --all to lint every tracked and untracked file ([#78](https://github.com/abemedia/stagelint/pull/78))
+
+### Fixed
+
+- *(config)* reject invalid commands in patterns that match no files ([#75](https://github.com/abemedia/stagelint/pull/75))
+- *(config)* anchor patterns with a leading / or ./ ([#70](https://github.com/abemedia/stagelint/pull/70))
+
+### Other
+
+- *(status)* skip the HEAD tree diff for --unstaged ([#77](https://github.com/abemedia/stagelint/pull/77))
+- simplify stash, index and status helpers ([#76](https://github.com/abemedia/stagelint/pull/76))
+- add linked worktrees integration test ([#73](https://github.com/abemedia/stagelint/pull/73))
+- invalidate only changed paths in the cache tree ([#72](https://github.com/abemedia/stagelint/pull/72))
+- add dprint and tombi formatters ([#68](https://github.com/abemedia/stagelint/pull/68))
+
 ## [0.1.6](https://github.com/abemedia/stagelint/compare/v0.1.5...v0.1.6) - 2026-09-10
 
 ### Added

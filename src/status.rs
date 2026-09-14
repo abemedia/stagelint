@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use gix::bstr::BString;
 use gix::diff::index::Change;
@@ -31,6 +33,8 @@ pub enum Source<'a> {
     Unstaged,
     /// Paths named on the command line.
     Files(&'a [PathBuf]),
+    /// Every file in the working tree that is not ignored.
+    All,
 }
 
 impl Source<'_> {
@@ -65,10 +69,16 @@ pub fn collect(
     walk_untracked: bool,
     source: Source<'_>,
 ) -> Result<Status, Error> {
-    // Named paths are the scope, so no status pass is needed.
+    // Named paths and every unignored file are the scope, so no status pass is needed.
     if let Source::Files(paths) = source {
         return Ok(Status {
             scope: file_scope(workdir, paths)?,
+            ..Status::default()
+        });
+    }
+    if let Source::All = source {
+        return Ok(Status {
+            scope: all_scope(repo, workdir)?,
             ..Status::default()
         });
     }
@@ -149,6 +159,47 @@ fn file_scope(workdir: &Path, paths: &[PathBuf]) -> Result<BTreeSet<BString>, Er
             Some(gix::path::to_unix_separators_on_windows(rela_path).into_owned())
         })
         .collect())
+}
+
+/// Regular files on disk that are tracked, skipping those git keeps out of the working tree, or
+/// untracked and not ignored.
+fn all_scope(repo: &gix::Repository, workdir: &Path) -> Result<BTreeSet<BString>, Error> {
+    let index = repo
+        .index_or_empty()
+        .map_err(|e| Error::Status(Box::new(e)))?;
+    let options = repo
+        .dirwalk_options()
+        .map_err(|e| Error::Status(Box::new(e)))?
+        .emit_untracked(gix::dir::walk::EmissionMode::Matching);
+    let untracked = repo
+        .dirwalk_iter(
+            index.clone(),
+            Vec::<BString>::new(),
+            Arc::<AtomicBool>::default().into(),
+            options,
+        )
+        .map_err(|e| Error::Status(Box::new(e)))?;
+
+    let mut scope: BTreeSet<BString> = index
+        .entries()
+        .iter()
+        .filter(|entry| eligible(entry.mode, entry.flags))
+        .map(|entry| entry.path(&index))
+        .filter(|path| {
+            std::fs::symlink_metadata(workdir.join(gix::path::from_bstr(*path)))
+                .is_ok_and(|meta| meta.is_file())
+        })
+        .map(ToOwned::to_owned)
+        .collect();
+    for item in untracked {
+        let entry = item.map_err(|e| Error::Status(Box::new(e)))?.entry;
+        if matches!(entry.status, gix::dir::entry::Status::Untracked)
+            && matches!(entry.disk_kind, Some(gix::dir::entry::Kind::File))
+        {
+            scope.insert(entry.rela_path);
+        }
+    }
+    Ok(scope)
 }
 
 /// Regular files changed in `spec` that exist on disk, resolved as `git diff <spec>` would.

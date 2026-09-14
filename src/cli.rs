@@ -103,8 +103,16 @@ pub struct Opts {
     #[arg(long, value_name = "PATHS", num_args = 1.., group = "source")]
     pub files: Vec<PathBuf>,
 
+    /// Lint every file in the working tree that is not ignored, instead of the staged files.
+    ///
+    /// Tracked and untracked files are both linted. Symlinks, submodules, skip-worktree paths and
+    /// files missing from the working tree are skipped. Nothing is stashed and nothing is staged,
+    /// as with `--unstaged`.
+    #[arg(short, long, group = "source")]
+    pub all: bool,
+
     /// Control stash scope; each value includes the previous.
-    #[arg(long, value_enum, default_value_t, conflicts_with_all = ["unstaged", "files"])]
+    #[arg(long, value_enum, default_value_t, conflicts_with_all = ["unstaged", "files", "all"])]
     pub stash: StashScope,
 
     /// Print only the output of failed commands and errors.
@@ -163,7 +171,11 @@ mod tests {
         assert!(Cli::try_parse_from(["stagelint", "--diff", "HEAD~1", "--unstaged"]).is_err());
         assert!(Cli::try_parse_from(["stagelint", "--diff", "HEAD~1", "--files", "a"]).is_err());
         assert!(Cli::try_parse_from(["stagelint", "--unstaged", "--files", "a"]).is_err());
+        assert!(Cli::try_parse_from(["stagelint", "--all", "--diff", "HEAD~1"]).is_err());
+        assert!(Cli::try_parse_from(["stagelint", "--all", "--unstaged"]).is_err());
+        assert!(Cli::try_parse_from(["stagelint", "--all", "--files", "a"]).is_err());
         assert!(Cli::try_parse_from(["stagelint", "--unstaged"]).is_ok());
+        assert!(Cli::try_parse_from(["stagelint", "--all"]).is_ok());
     }
 
     /// Nothing is stashed for the sources that stage nothing, so asking is a mistake.
@@ -171,6 +183,7 @@ mod tests {
     fn stash_rejects_sources_that_stage_nothing() {
         assert!(Cli::try_parse_from(["stagelint", "--unstaged", "--stash", "tracked"]).is_err());
         assert!(Cli::try_parse_from(["stagelint", "--files", "a", "--stash", "tracked"]).is_err());
+        assert!(Cli::try_parse_from(["stagelint", "--all", "--stash", "tracked"]).is_err());
         assert!(Cli::try_parse_from(["stagelint", "--stash", "tracked"]).is_ok());
     }
 

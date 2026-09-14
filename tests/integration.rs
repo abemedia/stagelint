@@ -2450,6 +2450,98 @@ fn files_lints_given_paths() {
     assert_eq!(repo.git(&["diff", "--cached", "--name-only"]), "");
 }
 
+/// Every unignored file on disk is linted from any directory, and nothing is staged.
+#[test]
+fn all_lints_unignored_files_without_staging() {
+    let repo = TestRepo::new(&json!({
+        "*.txt": [UPPERCASE, "sh -c 'printf \"%s\\n\" \"$@\" > .git/argv' _"]
+    }));
+
+    repo.write_file(".gitignore", "ignored.txt\n");
+    repo.write_file("clean.txt", "clean\n");
+    repo.write_file("modified.txt", "index\n");
+    repo.write_file("gone.txt", "gone\n");
+    repo.write_file("skipped.txt", "skipped\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "base"]);
+
+    repo.write_file("modified.txt", "worktree\n");
+    repo.write_file("staged.txt", "staged\n");
+    repo.git(&["add", "staged.txt"]);
+    fs::remove_file(repo.root.join("gone.txt")).expect("remove gone.txt");
+    repo.git(&["update-index", "--skip-worktree", "skipped.txt"]);
+    repo.write_file("untracked.txt", "untracked\n");
+    repo.write_file("fresh/new.txt", "new\n");
+    repo.write_file("ignored.txt", "ignored\n");
+    fs::create_dir(repo.root.join("sub")).expect("create sub");
+
+    let output = repo
+        .stagelint_cmd()
+        .arg("--all")
+        .current_dir(repo.root.join("sub"))
+        .output()
+        .expect("run stagelint");
+    assert!(
+        output.status.success(),
+        "stagelint failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let argv = repo.read_file(".git/argv");
+    for linted in [
+        "clean.txt",
+        "modified.txt",
+        "staged.txt",
+        "untracked.txt",
+        "new.txt",
+    ] {
+        assert!(
+            argv.contains(linted),
+            "{linted} should be linted, got: {argv}"
+        );
+    }
+    for skipped in ["gone.txt", "skipped.txt", "ignored.txt"] {
+        assert!(
+            !argv.contains(skipped),
+            "{skipped} should be skipped, got: {argv}"
+        );
+    }
+
+    assert_eq!(repo.read_file("modified.txt"), "WORKTREE\n");
+    assert_eq!(repo.read_file("staged.txt"), "STAGED\n");
+    assert_eq!(repo.read_file("untracked.txt"), "UNTRACKED\n");
+    assert_eq!(repo.git(&["show", ":staged.txt"]), "staged\n");
+    assert_eq!(
+        repo.git(&["diff", "--cached", "--name-only"]),
+        "staged.txt\n"
+    );
+}
+
+/// Tracked and untracked symlinks are not linted.
+#[test]
+fn all_skips_symlinks() {
+    if !file_symlinks_supported() {
+        return;
+    }
+
+    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+    repo.git(&["config", "core.symlinks", "true"]);
+
+    repo.write_file("target.md", "secret\n");
+    symlink_file("target.md", &repo.root.join("link.txt")).expect("symlink link.txt -> target.md");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-m", "base"]);
+    symlink_file("target.md", &repo.root.join("loose.txt"))
+        .expect("symlink loose.txt -> target.md");
+
+    assert_success(repo.stagelint(&["--all"]));
+
+    for link in ["link.txt", "loose.txt"] {
+        let meta = fs::symlink_metadata(repo.root.join(link)).expect("stat link");
+        assert!(meta.file_type().is_symlink(), "{link} should not be linted");
+    }
+}
+
 // Config
 
 /// Monorepo: each file uses the nearest config walking up to the root.

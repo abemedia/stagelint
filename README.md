@@ -231,11 +231,17 @@ is and their changes are left there.
 Runs commands against the given paths instead of the staged files. A path that no longer exists is
 skipped rather than failing the run. Nothing is hidden and nothing is staged, as with `--unstaged`.
 
+### `--all`, `-a`
+
+Runs commands against every file instead of just the staged files. Ignored files, symlinks,
+submodules, skip-worktree paths and files deleted from the working tree are skipped. Nothing is
+hidden and nothing is staged, as with `--unstaged`.
+
 ### `--stash <partial|tracked|untracked>`
 
 Controls how much of your working tree is hidden while commands run, so they see the content being
 committed rather than your work in progress. Each scope includes the previous, and ignored files are
-never touched. Rejected with `--unstaged` and `--files`, which hide nothing.
+never touched. Rejected with `--unstaged`, `--files` and `--all`, which hide nothing.
 
 - `partial` (default) - Only stash unstaged edits to partially staged files.
 - `tracked` - Also stash every other dirty tracked file.

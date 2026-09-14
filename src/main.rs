@@ -68,6 +68,8 @@ fn run(opts: &Opts, root: &Reporter) -> Result<()> {
         Source::Unstaged
     } else if !opts.files.is_empty() {
         Source::Files(&opts.files)
+    } else if opts.all {
+        Source::All
     } else {
         Source::Staged
     };
@@ -76,6 +78,7 @@ fn run(opts: &Opts, root: &Reporter) -> Result<()> {
         Source::Diff(_) => "changed",
         Source::Unstaged => "unstaged",
         Source::Files(_) => "given",
+        Source::All => "working tree",
     };
 
     let status = status::collect(&repo, &workdir, stash_untracked, source)?;

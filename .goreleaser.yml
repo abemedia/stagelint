@@ -64,8 +64,6 @@ homebrew_casks:
     homepage: https://stagelint.dev
     description: Run commands like linters and formatters on staged git files
     license: MIT
-    url:
-      verified: github.com/abemedia/stagelint/
     hooks:
       post:
         install: |
@@ -111,6 +109,15 @@ scoops:
     homepage: https://stagelint.dev
     description: Run commands like linters and formatters on staged git files
     license: MIT
+
+nix:
+  - repository:
+      owner: abemedia
+      name: nur-packages
+    homepage: https://stagelint.dev
+    description: Run commands like linters and formatters on staged git files
+    license: mit
+    main_program: stagelint
 
 signs:
   - cmd: cosign

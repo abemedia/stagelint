@@ -99,6 +99,20 @@ scoop bucket add abemedia https://github.com/abemedia/scoop-bucket
 scoop install stagelint
 ```
 
+### Nix
+
+With flakes:
+
+```sh
+nix profile add github:abemedia/nur-packages#stagelint
+```
+
+Or without flakes:
+
+```sh
+nix-env -f https://github.com/abemedia/nur-packages/archive/master.tar.gz -iA stagelint
+```
+
 ### mise
 
 ```sh

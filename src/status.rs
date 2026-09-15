@@ -37,13 +37,6 @@ pub enum Source<'a> {
     All,
 }
 
-impl Source<'_> {
-    /// Whether the run stages what the commands wrote, which is what needs the stash.
-    pub fn stages_results(self) -> bool {
-        matches!(self, Source::Staged | Source::Diff(_))
-    }
-}
-
 /// Everything one status pass knows about the repository.
 #[derive(Default)]
 pub struct Status {
@@ -69,20 +62,20 @@ pub fn collect(
     walk_untracked: bool,
     source: Source<'_>,
 ) -> Result<Status, Error> {
-    // Named paths and every unignored file are the scope, so no status pass is needed.
-    if let Source::Files(paths) = source {
+    // These sources find their files without a status pass, and nothing reads the rest of it.
+    let scope = match source {
+        Source::Files(paths) => Some(file_scope(workdir, paths)?),
+        Source::Diff(spec) => Some(diff_scope(repo, workdir, spec)?),
+        Source::All => Some(all_scope(repo, workdir)?),
+        Source::Staged | Source::Unstaged => None,
+    };
+    if let Some(scope) = scope {
         return Ok(Status {
-            scope: file_scope(workdir, paths)?,
+            scope,
             ..Status::default()
         });
     }
-    if let Source::All = source {
-        return Ok(Status {
-            scope: all_scope(repo, workdir)?,
-            ..Status::default()
-        });
-    }
-    let stashing = source.stages_results();
+    let stashing = matches!(source, Source::Staged);
     // Untracked files are part of the unstaged scope, whatever `--stash` asked for.
     let untracked_files = if walk_untracked || matches!(source, Source::Unstaged) {
         status::UntrackedFiles::Files
@@ -113,13 +106,10 @@ pub fn collect(
         let iter = platform
             .into_iter(Vec::<BString>::new())
             .map_err(|e| Error::Status(Box::new(e)))?;
-        if let Source::Diff(spec) = source {
-            result.scope = diff_scope(repo, workdir, spec, &index)?;
-        }
         for item in iter {
             match item.map_err(|e| Error::Status(Box::new(e)))? {
-                status::Item::TreeIndex(change) => tree_index(change, source, &index, &mut result),
-                status::Item::IndexWorktree(item) => index_worktree(item, source, &mut result),
+                status::Item::TreeIndex(change) => tree_index(change, &index, &mut result),
+                status::Item::IndexWorktree(item) => index_worktree(item, stashing, &mut result),
             }
         }
     } else {
@@ -128,7 +118,7 @@ pub fn collect(
             .map_err(|e| Error::Status(Box::new(e)))?;
         for item in iter {
             let item = item.map_err(|e| Error::Status(Box::new(e)))?;
-            index_worktree(item, source, &mut result);
+            index_worktree(item, stashing, &mut result);
         }
     }
     Ok(result)
@@ -207,7 +197,6 @@ fn diff_scope(
     repo: &gix::Repository,
     workdir: &Path,
     spec: &str,
-    index: &gix::index::State,
 ) -> Result<BTreeSet<BString>, Error> {
     let (from, to) = match repo
         .rev_parse(spec)
@@ -239,6 +228,9 @@ fn diff_scope(
         .map_err(|e| Error::Revspec(spec.to_owned(), Box::new(e)))?
         .peel_to_tree()
         .map_err(|e| Error::Revspec(spec.to_owned(), Box::new(e)))?;
+    let index = repo
+        .index_or_empty()
+        .map_err(|e| Error::Status(Box::new(e)))?;
 
     let mut scope = BTreeSet::new();
     from.changes()
@@ -249,7 +241,7 @@ fn diff_scope(
         .for_each_to_obtain_tree(&to, |change| {
             if !matches!(change, gix::object::tree::diff::Change::Deletion { .. })
                 && change.entry_mode().is_blob()
-                // No index entry means nothing to stage the result into.
+                // A path no longer tracked may now be ignored, so it is left alone.
                 && index
                     .entry_by_path(change.location())
                     .is_some_and(|entry| !entry.flags.contains(Flags::SKIP_WORKTREE))
@@ -264,15 +256,9 @@ fn diff_scope(
     Ok(scope)
 }
 
-/// Record a HEAD->index change, scoping it when the run covers staged files.
-fn tree_index(
-    change: Change,
-    source: Source<'_>,
-    index: &gix::worktree::Index,
-    result: &mut Status,
-) {
-    if matches!(source, Source::Staged)
-        && !matches!(change, Change::Deletion { .. })
+/// Record a HEAD->index change, scoping it when a command can be given the file.
+fn tree_index(change: Change, index: &gix::worktree::Index, result: &mut Status) {
+    if !matches!(change, Change::Deletion { .. })
         && eligible(change.entry_mode(), index.entries()[change.index()].flags)
     {
         result.scope.insert(change.location().to_owned());
@@ -284,9 +270,7 @@ fn tree_index(
 /// the run covers unstaged files.
 ///
 /// Only a run that stashes reads those sets.
-fn index_worktree(item: status::index_worktree::Item, source: Source<'_>, result: &mut Status) {
-    let unstaged = matches!(source, Source::Unstaged);
-    let stashing = source.stages_results();
+fn index_worktree(item: status::index_worktree::Item, stashing: bool, result: &mut Status) {
     match item {
         status::index_worktree::Item::Modification {
             entry,
@@ -308,7 +292,7 @@ fn index_worktree(item: status::index_worktree::Item, source: Source<'_>, result
                 }
             } else if stashing {
                 result.dirty.insert(rela_path);
-            } else if unstaged {
+            } else {
                 // A type change leaves the index mode stale; the worktree is what a command opens.
                 let mode = match &state {
                     EntryStatus::Change(index_as_worktree::Change::Type { worktree_mode }) => {
@@ -332,7 +316,7 @@ fn index_worktree(item: status::index_worktree::Item, source: Source<'_>, result
                 ) {
                     result.untracked.insert(entry.rela_path);
                 }
-            } else if unstaged && matches!(entry.disk_kind, Some(gix::dir::entry::Kind::File)) {
+            } else if matches!(entry.disk_kind, Some(gix::dir::entry::Kind::File)) {
                 result.scope.insert(entry.rela_path);
             }
         }

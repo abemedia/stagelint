@@ -83,8 +83,8 @@ pub struct Opts {
     /// Lint the files changed in a revision range instead of the staged files.
     ///
     /// Takes any range `git diff` does - `main...HEAD` for everything on the branch since it
-    /// diverged, or a single revision such as `HEAD~3` to compare against HEAD. Results are staged,
-    /// as in the default mode.
+    /// diverged, or a single revision such as `HEAD~3` to compare against HEAD. Nothing is stashed
+    /// and nothing is staged.
     #[arg(long, value_name = "REVSPEC", group = "source")]
     pub diff: Option<String>,
 
@@ -112,7 +112,7 @@ pub struct Opts {
     pub all: bool,
 
     /// Control stash scope; each value includes the previous.
-    #[arg(long, value_enum, default_value_t, conflicts_with_all = ["unstaged", "files", "all"])]
+    #[arg(long, value_enum, default_value_t, conflicts_with_all = ["diff", "unstaged", "files", "all"])]
     pub stash: StashScope,
 
     /// Print only the output of failed commands and errors.
@@ -181,6 +181,9 @@ mod tests {
     /// Nothing is stashed for the sources that stage nothing, so asking is a mistake.
     #[test]
     fn stash_rejects_sources_that_stage_nothing() {
+        assert!(
+            Cli::try_parse_from(["stagelint", "--diff", "HEAD~1", "--stash", "tracked"]).is_err()
+        );
         assert!(Cli::try_parse_from(["stagelint", "--unstaged", "--stash", "tracked"]).is_err());
         assert!(Cli::try_parse_from(["stagelint", "--files", "a", "--stash", "tracked"]).is_err());
         assert!(Cli::try_parse_from(["stagelint", "--all", "--stash", "tracked"]).is_err());

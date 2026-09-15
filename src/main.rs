@@ -113,7 +113,7 @@ fn run(opts: &Opts, root: &Reporter) -> Result<()> {
         move || c.cancel()
     })?;
 
-    let mut workflow = if source.stages_results() {
+    let mut workflow = if matches!(source, Source::Staged) {
         Some(workflow::Workflow::new(
             &repo,
             &workdir,

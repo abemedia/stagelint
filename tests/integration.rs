@@ -2202,7 +2202,7 @@ fn diff_rejects_non_range_spec() {
     );
 }
 
-/// `--diff a..b` lints the files changed between the two revisions, not the staged set.
+/// `--diff a..b` lints the files changed between the two revisions, and nothing is staged.
 #[test]
 fn diff_range_lints_changed_files() {
     let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
@@ -2210,13 +2210,19 @@ fn diff_range_lints_changed_files() {
     repo.write_file("changed.txt", "changed\n");
     repo.git(&["add", "changed.txt"]);
     repo.git(&["commit", "-m", "change"]);
+    repo.write_file("changed.txt", "changed\nunstaged\n");
     repo.write_file("staged.txt", "staged\n");
     repo.git(&["add", "staged.txt"]);
 
     assert_success(repo.stagelint(&["--diff", "HEAD~1..HEAD"]));
 
-    assert_eq!(repo.read_file("changed.txt"), "CHANGED\n");
+    assert_eq!(repo.read_file("changed.txt"), "CHANGED\nUNSTAGED\n");
     assert_eq!(repo.read_file("staged.txt"), "staged\n");
+    assert_eq!(repo.git(&["show", ":changed.txt"]), "changed\n");
+    assert_eq!(
+        repo.git(&["diff", "--cached", "--name-only"]),
+        "staged.txt\n"
+    );
 }
 
 /// `--diff a...b` diffs from the merge base: a file the other branch changed since the fork is
@@ -2280,26 +2286,6 @@ fn diff_skips_files_missing_from_disk() {
     assert!(!argv.contains("gone.txt"), "got: {argv}");
 }
 
-/// Under `--diff` an unstaged edit to a file in the range is linted and its result staged.
-#[test]
-fn diff_stages_unstaged_edits_in_range() {
-    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
-
-    repo.write_file("file.txt", "base\n");
-    repo.git(&["add", "file.txt"]);
-    repo.git(&["commit", "-m", "base"]);
-    repo.write_file("file.txt", "committed\n");
-    repo.git(&["add", "file.txt"]);
-    repo.git(&["commit", "-m", "change"]);
-
-    repo.write_file("file.txt", "committed\nunstaged\n");
-
-    assert_success(repo.stagelint(&["--diff", "HEAD~1..HEAD"]));
-
-    assert_eq!(repo.git(&["show", ":file.txt"]), "COMMITTED\nUNSTAGED\n");
-    assert_eq!(repo.read_file("file.txt"), "COMMITTED\nUNSTAGED\n");
-}
-
 /// Modified, untracked and partially staged files are linted; a staged file matching the index and
 /// an ignored file are not. The index is left as it was.
 #[test]
@@ -2340,7 +2326,7 @@ fn unstaged_lints_worktree_changes_without_staging() {
     );
 }
 
-/// A path in the range with no index entry is skipped: nothing could stage or restore it.
+/// A path in the range that is no longer tracked is skipped, since it may now be ignored.
 #[test]
 fn diff_skips_path_missing_from_index() {
     let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));

@@ -90,24 +90,20 @@ pub struct Opts {
 
     /// Lint the files modified in the working tree, including untracked ones.
     ///
-    /// Nothing is stashed and nothing is staged: the commands see the working tree as it is, and
-    /// their changes are left there.
+    /// Nothing is stashed and nothing is staged.
     #[arg(short, long, group = "source")]
     pub unstaged: bool,
 
     /// Lint the given paths instead of the staged files.
     ///
-    /// A path is skipped rather than failing the run if it does not exist, is a directory or a
-    /// symlink, or lies outside the repository. Ignored files are linted like any other. Nothing
-    /// is stashed and nothing is staged, as with `--unstaged`.
+    /// Nothing is stashed and nothing is staged.
     #[arg(long, value_name = "PATHS", num_args = 1.., group = "source")]
     pub files: Vec<PathBuf>,
 
     /// Lint every file in the working tree that is not ignored, instead of the staged files.
     ///
     /// Tracked and untracked files are both linted. Symlinks, submodules, skip-worktree paths and
-    /// files missing from the working tree are skipped. Nothing is stashed and nothing is staged,
-    /// as with `--unstaged`.
+    /// files missing from the working tree are skipped. Nothing is stashed and nothing is staged.
     #[arg(short, long, group = "source")]
     pub all: bool,
 

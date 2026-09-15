@@ -23,14 +23,16 @@ main() {
 	ARCH="$(uname -m)"
 	test "$ARCH" = "amd64" && ARCH="x86_64"
 	test "$ARCH" = "arm64" && ARCH="aarch64"
-	# An Apple Silicon Mac running a translated shell reports x86_64.
-	test "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = "1" && ARCH="aarch64"
 
 	EXT="tar.gz"
 	BIN="stagelint"
 	case "$OS" in
 	Linux) TARGET="$ARCH-unknown-linux-musl" ;;
-	Darwin) TARGET="$ARCH-apple-darwin" ;;
+	Darwin)
+		# An Apple Silicon Mac running a translated shell reports x86_64.
+		test "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = "1" && ARCH="aarch64"
+		TARGET="$ARCH-apple-darwin"
+		;;
 	MINGW* | MSYS* | CYGWIN*)
 		EXT="zip"
 		BIN="stagelint.exe"

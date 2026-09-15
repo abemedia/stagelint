@@ -243,14 +243,14 @@ is and their changes are left there.
 
 ### `--files <PATHS>...`
 
-Runs commands against the given paths instead of the staged files. A path that no longer exists is
-skipped rather than failing the run. Nothing is hidden and nothing is staged, as with `--unstaged`.
+Runs commands against the given paths instead of the staged files. Nothing is hidden and nothing is
+staged.
 
 ### `--all`, `-a`
 
 Runs commands against every file instead of just the staged files. Ignored files, symlinks,
 submodules, skip-worktree paths and files deleted from the working tree are skipped. Nothing is
-hidden and nothing is staged, as with `--unstaged`.
+hidden and nothing is staged.
 
 ### `--stash <partial|tracked|untracked>`
 

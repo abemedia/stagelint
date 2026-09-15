@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicBool;
 use gix::bstr::BString;
 use gix::diff::index::Change;
 use gix::index::entry::{Flags, Mode};
+use gix::repository::normalize_path;
 use gix::status;
 use gix::status::plumbing::index_as_worktree::{self, EntryStatus};
 
@@ -20,6 +21,8 @@ pub enum Error {
     NotARange(String),
     #[error("failed to resolve the working directory")]
     Workdir(#[source] std::io::Error),
+    #[error("failed to resolve path {}", .0.display())]
+    Path(PathBuf, #[source] normalize_path::Error),
 }
 
 /// Where the file set comes from.
@@ -64,7 +67,7 @@ pub fn collect(
 ) -> Result<Status, Error> {
     // These sources find their files without a status pass, and nothing reads the rest of it.
     let scope = match source {
-        Source::Files(paths) => Some(file_scope(workdir, paths)?),
+        Source::Files(paths) => Some(file_scope(repo, paths)?),
         Source::Diff(spec) => Some(diff_scope(repo, workdir, spec)?),
         Source::All => Some(all_scope(repo, workdir)?),
         Source::Staged | Source::Unstaged => None,
@@ -124,31 +127,26 @@ pub fn collect(
     Ok(result)
 }
 
-/// Repo-relative paths for the regular files among `paths` inside the worktree; anything else is
-/// skipped rather than rejected.
-fn file_scope(workdir: &Path, paths: &[PathBuf]) -> Result<BTreeSet<BString>, Error> {
+/// Repo-relative paths for `paths` inside the worktree, whether or not they exist.
+fn file_scope(repo: &gix::Repository, paths: &[PathBuf]) -> Result<BTreeSet<BString>, Error> {
     let cwd = std::env::current_dir().map_err(Error::Workdir)?;
-    let workdir = workdir.canonicalize().map_err(Error::Workdir)?;
-    Ok(paths
-        .iter()
-        .filter_map(|path| {
-            let path = if path.is_absolute() {
-                Cow::Borrowed(path.as_path())
-            } else {
-                Cow::Owned(cwd.join(path))
-            };
-            // Symlinked parents have to be resolved for the prefix to match, but the final
-            // component is left alone so that a symlinked file is still skipped.
-            if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
-                return None;
-            }
-            let resolved = path.parent()?.canonicalize().ok()?.join(path.file_name()?);
-            let rela_path = resolved.strip_prefix(&workdir).ok()?;
-            // Everything else in `scope` comes from git, which is always slash-separated.
-            let rela_path = gix::path::into_bstr(rela_path);
-            Some(gix::path::to_unix_separators_on_windows(rela_path).into_owned())
-        })
-        .collect())
+    let mut scope = BTreeSet::new();
+    for path in paths {
+        // Make paths absolute and drop `..` first: `normalize_path` reads relative paths from the
+        // root inside `.git`, and rejects `../repo/x` even though it ends up inside.
+        let Some(absolute) = gix::path::normalize(Cow::Owned(cwd.join(path)), &cwd) else {
+            continue;
+        };
+        match repo.normalize_path(&gix::path::into_bstr(absolute)) {
+            Ok(rela_path) => scope.insert(rela_path.into_owned()),
+            Err(
+                normalize_path::Error::OutsideOfRepository { .. }
+                | normalize_path::Error::AbsolutePathOutsideOfRepository { .. },
+            ) => continue,
+            Err(e) => return Err(Error::Path(path.clone(), e)),
+        };
+    }
+    Ok(scope)
 }
 
 /// Regular files on disk that are tracked, skipping those git keeps out of the working tree, or

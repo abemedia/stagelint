@@ -193,7 +193,7 @@ pub fn assert_failure(child: Child) -> Output {
     output
 }
 
-pub fn symlink_file(target: &str, link: &Path) -> io::Result<()> {
+pub fn symlink_file(target: impl AsRef<Path>, link: &Path) -> io::Result<()> {
     #[cfg(unix)]
     return std::os::unix::fs::symlink(target, link);
     #[cfg(windows)]

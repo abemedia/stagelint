@@ -15,7 +15,7 @@ fn empty_scope_succeeds() {
 
     assert_success(repo.stagelint(&[]));
     assert_success(repo.stagelint(&["--unstaged"]));
-    assert_success(repo.stagelint(&["--files", "gone.txt"]));
+    assert_success(repo.stagelint(&["--files", "../outside.txt"]));
     assert_success(repo.stagelint(&["--diff", "HEAD...HEAD"]));
 }
 
@@ -2400,39 +2400,53 @@ fn unstaged_follows_worktree_after_type_change() {
     assert_eq!(repo.read_file("now_file.txt"), "REAL\n");
 }
 
-/// Only named paths are linted, absolute or relative; missing paths and directories are skipped,
-/// and nothing is staged.
+/// Named paths are passed as given, whether or not they exist, and nothing is staged.
 #[test]
 fn files_lints_given_paths() {
-    let repo = TestRepo::new(&json!({"*.txt": UPPERCASE}));
+    if !file_symlinks_supported() {
+        return;
+    }
+
+    let repo = TestRepo::new(&json!({
+        "*.txt": UPPERCASE,
+        "*": "sh -c 'printf \"%s\\n\" \"$@\" > .git/argv' _"
+    }));
 
     repo.write_file("top.txt", "top\n");
     repo.write_file("sub/nested.txt", "nested\n");
     repo.write_file("sub/other.txt", "other\n");
     repo.write_file("sub/deeper/deep.txt", "deep\n");
+    let outside = tempfile::tempdir().expect("create temp dir");
+    let target = outside.path().join("target.md");
+    fs::write(&target, "outside\n").expect("write target");
+    symlink_file(&target, &repo.root.join("sub/link.md")).expect("symlink sub/link.md -> outside");
 
-    let mut cmd = repo.stagelint_cmd();
-    let output = cmd
-        .args([
-            "--files",
-            repo.root.join("top.txt").to_str().expect("utf8 path"),
-            "nested.txt",
-            "deeper",
-            "gone.txt",
-        ])
-        .current_dir(repo.root.join("sub"))
-        .output()
-        .expect("run stagelint");
-    assert!(
-        output.status.success(),
-        "stagelint failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+    assert_success(
+        repo.stagelint_cmd()
+            .args([
+                "--files",
+                repo.root.join("top.txt").to_str().expect("utf8 path"),
+                "nested.txt",
+                "deeper",
+                "gone.md",
+                "link.md",
+            ])
+            .current_dir(repo.root.join("sub"))
+            .spawn()
+            .expect("spawn stagelint"),
     );
 
     assert_eq!(repo.read_file("top.txt"), "TOP\n");
     assert_eq!(repo.read_file("sub/nested.txt"), "NESTED\n");
     assert_eq!(repo.read_file("sub/other.txt"), "other\n");
     assert_eq!(repo.read_file("sub/deeper/deep.txt"), "deep\n");
+    let argv = repo.read_file(".git/argv");
+    for passed in ["sub/deeper", "sub/gone.md", "sub/link.md"] {
+        assert!(
+            argv.contains(passed),
+            "{passed} should be passed, got: {argv}"
+        );
+    }
     assert_eq!(repo.git(&["diff", "--cached", "--name-only"]), "");
 }
 

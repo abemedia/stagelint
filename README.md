@@ -232,7 +232,8 @@ another. Commands with `pass_filenames: false` are never split.
 
 Runs commands against the files changed in a revision range instead of the staged files. For
 example, `main...HEAD` for everything since your branch diverged, or `HEAD~3` for the last three
-commits. The commands' changes are staged, as in a normal run.
+commits. Nothing is hidden and nothing is staged: the commands see the working tree as it is and
+their changes are left there.
 
 ### `--unstaged`, `-u`
 
@@ -255,7 +256,7 @@ hidden and nothing is staged, as with `--unstaged`.
 
 Controls how much of your working tree is hidden while commands run, so they see the content being
 committed rather than your work in progress. Each scope includes the previous, and ignored files are
-never touched. Rejected with `--unstaged`, `--files` and `--all`, which hide nothing.
+never touched. Rejected with `--diff`, `--unstaged`, `--files` and `--all`, which hide nothing.
 
 - `partial` (default) - Only stash unstaged edits to partially staged files.
 - `tracked` - Also stash every other dirty tracked file.

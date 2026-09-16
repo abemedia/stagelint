@@ -3337,15 +3337,21 @@ fn init_uses_relative_path_in_worktree() {
     fs::create_dir_all(repo.root.join("tools")).expect("create tools dir");
     fs::copy(stagelint_exe(), &inside).expect("copy binary");
 
-    assert_success(
-        Command::new(&inside)
+    // A child forked by a parallel test can briefly hold the copy's write fd, failing exec on Linux.
+    assert_success(loop {
+        match Command::new(&inside)
             .arg("init")
             .current_dir(&repo.root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn stagelint"),
-    );
+        {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            res => break res.expect("spawn stagelint"),
+        }
+    });
 
     let hook = repo.read_file(".git/hooks/pre-commit");
     let expected = format!("./tools/{name}");

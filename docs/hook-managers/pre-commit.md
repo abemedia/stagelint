@@ -11,7 +11,7 @@ formatters rewrote. Give stagelint the `pre-commit` hook and pre-commit keeps ev
 
 Name the hook types pre-commit should own in `.pre-commit-config.yaml`:
 
-```yaml
+```yaml [.pre-commit-config.yaml]
 default_install_hook_types: [commit-msg, pre-push]
 ```
 
@@ -35,7 +35,7 @@ Declare stagelint as a local hook if you would rather have one config file and o
 pre-commit installs it from PyPI, which ships prebuilt binaries, so there is nothing to install
 yourself:
 
-```yaml
+```yaml [.pre-commit-config.yaml]
 repos:
   - repo: local
     hooks:

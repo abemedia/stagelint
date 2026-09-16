@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { defineConfig } from 'vitepress'
+import { groupIconMdPlugin, groupIconVitePlugin } from 'vitepress-plugin-group-icons'
 
 const hostname = 'https://stagelint.dev'
 const version = readFileSync(new URL('../../Cargo.toml', import.meta.url), 'utf8').match(
@@ -21,10 +22,24 @@ export default defineConfig({
       md.core.ruler.before('normalize', 'version', (state) => {
         state.src = state.src.replaceAll('%version%', version)
       })
+      md.use(groupIconMdPlugin)
       const codeInline = md.renderer.rules.code_inline!
       md.renderer.rules.code_inline = (...args) =>
         codeInline(...args).replace('<code', '<code v-pre')
     },
+  },
+  vite: {
+    plugins: [
+      groupIconVitePlugin({
+        customIcon: {
+          uv: 'vscode-icons:file-type-uv',
+          poetry: 'vscode-icons:file-type-poetry',
+          pip: 'vscode-icons:file-type-pip',
+          pipx: 'thesvg-color:pipx',
+          '.sh': 'vscode-icons:file-type-shell',
+        },
+      }),
+    ],
   },
   transformPageData(pageData, { siteConfig: { site } }) {
     const url = new URL(pageData.relativePath.replace(/(?:(^|\/)index)?\.md$/, '$1'), hostname).href

@@ -13,7 +13,7 @@ does, such as `npx stagelint`, `uv run stagelint` or `mise exec -- stagelint`.
 
 Configure the hook in `.github/hooks/stagelint.json`:
 
-```json
+```json [.github/hooks/stagelint.json]
 {
   "version": 1,
   "hooks": {

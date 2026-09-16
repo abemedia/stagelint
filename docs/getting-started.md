@@ -14,7 +14,7 @@ Before you begin, [install stagelint](/installation).
 
 Create `.stagelint.yml` in your project root. The format is a map of glob patterns to commands:
 
-```yaml
+```yaml [.stagelint.yml]
 '*': prettier --write --ignore-unknown
 '*.ts':
   - eslint --fix

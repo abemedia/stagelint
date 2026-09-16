@@ -9,6 +9,8 @@
     "preview": "vitepress preview"
   },
   "devDependencies": {
-    "vitepress": "^1.6.4"
+    "@iconify-json/thesvg-color": "^1.2.9",
+    "vitepress": "^1.6.4",
+    "vitepress-plugin-group-icons": "^1.7.6"
   }
 }

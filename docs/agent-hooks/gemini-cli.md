@@ -13,7 +13,7 @@ does, such as `npx stagelint`, `uv run stagelint` or `mise exec -- stagelint`.
 
 Configure the hook in `.gemini/settings.json`:
 
-```json
+```json [.gemini/settings.json]
 {
   "hooks": {
     "AfterAgent": [

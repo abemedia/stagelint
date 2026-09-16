@@ -8,7 +8,7 @@ description: Run stagelint from husky with one line in .husky/pre-commit, includ
 husky installs hooks but does not run tasks, so there is nothing to configure beyond the hook file.
 Put the command in `.husky/pre-commit`:
 
-```sh
+```sh [.husky/pre-commit]
 stagelint
 ```
 
@@ -30,7 +30,7 @@ makes the negation unnecessary. In lint-staged:
 
 In `.stagelint.yml`:
 
-```yaml
+```yaml [.stagelint.yml]
 '*': prettier --write --ignore-unknown
 '*.ts': eslint --fix
 ```

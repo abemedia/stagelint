@@ -10,7 +10,7 @@ does, such as `npx stagelint`, `uv run stagelint` or `mise exec -- stagelint`.
 
 Configure the hook in `.claude/settings.json`:
 
-```json
+```json [.claude/settings.json]
 {
   "hooks": {
     "Stop": [

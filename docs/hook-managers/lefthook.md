@@ -8,8 +8,7 @@ description:
 
 Add one command to the `pre-commit` hook in `lefthook.yml`, alongside any commands you already have:
 
-```yaml
-# lefthook.yml
+```yaml [lefthook.yml]
 pre-commit:
   commands:
     stagelint:

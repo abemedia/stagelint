@@ -17,8 +17,7 @@ If a directory has more than one, the first in this list is used.
 The format is a map of glob patterns to commands. A pattern takes a command as a string, a command
 as an object, or a list of either to run in sequence:
 
-```yaml
-# .stagelint.yml
+```yaml [.stagelint.yml]
 '*.md': prettier --write
 
 '*.go':
@@ -95,17 +94,21 @@ Place config files at any level in the repo. Each staged file uses the nearest c
 
 ```text
 .
-├── .stagelint.yml            # applies to everything without a closer config
-├── packages/
-│   ├── api/
-│   │   └── .stagelint.yml    # applies to packages/api/**
-│   └── web/
-│       └── .stagelint.yml    # applies to packages/web/**
+├── .stagelint.yml
+└── packages/
+    ├── api/
+    │   ├── .stagelint.yml
+    │   └── main.go         # uses packages/api/.stagelint.yml
+    └── web/
+        └── app.ts          # uses .stagelint.yml
 ```
 
+Config files do not merge, so `main.go` gets only the patterns in `packages/api/.stagelint.yml`, not
+the root ones.
+
 A config file's own directory is the base for everything in it. Patterns match relative to that
-directory, and commands run with it as their working directory, so `packages/web/.stagelint.yml`
-matches paths under `packages/web` and runs its commands there.
+directory, and commands run with it as their working directory, so `packages/api/.stagelint.yml`
+matches paths under `packages/api` and runs its commands there.
 
 ## Command resolution
 

@@ -10,7 +10,7 @@ does, such as `npx stagelint`, `uv run stagelint` or `mise exec -- stagelint`.
 
 OpenCode takes a plugin rather than a config entry. Put this in `.opencode/plugins/stagelint.js`:
 
-```javascript
+```javascript [.opencode/plugins/stagelint.js]
 const maxAttempts = 5
 const attempts = new Map()
 

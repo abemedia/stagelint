@@ -8,6 +8,8 @@ stagelint runs commands such as linters, formatters and type checkers on the fil
 commit, and stages what they fix. It runs from its own pre-commit hook, from your hook manager, from
 a coding agent's hooks, or in CI.
 
+![A pre-commit run: independent globs in parallel, overlapping ones in order](/demo.gif)
+
 ## Features
 
 - Partially staged files are three-way merged, so a conflict with your unstaged changes never blocks

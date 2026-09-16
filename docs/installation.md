@@ -149,7 +149,7 @@ It installs to `/usr/local/bin` when that is writable, otherwise to `~/.local/bi
 version:
 
 ```sh
-curl -fsSL https://stagelint.dev/install.sh | STAGELINT_VERSION=0.1.7 sh
+curl -fsSL https://stagelint.dev/install.sh | STAGELINT_VERSION=%version% sh
 ```
 
 ## Manual install

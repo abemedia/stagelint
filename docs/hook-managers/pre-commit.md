@@ -43,7 +43,7 @@ repos:
         name: stagelint
         entry: stagelint --files
         language: python
-        additional_dependencies: [stagelint==0.1.7]
+        additional_dependencies: [stagelint==%version%]
         require_serial: true
 ```
 

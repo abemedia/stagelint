@@ -9,7 +9,7 @@ Run commands like linters and formatters on staged git files.
 - **Fast.** Written in Rust, it is [5 to 30 times faster](#benchmarks) than pre-commit, lint-staged,
   Lefthook and nano-staged.
 
-![A pre-commit run: independent globs in parallel, overlapping ones in order](https://vhs.charm.sh/vhs-f7DSt1Dyw2ktDUI7fWabm.gif)
+![A pre-commit run: independent globs in parallel, overlapping ones in order](https://stagelint.dev/demo.gif)
 
 ## Why stagelint?
 

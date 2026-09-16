@@ -30,3 +30,8 @@ test:
 # Benchmark against the alternatives; override with STAGED=10,500 RUNS=3
 bench:
     ./bench/run.sh
+
+# Run the docs site locally
+docs:
+    npm --prefix docs install
+    npm --prefix docs run dev

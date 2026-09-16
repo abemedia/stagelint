@@ -13,7 +13,7 @@ does, such as `npx stagelint`, `uv run stagelint` or `mise exec -- stagelint`.
 
 Configure the hook in `.cursor/hooks.json` and point it at a script:
 
-```json
+```json [.cursor/hooks.json]
 {
   "version": 1,
   "hooks": {
@@ -24,7 +24,7 @@ Configure the hook in `.cursor/hooks.json` and point it at a script:
 
 Then create `.cursor/hooks/stagelint.sh`:
 
-```sh
+```sh [.cursor/hooks/stagelint.sh]
 #!/bin/sh
 out=$(stagelint --unstaged --quiet 2>&1) && exit 0
 printf '{"followup_message":%s}' "$(printf '%s' "$out" | jq -Rs .)"

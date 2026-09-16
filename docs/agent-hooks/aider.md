@@ -11,7 +11,7 @@ does, such as `npx stagelint`, `uv run stagelint` or `mise exec -- stagelint`.
 aider's auto-lint is on by default and appends the edited filenames to `lint-cmd`, so one line of
 `.aider.conf.yml` is enough:
 
-```yaml
+```yaml [.aider.conf.yml]
 lint-cmd: stagelint --quiet --files
 ```
 

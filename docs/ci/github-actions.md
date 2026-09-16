@@ -7,7 +7,7 @@ description: How to run stagelint in GitHub Actions.
 Add a workflow to `.github/workflows/stagelint.yml` that runs the
 [stagelint action](https://github.com/abemedia/stagelint-action):
 
-```yaml
+```yaml [.github/workflows/stagelint.yml]
 name: stagelint
 
 on:
@@ -71,7 +71,7 @@ warning is logged.
 job, including on pull requests from forks. It needs its GitHub App installed, and the workflow must
 be named `autofix.ci`:
 
-```yaml
+```yaml [.github/workflows/autofix.yml]
 name: autofix.ci
 
 on: pull_request

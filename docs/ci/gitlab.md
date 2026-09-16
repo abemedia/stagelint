@@ -6,7 +6,7 @@ description: Check merge requests and pushes with stagelint in GitLab CI/CD.
 
 Add a job to `.gitlab-ci.yml`:
 
-```yaml
+```yaml [.gitlab-ci.yml]
 stagelint:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"

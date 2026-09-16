@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/abemedia/stagelint/compare/v0.1.7...v0.2.0) - 2026-09-16
+
+### Added
+
+- [**breaking**] pass --files paths to commands as given ([#85](https://github.com/abemedia/stagelint/pull/85))
+- [**breaking**] disable stash and stage when running with --diff ([#84](https://github.com/abemedia/stagelint/pull/84))
+- add install script for prebuilt binaries ([#82](https://github.com/abemedia/stagelint/pull/82))
+
+### Other
+
+- *(install.sh)* tweak architecture detection on Apple Silicon Macs ([#83](https://github.com/abemedia/stagelint/pull/83))
+- publish to NUR and attest release artifacts ([#79](https://github.com/abemedia/stagelint/pull/79))
+
 ## [0.1.7](https://github.com/abemedia/stagelint/compare/v0.1.6...v0.1.7) - 2026-09-14
 
 ### Added

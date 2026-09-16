@@ -1,6 +1,10 @@
+import { readFileSync } from 'node:fs'
 import { defineConfig } from 'vitepress'
 
 const hostname = 'https://stagelint.dev'
+const version = readFileSync(new URL('../../Cargo.toml', import.meta.url), 'utf8').match(
+  /^version = "(.+)"$/m,
+)![1]
 
 export default defineConfig({
   title: 'stagelint',
@@ -14,6 +18,9 @@ export default defineConfig({
   ],
   markdown: {
     config(md) {
+      md.core.ruler.before('normalize', 'version', (state) => {
+        state.src = state.src.replaceAll('%version%', version)
+      })
       const codeInline = md.renderer.rules.code_inline!
       md.renderer.rules.code_inline = (...args) =>
         codeInline(...args).replace('<code', '<code v-pre')

@@ -7,7 +7,7 @@ description = "Run commands like linters and formatters on staged git files"
 homepage = "https://stagelint.dev"
 repository = "https://github.com/abemedia/stagelint"
 license = "MIT"
-exclude = [".github/", ".goreleaser.yml", "bench/", "pyproject.toml"]
+include = ["/LICENSE", "/README.md", "/src/", "/tests/"]
 
 [package.metadata.npm]
 name = "@stagelint/stagelint"

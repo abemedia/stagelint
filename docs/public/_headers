@@ -1,0 +1,8 @@
+https://:version.:subdomain.workers.dev/*
+  X-Robots-Tag: noindex
+
+/assets/*
+  Cache-Control: public, max-age=31556952, immutable
+
+/install.sh
+  Content-Type: text/plain; charset=utf-8

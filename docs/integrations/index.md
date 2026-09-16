@@ -1,6 +1,8 @@
 ---
 description: Run the same .stagelint.yml from your pre-commit hook, your coding agent and your CI,
   so the checks never drift apart.
+prev: false
+next: false
 ---
 
 # Integrations

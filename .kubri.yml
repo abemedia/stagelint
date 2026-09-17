@@ -1,0 +1,26 @@
+version: '>=0.2.0'
+
+source:
+  type: github
+  owner: abemedia
+  repo: stagelint
+
+target:
+  type: s3
+  bucket: stagelint-packages
+  region: auto
+  endpoint: https://44d8880eefdff4523e34b12529c6e1ed.r2.cloudflarestorage.com
+  url: https://pkg.stagelint.dev/
+
+apk:
+  folder: alpine
+  key-name: info@stagelint.dev
+
+apt:
+  folder: deb
+
+arch:
+  repo-name: stagelint
+
+yum:
+  folder: rpm

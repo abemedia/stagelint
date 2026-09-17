@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Bin>stagelint</Bin>
+    <Bin Condition="$(Rid.StartsWith('win'))">stagelint.exe</Bin>
+    <Settings>unix</Settings>
+    <Settings Condition="$(Rid.StartsWith('win'))">windows</Settings>
+    <Triple Condition="'$(Rid)' == 'linux-x64'">x86_64-unknown-linux-musl</Triple>
+    <Triple Condition="'$(Rid)' == 'linux-arm64'">aarch64-unknown-linux-musl</Triple>
+    <Triple Condition="'$(Rid)' == 'osx-x64'">x86_64-apple-darwin</Triple>
+    <Triple Condition="'$(Rid)' == 'osx-arm64'">aarch64-apple-darwin</Triple>
+    <Triple Condition="'$(Rid)' == 'win-x64'">x86_64-pc-windows-gnu</Triple>
+    <Triple Condition="'$(Rid)' == 'win-arm64'">aarch64-pc-windows-gnullvm</Triple>
+    <NuspecFile>stagelint.nuspec</NuspecFile>
+    <NuspecFile Condition="'$(Rid)' == 'any'">pointer.nuspec</NuspecFile>
+    <NuspecBasePath>$(MSBuildThisFileDirectory)../..</NuspecBasePath>
+    <NuspecProperties>version=$(Version);rid=$(Rid);triple=$(Triple);bin=$(Bin);settings=$(Settings)</NuspecProperties>
+    <TargetFramework>net10.0</TargetFramework>
+    <NoBuild>true</NoBuild>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+  </PropertyGroup>
+</Project>

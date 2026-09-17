@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>stagelint</id>
+    <version>$version$</version>
+    <authors>Adam Bouqdib</authors>
+    <description>Run commands like linters and formatters on staged git files</description>
+    <license type="expression">MIT</license>
+    <projectUrl>https://stagelint.dev</projectUrl>
+    <repository type="git" url="https://github.com/abemedia/stagelint" />
+    <readme>README.md</readme>
+    <tags>git hooks pre-commit lint format</tags>
+    <packageTypes>
+      <packageType name="DotnetTool" />
+    </packageTypes>
+  </metadata>
+  <files>
+    <file src="README.md" target="" />
+    <file src="build/dotnet/DotnetToolSettings.any.xml" target="tools/any/any/DotnetToolSettings.xml" />
+  </files>
+</package>

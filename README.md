@@ -63,6 +63,12 @@ Or compile it from source:
 cargo install stagelint
 ```
 
+### .NET
+
+```sh
+dotnet tool install -g stagelint
+```
+
 ### Homebrew
 
 ```sh

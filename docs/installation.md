@@ -106,6 +106,57 @@ scoop bucket add abemedia https://github.com/abemedia/scoop-bucket
 scoop install stagelint
 ```
 
+## APT
+
+```sh
+sudo curl -fsSL https://pkg.stagelint.dev/deb/key.asc -o /etc/apt/keyrings/stagelint.asc
+sudo chmod a+r /etc/apt/keyrings/stagelint.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/stagelint.asc] https://pkg.stagelint.dev/deb stable main" | sudo tee /etc/apt/sources.list.d/stagelint.list > /dev/null
+sudo apt update
+sudo apt install stagelint
+```
+
+## DNF
+
+```sh
+echo '[stagelint]
+name=stagelint
+baseurl=https://pkg.stagelint.dev/rpm/
+enabled=1
+gpgcheck=0
+repo_gpgcheck=1
+gpgkey=https://pkg.stagelint.dev/rpm/repodata/repomd.xml.key' | sudo tee /etc/yum.repos.d/stagelint.repo > /dev/null
+
+sudo dnf install stagelint
+```
+
+## Pacman
+
+```sh
+curl -fsSL https://pkg.stagelint.dev/arch/key.asc | sudo pacman-key --add -
+sudo pacman-key --lsign-key 04ECDE59ADB67FFCF334D52A43BD4A43FBABEF34
+echo '[stagelint]
+Server = https://pkg.stagelint.dev/arch/$arch' | sudo tee -a /etc/pacman.conf
+sudo pacman -Syu stagelint
+```
+
+## Zypper
+
+```sh
+sudo zypper addrepo --refresh https://pkg.stagelint.dev/rpm/ stagelint
+sudo zypper --gpg-auto-import-keys refresh
+sudo zypper install stagelint
+```
+
+## APK
+
+```sh
+wget -qO /etc/apk/keys/info@stagelint.dev.rsa.pub https://pkg.stagelint.dev/alpine/info@stagelint.dev.rsa.pub
+echo 'https://pkg.stagelint.dev/alpine' >> /etc/apk/repositories
+apk update
+apk add stagelint
+```
+
 ## Nix
 
 ```sh

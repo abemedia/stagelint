@@ -84,7 +84,7 @@ version.
 ### Other methods
 
 See the [installation docs](https://stagelint.dev/installation) for more ways to install
-**stagelint**, including Scoop, Nix and mise.
+**stagelint**, including APT, DNF, Pacman, Scoop, Nix and mise.
 
 ## Setting up the hook
 

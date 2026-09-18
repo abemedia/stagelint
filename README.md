@@ -63,6 +63,12 @@ Or compile it from source:
 cargo install stagelint
 ```
 
+### Go
+
+```sh
+go install github.com/abemedia/stagelint@latest
+```
+
 ### .NET
 
 ```sh

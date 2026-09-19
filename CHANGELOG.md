@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/abemedia/stagelint/compare/v0.2.0...v0.2.1) - 2026-09-19
+
+### Other
+
+- *(deps)* bump indexmap from 2.14.1 to 2.14.2 ([#97](https://github.com/abemedia/stagelint/pull/97))
+- support installing via go install ([#104](https://github.com/abemedia/stagelint/pull/104))
+- *(deps)* bump clap from 4.6.6 to 4.6.7 ([#105](https://github.com/abemedia/stagelint/pull/105))
+- *(deps)* bump serde_with from 3.22.0 to 3.23.0 ([#96](https://github.com/abemedia/stagelint/pull/96))
+- *(deps)* bump console from 0.16.4 to 0.16.6 ([#95](https://github.com/abemedia/stagelint/pull/95))
+- publish .NET tool packages to NuGet ([#103](https://github.com/abemedia/stagelint/pull/103))
+- publish Linux packages via kubri ([#102](https://github.com/abemedia/stagelint/pull/102))
+- retry spawning the copied binary while another test holds its write fd ([#99](https://github.com/abemedia/stagelint/pull/99))
+- add demo gif to introduction and serve it from the site ([#98](https://github.com/abemedia/stagelint/pull/98))
+- package only source, tests, license and readme ([#90](https://github.com/abemedia/stagelint/pull/90))
+- add code block titles and icons ([#89](https://github.com/abemedia/stagelint/pull/89))
+- fill pinned versions from Cargo.toml at build time ([#87](https://github.com/abemedia/stagelint/pull/87))
+
 ## [0.2.0](https://github.com/abemedia/stagelint/compare/v0.1.7...v0.2.0) - 2026-09-16
 
 ### Added

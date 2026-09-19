@@ -93,6 +93,20 @@ Or compile it from source:
 cargo install stagelint
 ```
 
+## Go
+
+Add it to your project and run it with `go tool stagelint`:
+
+```sh
+go get -tool github.com/abemedia/stagelint
+```
+
+Or install it globally:
+
+```sh
+go install github.com/abemedia/stagelint@latest
+```
+
 ## .NET
 
 ```sh

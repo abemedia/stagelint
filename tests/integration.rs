@@ -625,7 +625,7 @@ fn ctrl_c_kills_background_pipe_holder() {
     assert_eq!(output.status.code(), Some(1), "expected a controlled exit");
 
     assert_eq!(repo.read_file("file.txt"), "working tree\n");
-    assert!(repo.git(&["stash", "list"]).is_empty());
+    assert_eq!(repo.git(&["stash", "list"]), "");
 }
 
 // Stash
@@ -672,7 +672,7 @@ fn stash_tracked_hides_unstaged_deletion() {
         "deletion should be restored after the run"
     );
     assert_eq!(repo.git(&["show", ":victim.txt"]), "tracked\n");
-    assert!(repo.git(&["stash", "list"]).is_empty());
+    assert_eq!(repo.git(&["stash", "list"]), "");
 }
 
 /// `--stash tracked` with no dirty files: succeeds and leaves no stash entries.
@@ -720,7 +720,7 @@ fn sparse_checkout_files_not_materialized() {
         !repo.root.join("excluded/gone.txt").exists(),
         "sparse-excluded files must not be materialized"
     );
-    assert!(!repo.git(&["ls-files", "excluded/gone.txt"]).is_empty());
+    assert_ne!(repo.git(&["ls-files", "excluded/gone.txt"]), "");
 }
 
 /// Skip-worktree entries are absent on purpose and must not be staged as deletions.
@@ -1155,7 +1155,7 @@ fn closed_output_does_not_leak_stash() {
     assert_success(child);
 
     assert_eq!(repo.read_file("file.txt"), "v2\n");
-    assert!(repo.git(&["stash", "list"]).is_empty());
+    assert_eq!(repo.git(&["stash", "list"]), "");
 }
 
 /// Exec bit tracks a stash round-trip: set while hidden, cleared on restore.
@@ -3701,5 +3701,5 @@ fn crash_empty_repo_recoverable() {
         repo.git(&["ls-files", "untracked.txt"]).is_empty(),
         "untracked.txt should not be in the index after recovery"
     );
-    assert!(repo.git(&["stash", "list"]).is_empty());
+    assert_eq!(repo.git(&["stash", "list"]), "");
 }

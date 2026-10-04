@@ -764,7 +764,6 @@ mod tests {
     #[test]
     fn chunks_yield_one_empty_run_for_no_files() {
         let runs: Vec<&[OsString]> = chunks(&[], 0, 1).collect();
-        assert_eq!(runs.len(), 1);
-        assert!(runs[0].is_empty());
+        assert_eq!(runs, [&[] as &[OsString]]);
     }
 }

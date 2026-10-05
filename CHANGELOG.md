@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/abemedia/stagelint/compare/v0.2.1...v0.2.2) - 2026-10-05
+
+### Other
+
+- *(deps)* bump gix from 0.87.1 to 0.88.0 ([#106](https://github.com/abemedia/stagelint/pull/106))
+- *(deps)* bump serde_with from 3.23.0 to 3.24.0 ([#107](https://github.com/abemedia/stagelint/pull/107))
+- *(deps)* bump thiserror from 2.0.20 to 2.0.21 ([#108](https://github.com/abemedia/stagelint/pull/108))
+- fix clippy assert_is_empty lints ([#110](https://github.com/abemedia/stagelint/pull/110))
+
 ## [0.2.1](https://github.com/abemedia/stagelint/compare/v0.2.0...v0.2.1) - 2026-09-19
 
 ### Other

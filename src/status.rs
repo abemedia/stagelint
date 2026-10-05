@@ -7,22 +7,21 @@ use std::sync::atomic::AtomicBool;
 use gix::bstr::BString;
 use gix::diff::index::Change;
 use gix::index::entry::{Flags, Mode};
-use gix::repository::normalize_path;
 use gix::status;
 use gix::status::plumbing::index_as_worktree::{self, EntryStatus};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("failed to compute repository status")]
-    Status(#[source] Box<dyn std::error::Error + Send + Sync>),
+    Status(#[source] gix::Error),
     #[error("failed to resolve revision {0}")]
-    Revspec(String, #[source] Box<dyn std::error::Error + Send + Sync>),
+    Revspec(String, #[source] gix::Error),
     #[error("{0} is not a diff range")]
     NotARange(String),
     #[error("failed to resolve the working directory")]
     Workdir(#[source] std::io::Error),
-    #[error("failed to resolve path {}", .0.display())]
-    Path(PathBuf, #[source] normalize_path::Error),
+    #[error("failed to resolve path {0}")]
+    Path(PathBuf, #[source] gix::Error),
 }
 
 /// Where the file set comes from.
@@ -91,12 +90,10 @@ pub fn collect(
         copies: None,
         ..Default::default()
     });
-    let index = repo
-        .index_or_empty()
-        .map_err(|e| Error::Status(Box::new(e)))?;
+    let index = repo.index_or_empty().map_err(Error::Status)?;
     let platform = repo
         .status(gix::progress::Discard)
-        .map_err(|e| Error::Status(Box::new(e)))?
+        .map_err(Error::Status)?
         .index(index.clone().into())
         .index_worktree_rewrites(rewrites)
         .untracked_files(untracked_files)
@@ -108,9 +105,9 @@ pub fn collect(
     if stashing {
         let iter = platform
             .into_iter(Vec::<BString>::new())
-            .map_err(|e| Error::Status(Box::new(e)))?;
+            .map_err(Error::Status)?;
         for item in iter {
-            match item.map_err(|e| Error::Status(Box::new(e)))? {
+            match item.map_err(Error::Status)? {
                 status::Item::TreeIndex(change) => tree_index(change, &index, &mut result),
                 status::Item::IndexWorktree(item) => index_worktree(item, stashing, &mut result),
             }
@@ -118,9 +115,9 @@ pub fn collect(
     } else {
         let iter = platform
             .into_index_worktree_iter(Vec::<BString>::new())
-            .map_err(|e| Error::Status(Box::new(e)))?;
+            .map_err(Error::Status)?;
         for item in iter {
-            let item = item.map_err(|e| Error::Status(Box::new(e)))?;
+            let item = item.map_err(Error::Status)?;
             index_worktree(item, stashing, &mut result);
         }
     }
@@ -139,10 +136,7 @@ fn file_scope(repo: &gix::Repository, paths: &[PathBuf]) -> Result<BTreeSet<BStr
         };
         match repo.normalize_path(&gix::path::into_bstr(absolute)) {
             Ok(rela_path) => scope.insert(rela_path.into_owned()),
-            Err(
-                normalize_path::Error::OutsideOfRepository { .. }
-                | normalize_path::Error::AbsolutePathOutsideOfRepository { .. },
-            ) => continue,
+            Err(e) if e.is_validation() => continue,
             Err(e) => return Err(Error::Path(path.clone(), e)),
         };
     }
@@ -152,12 +146,10 @@ fn file_scope(repo: &gix::Repository, paths: &[PathBuf]) -> Result<BTreeSet<BStr
 /// Regular files on disk that are tracked, skipping those git keeps out of the working tree, or
 /// untracked and not ignored.
 fn all_scope(repo: &gix::Repository, workdir: &Path) -> Result<BTreeSet<BString>, Error> {
-    let index = repo
-        .index_or_empty()
-        .map_err(|e| Error::Status(Box::new(e)))?;
+    let index = repo.index_or_empty().map_err(Error::Status)?;
     let options = repo
         .dirwalk_options()
-        .map_err(|e| Error::Status(Box::new(e)))?
+        .map_err(Error::Status)?
         .emit_untracked(gix::dir::walk::EmissionMode::Matching);
     let untracked = repo
         .dirwalk_iter(
@@ -166,7 +158,7 @@ fn all_scope(repo: &gix::Repository, workdir: &Path) -> Result<BTreeSet<BString>
             Arc::<AtomicBool>::default().into(),
             options,
         )
-        .map_err(|e| Error::Status(Box::new(e)))?;
+        .map_err(Error::Status)?;
 
     let mut scope: BTreeSet<BString> = index
         .entries()
@@ -180,7 +172,7 @@ fn all_scope(repo: &gix::Repository, workdir: &Path) -> Result<BTreeSet<BString>
         .map(ToOwned::to_owned)
         .collect();
     for item in untracked {
-        let entry = item.map_err(|e| Error::Status(Box::new(e)))?.entry;
+        let entry = item.map_err(Error::Status)?.entry;
         if matches!(entry.status, gix::dir::entry::Status::Untracked)
             && matches!(entry.disk_kind, Some(gix::dir::entry::Kind::File))
         {
@@ -198,41 +190,39 @@ fn diff_scope(
 ) -> Result<BTreeSet<BString>, Error> {
     let (from, to) = match repo
         .rev_parse(spec)
-        .map_err(|e| Error::Revspec(spec.to_owned(), Box::new(e)))?
+        .map_err(|e| Error::Revspec(spec.to_owned(), e))?
         .detach()
     {
         gix::revision::plumbing::Spec::Range { from, to } => (from, to),
         gix::revision::plumbing::Spec::Merge { theirs, ours } => {
             let base = repo
                 .merge_base(theirs, ours)
-                .map_err(|e| Error::Revspec(spec.to_owned(), Box::new(e)))?;
+                .map_err(|e| Error::Revspec(spec.to_owned(), e))?;
             (base.detach(), ours)
         }
         gix::revision::plumbing::Spec::Include(from) => {
             let head = repo
                 .head_id()
-                .map_err(|e| Error::Revspec(spec.to_owned(), Box::new(e)))?;
+                .map_err(|e| Error::Revspec(spec.to_owned(), e))?;
             (from, head.detach())
         }
         _ => return Err(Error::NotARange(spec.to_owned())),
     };
     let from = repo
         .find_object(from)
-        .map_err(|e| Error::Revspec(spec.to_owned(), Box::new(e)))?
+        .map_err(|e| Error::Revspec(spec.to_owned(), e))?
         .peel_to_tree()
-        .map_err(|e| Error::Revspec(spec.to_owned(), Box::new(e)))?;
+        .map_err(|e| Error::Revspec(spec.to_owned(), e))?;
     let to = repo
         .find_object(to)
-        .map_err(|e| Error::Revspec(spec.to_owned(), Box::new(e)))?
+        .map_err(|e| Error::Revspec(spec.to_owned(), e))?
         .peel_to_tree()
-        .map_err(|e| Error::Revspec(spec.to_owned(), Box::new(e)))?;
-    let index = repo
-        .index_or_empty()
-        .map_err(|e| Error::Status(Box::new(e)))?;
+        .map_err(|e| Error::Revspec(spec.to_owned(), e))?;
+    let index = repo.index_or_empty().map_err(Error::Status)?;
 
     let mut scope = BTreeSet::new();
     from.changes()
-        .map_err(|e| Error::Status(Box::new(e)))?
+        .map_err(Error::Status)?
         .options(|opts| {
             opts.track_rewrites(None);
         })
@@ -248,9 +238,9 @@ fn diff_scope(
             {
                 scope.insert(change.location().to_owned());
             }
-            Ok::<_, std::convert::Infallible>(gix::object::tree::diff::Action::Continue(()))
+            Ok(gix::object::tree::diff::Action::Continue(()))
         })
-        .map_err(|e| Error::Status(Box::new(e)))?;
+        .map_err(Error::Status)?;
     Ok(scope)
 }
 

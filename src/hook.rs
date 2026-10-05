@@ -3,7 +3,6 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use gix::bstr::{BString, ByteSlice};
-use gix::discover::upwards;
 
 use crate::report::{Reporter, Status};
 
@@ -11,12 +10,13 @@ const BEGIN: &str = "# stagelint begin";
 const END: &str = "# stagelint end";
 
 pub fn install(force: bool, flags: &[BString], root: &Reporter) -> Result<()> {
-    let repo = match gix::discover(std::env::current_dir()?) {
+    let cwd = std::env::current_dir()?;
+    let repo = match gix::discover(&cwd) {
         Ok(repo) => repo,
-        Err(gix::discover::Error::Discover(upwards::Error::NoGitRepository { path })) => {
+        Err(e) if e.is_not_found() && !e.is_validation() => {
             root.add(format!(
                 "No git repository in {}; skipping hook installation",
-                path.display()
+                cwd.display()
             ))
             .status(Status::Warn);
             return Ok(());
@@ -30,7 +30,7 @@ pub fn install(force: bool, flags: &[BString], root: &Reporter) -> Result<()> {
     let hooks_dir = match repo
         .config_snapshot()
         .trusted_path("core.hooksPath")
-        .map_err(|e| anyhow!("failed to interpolate core.hooksPath: {e}"))?
+        .context("failed to interpolate core.hooksPath")?
     {
         Some(dir) => workdir.join(dir),
         None => repo.common_dir().join("hooks"),

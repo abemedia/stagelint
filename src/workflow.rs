@@ -1,6 +1,3 @@
-// The gix errors in `Error` push `Result` sizes past the lint threshold; a CLI never feels it.
-#![allow(clippy::result_large_err)]
-
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io::Write;
@@ -19,6 +16,7 @@ use gix::objs::Commit;
 use gix::objs::tree::{EntryKind, EntryMode};
 use gix::prelude::ObjectIdExt;
 use gix::refs::Target;
+use gix::refs::file::transaction::prepare::ReferenceOutOfDate;
 use gix::refs::log::Line;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::status::plumbing::index_as_worktree::EntryStatus;
@@ -32,35 +30,35 @@ pub enum Error {
     #[error("could not restore the working tree")]
     Restore,
     #[error("failed to read tree from commit")]
-    TreeDecode(#[source] gix::object::commit::Error),
+    TreeDecode(#[source] gix::Error),
     #[error("failed to create tree editor")]
-    TreeEditInit(#[source] gix::object::tree::editor::init::Error),
+    TreeEditInit(#[source] gix::Error),
     #[error("failed to edit tree")]
-    TreeEdit(#[source] gix::objs::tree::editor::Error),
+    TreeEdit(#[source] gix::Error),
     #[error("failed to write edited tree")]
-    TreeEditorWrite(#[source] gix::object::tree::editor::write::Error),
+    TreeEditorWrite(#[source] gix::Error),
     #[error("failed to write object")]
-    ObjectWrite(#[source] gix::object::write::Error),
+    ObjectWrite(#[source] gix::Error),
     #[error("failed to create stash ref")]
-    RefWrite(#[source] gix::reference::edit::Error),
+    RefWrite(#[source] gix::Error),
     #[error("failed to delete stash ref")]
-    RefDelete(#[source] gix::reference::edit::Error),
+    RefDelete(#[source] gix::Error),
     #[error("failed to read index")]
-    IndexRead(#[source] gix::worktree::open_index::Error),
+    IndexRead(#[source] gix::Error),
     #[error("failed to write index")]
-    IndexWrite(#[source] gix::index::file::write::Error),
+    IndexWrite(#[source] gix::Error),
     #[error("failed to read object")]
-    ObjectFind(#[source] gix::object::find::existing::Error),
+    ObjectFind(#[source] gix::Error),
     #[error("failed to traverse tree")]
-    TreeTraverse(#[source] gix::traverse::tree::breadthfirst::Error),
+    TreeTraverse(#[source] gix::Error),
     #[error("cannot represent {0} as a filesystem path")]
     NonOsPath(BString),
     #[error("failed to determine committer identity; set user.name and user.email in git config")]
     NoIdentity,
     #[error("invalid committer time")]
-    CommitterTime(#[source] gix::config::time::Error),
+    CommitterTime(#[source] gix::Error),
     #[error("invalid committer signature")]
-    CommitterValidation(#[source] gix::date::Error),
+    CommitterValidation(#[source] gix::Error),
     #[error("failed to read {path}")]
     FileRead {
         path: PathBuf,
@@ -74,7 +72,7 @@ pub enum Error {
         source: std::io::Error,
     },
     #[error(transparent)]
-    Lock(#[from] gix::lock::acquire::Error),
+    Lock(gix::Error),
     #[error("failed to delete {path}")]
     FileDelete {
         path: PathBuf,
@@ -82,53 +80,37 @@ pub enum Error {
         source: std::io::Error,
     },
     #[error("failed to create merge resource cache")]
-    MergeResourceCache(#[source] gix::repository::merge_resource_cache::Error),
-    #[error("failed to load merge options")]
-    BlobMergeOptions(#[source] gix::repository::blob_merge_options::Error),
-    #[error("failed to load command context")]
-    CommandContext(#[source] gix::config::command_context::Error),
+    MergeResourceCache(#[source] gix::Error),
     #[error("failed to create filter pipeline")]
-    FilterPipeline(#[source] gix::repository::filter::pipeline::Error),
+    FilterPipeline(#[source] gix::Error),
     #[error("failed to merge {path}")]
-    MergeResource {
+    Merge {
         path: BString,
         #[source]
-        source: gix::merge::blob::platform::set_resource::Error,
-    },
-    #[error("failed to merge {path}")]
-    MergePrepare {
-        path: BString,
-        #[source]
-        source: gix::merge::blob::platform::prepare_merge::Error,
+        source: gix::Error,
     },
     #[error("failed to convert {path} to worktree form")]
     ConvertToWorktree {
         path: BString,
         #[source]
-        source: gix::filter::pipeline::convert_to_worktree::Error,
+        source: gix::Error,
     },
     #[error("failed to capture {path}")]
     Capture {
         path: BString,
         #[source]
-        source: gix::filter::pipeline::worktree_file_to_object::Error,
+        source: gix::Error,
     },
     #[error("failed to compute repository status")]
-    Status(#[source] Box<dyn std::error::Error + Send + Sync>),
+    Status(#[source] gix::Error),
     #[error("failed to read stash reflog")]
-    ReflogRead(#[source] gix::refs::file::log::Error),
-    #[error("failed to load checkout options")]
-    CheckoutOptions(#[source] gix::config::checkout_options::Error),
+    ReflogRead(#[source] gix::Error),
     #[error("failed to check out files")]
-    Checkout(#[source] gix::worktree::state::checkout::Error),
+    Checkout(#[source] gix::Error),
     #[error("failed to open object database")]
     OdbOpen(#[source] std::io::Error),
-    #[error("failed to load filesystem capabilities")]
-    FsCapabilities(#[source] gix::config::boolean::Error),
-    #[error("failed to load stat options")]
-    StatOptions(#[source] gix::config::stat_options::Error),
-    #[error("failed to read core.bigFileThreshold")]
-    BigFileThreshold(#[source] gix::config::unsigned_integer::Error),
+    #[error("invalid git config")]
+    Config(#[source] gix::Error),
 }
 
 /// Owns the git state around one run: stash the working changes so commands see only staged
@@ -462,7 +444,7 @@ fn checkout_worktree(
 
     let mut options = repo
         .checkout_options(gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping)
-        .map_err(Error::CheckoutOptions)?;
+        .map_err(Error::Config)?;
     options.destination_is_initially_empty = false;
     options.overwrite_existing = true;
 
@@ -475,7 +457,7 @@ fn checkout_worktree(
         &std::sync::atomic::AtomicBool::default(),
         options,
     )
-    .map_err(Error::Checkout)?;
+    .map_err(|e| Error::Checkout(e.into()))?;
     Ok(())
 }
 
@@ -493,7 +475,7 @@ fn create_stash_commit(
         .ok_or(Error::NoIdentity)?
         .map_err(Error::CommitterTime)?
         .to_owned()
-        .map_err(Error::CommitterValidation)?;
+        .map_err(|e| Error::CommitterValidation(e.into()))?;
 
     let head = repo.head_commit().ok();
 
@@ -757,15 +739,17 @@ fn drop_stash(repo: &Repository, oid: ObjectId) -> Result<(), Error> {
     // All git stash operations run under refs/stash.lock; hold it for the whole rewrite.
     let ref_path = repo.common_dir().join("refs/stash");
     let mut ref_lock =
-        gix::lock::File::acquire_to_update_resource(&ref_path, Fail::Immediately, None)?;
+        gix::lock::File::acquire_to_update_resource(&ref_path, Fail::Immediately, None)
+            .map_err(|e| Error::Lock(e.into()))?;
 
     let mut reflog_lock =
-        gix::lock::File::acquire_to_update_resource(&reflog_path, Fail::Immediately, None)?;
+        gix::lock::File::acquire_to_update_resource(&reflog_path, Fail::Immediately, None)
+            .map_err(|e| Error::Lock(e.into()))?;
     let mut buf = Vec::new();
     let Some(lines) = repo
         .refs
         .reflog_iter("refs/stash", &mut buf)
-        .map_err(Error::ReflogRead)?
+        .map_err(|e| Error::ReflogRead(e.into()))?
     else {
         return Ok(());
     };
@@ -816,11 +800,10 @@ fn drop_stash(repo: &Repository, oid: ObjectId) -> Result<(), Error> {
             name: "refs/stash".try_into().expect("valid ref name"),
             deref: false,
         }) {
-            Ok(_)
-            | Err(gix::reference::edit::Error::FileTransactionPrepare(
-                gix::refs::file::transaction::prepare::Error::ReferenceOutOfDate { .. }
-                | gix::refs::file::transaction::prepare::Error::DeleteReferenceMustExist { .. },
-            )) => Ok(()),
+            Ok(_) => Ok(()),
+            Err(e) if e.is_not_found() || e.downcast_any_ref::<ReferenceOutOfDate>().is_some() => {
+                Ok(())
+            }
             Err(e) => Err(Error::RefDelete(e)),
         }
     }
@@ -847,10 +830,11 @@ fn update_index(
     // Hold index.lock across the read-modify-write, as git does: a concurrent writer can neither
     // clobber this update nor be clobbered by it.
     let lock =
-        gix::lock::File::acquire_to_update_resource(repo.index_path(), Fail::Immediately, None)?;
+        gix::lock::File::acquire_to_update_resource(repo.index_path(), Fail::Immediately, None)
+            .map_err(|e| Error::Lock(e.into()))?;
     let mut index = repo.open_index().map_err(Error::IndexRead)?;
-    let caps = repo.filesystem_options().map_err(Error::FsCapabilities)?;
-    let stat_options = repo.stat_options().map_err(Error::StatOptions)?;
+    let caps = repo.filesystem_options().map_err(Error::Config)?;
+    let stat_options = repo.stat_options().map_err(Error::Config)?;
     let mut merge_bases = Vec::new();
     let mut changed = false;
 
@@ -933,7 +917,10 @@ fn update_index(
             .write_to(&mut writer, write::Options::default())
             .map_err(|e| Error::IndexWrite(e.into()))?;
         match writer.into_inner() {
-            Ok(lock) => lock.commit().map_err(|e| Error::IndexWrite(e.into()))?,
+            Ok(lock) => lock.commit().map_err(|e| Error::FileWrite {
+                path: repo.index_path(),
+                source: e.error,
+            })?,
             Err(e) => {
                 return Err(Error::FileWrite {
                     path: repo.index_path(),
@@ -985,7 +972,7 @@ fn apply_merges(
         return Ok(());
     }
 
-    let threshold = repo.big_file_threshold().map_err(Error::BigFileThreshold)?;
+    let threshold = repo.big_file_threshold().map_err(Error::Config)?;
     let roots = WorktreeRoots {
         current_root: Some(workdir.to_path_buf()),
         ..Default::default()
@@ -993,8 +980,8 @@ fn apply_merges(
     let mut platform = repo
         .merge_resource_cache(roots)
         .map_err(Error::MergeResourceCache)?;
-    let options = repo.blob_merge_options().map_err(Error::BlobMergeOptions)?;
-    let context = repo.command_context().map_err(Error::CommandContext)?;
+    let options = repo.blob_merge_options().map_err(Error::Config)?;
+    let context = repo.command_context().map_err(Error::Config)?;
     let null = ObjectId::null(repo.object_hash());
 
     let mut skipped_files = Vec::new();
@@ -1034,16 +1021,16 @@ fn apply_merges(
         for (id, kind) in sides {
             platform
                 .set_resource(id, EntryKind::Blob, rela, kind, &repo.objects)
-                .map_err(|e| Error::MergeResource {
+                .map_err(|e| Error::Merge {
                     path: mb.path.clone(),
-                    source: e,
+                    source: e.into(),
                 })?;
         }
         let prepared = platform
             .prepare_merge(&repo.objects, options)
-            .map_err(|e| Error::MergePrepare {
+            .map_err(|e| Error::Merge {
                 path: mb.path.clone(),
-                source: e,
+                source: e.into(),
             })?;
 
         out.clear();
@@ -1051,7 +1038,10 @@ fn apply_merges(
         let (pick, resolution) = match prepared.merge(&mut out, Labels::default(), &context) {
             Ok(result) => result,
             Err(e) => {
-                skipped(&mb.path, &format_args!("{:#}", anyhow::Error::new(e)));
+                skipped(
+                    &mb.path,
+                    &format_args!("{:#}", anyhow::Error::new(e.into_error())),
+                );
                 continue;
             }
         };
@@ -1130,16 +1120,16 @@ fn restore_clean_tracked(
 ) -> Result<(), Error> {
     let iter = repo
         .status(gix::progress::Discard)
-        .map_err(|e| Error::Status(Box::new(e)))?
+        .map_err(Error::Status)?
         .untracked_files(gix::status::UntrackedFiles::None)
         .index_worktree_submodules(None)
         .into_index_worktree_iter(Vec::<gix::bstr::BString>::new())
-        .map_err(|e| Error::Status(Box::new(e)))?;
+        .map_err(Error::Status)?;
 
     let mut to_write = Vec::new();
 
     for item in iter {
-        let item = item.map_err(|e| Error::Status(Box::new(e)))?;
+        let item = item.map_err(Error::Status)?;
         let gix::status::index_worktree::Item::Modification {
             entry,
             rela_path,

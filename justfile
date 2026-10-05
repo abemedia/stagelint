@@ -27,6 +27,10 @@ lint:
 test:
     cargo test
 
+# Rerun coverage on change, writing target/lcov.info
+cov:
+    cargo watch -x 'llvm-cov --lcov --output-path target/lcov.info'
+
 # Benchmark against the alternatives; override with STAGED=10,500 RUNS=3
 bench:
     ./bench/run.sh

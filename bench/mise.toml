@@ -1,0 +1,14 @@
+[tools]
+hyperfine = "1.20.0"
+node = "24.21.0"
+uv = "0.12.13"
+lefthook = "2.1.12"
+"npm:lint-staged" = "17.5.1"
+"npm:nano-staged" = "1.0.2"
+"pipx:pre-commit" = { version = "4.6.2", uvx_args = "--python 3.13.15" }
+prek = "0.5.3"
+"cargo:hk" = "2.0.0"
+
+[settings]
+# The default installer launches bins through a shell script instead of linking them directly.
+npm.package_manager = "npm"

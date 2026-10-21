@@ -121,6 +121,12 @@ Needs the .NET 10 SDK or later.
 brew install abemedia/tap/stagelint
 ```
 
+## WinGet
+
+```sh
+winget install abemedia.stagelint
+```
+
 ## Scoop
 
 ```sh

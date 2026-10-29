@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/abemedia/stagelint/compare/v0.2.1...v0.2.2) - 2026-10-29
+
+### Other
+
+- *(deps)* bump libc from 0.2.189 to 0.2.191 ([#118](https://github.com/abemedia/stagelint/pull/118))
+- *(deps)* bump gix from 0.88.0 to 0.90.0 ([#124](https://github.com/abemedia/stagelint/pull/124))
+- *(deps)* bump serde_json from 1.0.151 to 1.0.154 ([#120](https://github.com/abemedia/stagelint/pull/120))
+- *(deps)* bump tokio-util from 0.7.19 to 0.7.20 ([#122](https://github.com/abemedia/stagelint/pull/122))
+- *(deps)* bump tokio from 1.53.1 to 1.54.1 ([#127](https://github.com/abemedia/stagelint/pull/127))
+- *(deps)* bump json5 from 1.3.1 to 1.3.4 ([#125](https://github.com/abemedia/stagelint/pull/125))
+- add winget install method ([#115](https://github.com/abemedia/stagelint/pull/115))
+- *(deps)* bump gix from 0.87.1 to 0.88.0 ([#106](https://github.com/abemedia/stagelint/pull/106))
+- *(deps)* bump serde_with from 3.23.0 to 3.24.0 ([#107](https://github.com/abemedia/stagelint/pull/107))
+- *(deps)* bump thiserror from 2.0.20 to 2.0.21 ([#108](https://github.com/abemedia/stagelint/pull/108))
+- fix clippy assert_is_empty lints ([#110](https://github.com/abemedia/stagelint/pull/110))
+
 ## [0.2.1](https://github.com/abemedia/stagelint/compare/v0.2.0...v0.2.1) - 2026-09-19
 
 ### Other

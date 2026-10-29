@@ -92,8 +92,7 @@ fn run(opts: &Opts, root: &Reporter) -> Result<()> {
     let mut paths = Vec::with_capacity(status.scope.len());
     for path in &status.scope {
         paths.push(
-            gix::path::try_from_byte_slice(path.as_slice())
-                .map_err(gix::Exn::into_error)
+            gix::path::from_byte_slice(path.as_slice())
                 .with_context(|| format!("cannot represent {path} as a filesystem path"))?,
         );
     }

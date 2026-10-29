@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use gix::bstr::{BString, ByteSlice};
+use gix::bstr::{BStr, BString, ByteSlice};
 
 use crate::report::{Reporter, Status};
 
@@ -51,6 +51,8 @@ pub fn install(force: bool, flags: &[BString], root: &Reporter) -> Result<()> {
         .map(|rel| Path::new(".").join(rel))
         .or_else(|| which::which("stagelint").ok())
         .unwrap_or(exe);
+    let command = gix::path::into_bstr(&command)
+        .with_context(|| format!("failed to add {} to the pre-commit hook", command.display()))?;
     let section = section(&command, flags);
 
     let existing = fs::symlink_metadata(&hook_path);
@@ -109,11 +111,9 @@ fn replace_section(hook: &[u8], section: &[u8]) -> Option<BString> {
     Some(out)
 }
 
-fn section(command: &Path, flags: &[BString]) -> BString {
-    let command = gix::path::into_bstr(command);
+fn section(command: &BStr, flags: &[BString]) -> BString {
     // git's bundled sh reads backslashes as escapes.
-    #[cfg(windows)]
-    let command = command.replace(b"\\", b"/");
+    let command = gix::path::to_unix_separators_on_windows(command);
 
     // Not `exec`: user lines after ours must run.
     let mut section = BString::from(BEGIN);
@@ -146,11 +146,10 @@ fn quote(word: &[u8], out: &mut BString) {
 
 #[cfg(test)]
 mod tests {
-    use super::{BEGIN, BString, END, replace_section, section};
-    use std::path::Path;
+    use super::{BEGIN, BStr, BString, END, replace_section, section};
 
     fn command_of(command: &str, flags: &[BString]) -> String {
-        section(Path::new(command), flags)
+        section(BStr::new(command), flags)
             .to_string()
             .lines()
             .nth(1)
@@ -202,13 +201,9 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn non_utf8_path_survives() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-
-        let command = Path::new(OsStr::from_bytes(b"/tmp/dir-\xff/stagelint"));
+        let command = BStr::new(b"/tmp/dir-\xff/stagelint");
         let section = section(command, &[]);
         assert!(
             section.contains(&b'\xff'),

@@ -18,6 +18,8 @@ pub enum Error {
     Revspec(String, #[source] gix::Error),
     #[error("{0} is not a diff range")]
     NotARange(String),
+    #[error("{0} has no merge base")]
+    NoMergeBase(String),
     #[error("failed to resolve the working directory")]
     Workdir(#[source] std::io::Error),
     #[error("failed to resolve path {0}")]
@@ -134,7 +136,8 @@ fn file_scope(repo: &gix::Repository, paths: &[PathBuf]) -> Result<BTreeSet<BStr
         let Some(absolute) = gix::path::normalize(Cow::Owned(cwd.join(path)), &cwd) else {
             continue;
         };
-        match repo.normalize_path(&gix::path::into_bstr(absolute)) {
+        let absolute = gix::path::into_bstr(absolute).map_err(|e| Error::Path(path.clone(), e))?;
+        match repo.normalize_path(&absolute) {
             Ok(rela_path) => scope.insert(rela_path.into_owned()),
             Err(e) if e.is_validation() => continue,
             Err(e) => return Err(Error::Path(path.clone(), e)),
@@ -166,8 +169,9 @@ fn all_scope(repo: &gix::Repository, workdir: &Path) -> Result<BTreeSet<BString>
         .filter(|entry| eligible(entry.mode, entry.flags))
         .map(|entry| entry.path(&index))
         .filter(|path| {
-            std::fs::symlink_metadata(workdir.join(gix::path::from_bstr(*path)))
-                .is_ok_and(|meta| meta.is_file())
+            gix::path::from_bstr(*path).is_ok_and(|path| {
+                std::fs::symlink_metadata(workdir.join(path)).is_ok_and(|meta| meta.is_file())
+            })
         })
         .map(ToOwned::to_owned)
         .collect();
@@ -197,7 +201,8 @@ fn diff_scope(
         gix::revision::plumbing::Spec::Merge { theirs, ours } => {
             let base = repo
                 .merge_base(theirs, ours)
-                .map_err(|e| Error::Revspec(spec.to_owned(), e))?;
+                .map_err(|e| Error::Revspec(spec.to_owned(), e))?
+                .ok_or_else(|| Error::NoMergeBase(spec.to_owned()))?;
             (base.detach(), ours)
         }
         gix::revision::plumbing::Spec::Include(from) => {
@@ -233,8 +238,9 @@ fn diff_scope(
                 && index
                     .entry_by_path(change.location())
                     .is_some_and(|entry| !entry.flags.contains(Flags::SKIP_WORKTREE))
-                && std::fs::symlink_metadata(workdir.join(gix::path::from_bstr(change.location())))
-                    .is_ok_and(|meta| meta.is_file())
+                && gix::path::from_bstr(change.location()).is_ok_and(|path| {
+                    std::fs::symlink_metadata(workdir.join(path)).is_ok_and(|meta| meta.is_file())
+                })
             {
                 scope.insert(change.location().to_owned());
             }

@@ -457,7 +457,7 @@ fn checkout_worktree(
         &std::sync::atomic::AtomicBool::default(),
         options,
     )
-    .map_err(|e| Error::Checkout(e.into()))?;
+    .map_err(Error::Checkout)?;
     Ok(())
 }
 
@@ -475,7 +475,7 @@ fn create_stash_commit(
         .ok_or(Error::NoIdentity)?
         .map_err(Error::CommitterTime)?
         .to_owned()
-        .map_err(|e| Error::CommitterValidation(e.into()))?;
+        .map_err(Error::CommitterValidation)?;
 
     let head = repo.head_commit().ok();
 
@@ -647,10 +647,7 @@ fn apply_stash(
 ) -> Result<(), Error> {
     let stash_obj = repo.find_object(stash_oid).map_err(Error::ObjectFind)?;
     let stash_commit = stash_obj.into_commit();
-    let stash_tree_oid = stash_commit
-        .tree_id()
-        .map_err(|e| Error::TreeDecode(e.into()))?
-        .detach();
+    let stash_tree_oid = stash_commit.tree_id().map_err(Error::TreeDecode)?.detach();
     let untracked_oid = stash_commit.parent_ids().nth(2).map(Id::detach);
 
     apply_stash_tree(repo, workdir, stash_tree_oid, manifest)?;
@@ -704,7 +701,7 @@ fn apply_stash_untracked(
         .map_err(Error::ObjectFind)?
         .into_commit()
         .tree_id()
-        .map_err(|e| Error::TreeDecode(e.into()))?
+        .map_err(Error::TreeDecode)?
         .detach();
     let untracked_tree = repo
         .find_object(untracked_tree_oid)
@@ -739,17 +736,17 @@ fn drop_stash(repo: &Repository, oid: ObjectId) -> Result<(), Error> {
     // All git stash operations run under refs/stash.lock; hold it for the whole rewrite.
     let ref_path = repo.common_dir().join("refs/stash");
     let mut ref_lock =
-        gix::lock::File::acquire_to_update_resource(&ref_path, Fail::Immediately, None)
-            .map_err(|e| Error::Lock(e.into()))?;
+        gix::lock::File::acquire_to_update_resource(&ref_path, Fail::Immediately, None, 0)
+            .map_err(Error::Lock)?;
 
     let mut reflog_lock =
-        gix::lock::File::acquire_to_update_resource(&reflog_path, Fail::Immediately, None)
-            .map_err(|e| Error::Lock(e.into()))?;
+        gix::lock::File::acquire_to_update_resource(&reflog_path, Fail::Immediately, None, 0)
+            .map_err(Error::Lock)?;
     let mut buf = Vec::new();
     let Some(lines) = repo
         .refs
         .reflog_iter("refs/stash", &mut buf)
-        .map_err(|e| Error::ReflogRead(e.into()))?
+        .map_err(Error::ReflogRead)?
     else {
         return Ok(());
     };
@@ -830,8 +827,8 @@ fn update_index(
     // Hold index.lock across the read-modify-write, as git does: a concurrent writer can neither
     // clobber this update nor be clobbered by it.
     let lock =
-        gix::lock::File::acquire_to_update_resource(repo.index_path(), Fail::Immediately, None)
-            .map_err(|e| Error::Lock(e.into()))?;
+        gix::lock::File::acquire_to_update_resource(repo.index_path(), Fail::Immediately, None, 0)
+            .map_err(Error::Lock)?;
     let mut index = repo.open_index().map_err(Error::IndexRead)?;
     let caps = repo.filesystem_options().map_err(Error::Config)?;
     let stat_options = repo.stat_options().map_err(Error::Config)?;
@@ -915,7 +912,7 @@ fn update_index(
         let mut writer = std::io::BufWriter::with_capacity(64 * 1024, lock);
         index
             .write_to(&mut writer, write::Options::default())
-            .map_err(|e| Error::IndexWrite(e.into()))?;
+            .map_err(Error::IndexWrite)?;
         match writer.into_inner() {
             Ok(lock) => lock.commit().map_err(|e| Error::FileWrite {
                 path: repo.index_path(),
@@ -1023,14 +1020,14 @@ fn apply_merges(
                 .set_resource(id, EntryKind::Blob, rela, kind, &repo.objects)
                 .map_err(|e| Error::Merge {
                     path: mb.path.clone(),
-                    source: e.into(),
+                    source: e,
                 })?;
         }
         let prepared = platform
             .prepare_merge(&repo.objects, options)
             .map_err(|e| Error::Merge {
                 path: mb.path.clone(),
-                source: e.into(),
+                source: e,
             })?;
 
         out.clear();
@@ -1038,10 +1035,7 @@ fn apply_merges(
         let (pick, resolution) = match prepared.merge(&mut out, Labels::default(), &context) {
             Ok(result) => result,
             Err(e) => {
-                skipped(
-                    &mb.path,
-                    &format_args!("{:#}", anyhow::Error::new(e.into_error())),
-                );
+                skipped(&mb.path, &format_args!("{:#}", anyhow::Error::new(e)));
                 continue;
             }
         };
@@ -1152,7 +1146,7 @@ fn restore_clean_tracked(
 /// Join a repo-relative git path onto the worktree. Fails only on Windows, where a filename
 /// must be valid UTF-16 to exist at all.
 fn os_path(workdir: &Path, rela: &BStr) -> Result<PathBuf, Error> {
-    let path = gix::path::try_from_bstr(rela).map_err(|_| Error::NonOsPath(rela.to_owned()))?;
+    let path = gix::path::from_bstr(rela).map_err(|_| Error::NonOsPath(rela.to_owned()))?;
     Ok(workdir.join(path))
 }
 

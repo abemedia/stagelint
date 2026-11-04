@@ -7,6 +7,8 @@ description = "Run commands like linters and formatters on staged git files"
 homepage = "https://stagelint.dev"
 repository = "https://github.com/abemedia/stagelint"
 license = "MIT"
+keywords = ["format", "git", "git-hooks", "lint", "pre-commit"]
+categories = ["command-line-utilities", "development-tools"]
 include = ["/LICENSE", "/README.md", "/src/", "/tests/"]
 
 [package.metadata.npm]

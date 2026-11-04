@@ -20,6 +20,9 @@ builds:
       - --release
       - --locked
 
+source:
+  enabled: true
+
 checksum:
   name_template: checksums.txt
 
@@ -118,6 +121,42 @@ nix:
     description: Run commands like linters and formatters on staged git files
     license: mit
     main_program: stagelint
+
+aurs:
+  - name: stagelint-bin
+    homepage: https://stagelint.dev
+    description: Run commands like linters and formatters on staged git files
+    maintainers: ['Adam Bouqdib <adam@abemedia.co.uk>']
+    license: MIT
+    private_key: '{{ .Env.AUR_KEY }}'
+    git_url: ssh://aur@aur.archlinux.org/stagelint-bin.git
+    provides: [stagelint]
+    conflicts: [stagelint]
+    package: |-
+      install -Dm755 "./stagelint" "${pkgdir}/usr/bin/stagelint"
+      install -Dm644 "./LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+
+aur_sources:
+  - name: stagelint
+    homepage: https://stagelint.dev
+    description: Run commands like linters and formatters on staged git files
+    maintainers: ['Adam Bouqdib <adam@abemedia.co.uk>']
+    license: MIT
+    private_key: '{{ .Env.AUR_KEY }}'
+    git_url: ssh://aur@aur.archlinux.org/stagelint.git
+    depends: [gcc-libs, glibc]
+    makedepends: [cargo]
+    provides: [stagelint]
+    conflicts: [stagelint-bin]
+    prepare: |-
+      cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+    build: |-
+      export RUSTUP_TOOLCHAIN=stable
+      export CARGO_TARGET_DIR=target
+      cargo build --frozen --release
+    package: |-
+      install -Dm755 "target/release/stagelint" "${pkgdir}/usr/bin/stagelint"
+      install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 
 signs:
   - cmd: cosign

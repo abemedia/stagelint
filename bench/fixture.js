@@ -25,6 +25,16 @@ const PRE_COMMIT = {
   ],
 }
 
+const HK = `amends "package://github.com/jdx/hk/releases/download/v2.0.0/hk@2.0.0#/Config.pkl"
+
+steps {
+  ["task"] {
+    glob = "*.txt"
+    fix = "true {{files}}"
+  }
+}
+`
+
 const git = (dir, ...args) =>
   execFileSync('git', args, {
     cwd: dir,
@@ -49,6 +59,7 @@ function build(dir, repoFiles, staged, mode) {
   fs.writeFileSync(path.join(dir, '.nano-staged.json'), JSON.stringify(TASK))
   fs.writeFileSync(path.join(dir, 'lefthook.json'), JSON.stringify(LEFTHOOK))
   fs.writeFileSync(path.join(dir, '.pre-commit-config.yaml'), JSON.stringify(PRE_COMMIT))
+  fs.writeFileSync(path.join(dir, 'hk.pkl'), HK)
 
   for (let i = 0; i < repoFiles; i++) {
     fs.writeFileSync(path.join(dir, name(i)), `committed ${i}\n`)

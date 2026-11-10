@@ -15,7 +15,7 @@ if (!file) {
 const { results } = JSON.parse(fs.readFileSync(file, 'utf8'))
 const ms = (v) => (v === undefined ? '-' : `${Math.round(v * 1000).toLocaleString('en-US')}ms`)
 
-const uniq = (key) => [...new Set(results.map((r) => r.parameters[key]))]
+const uniq = (key) => [...new Set(results.map((r) => r.parameters[key].value))]
 const tools = uniq('tool')
 const rows = uniq('staged').sort((a, b) => a - b)
 const modes = uniq('mode')
@@ -23,8 +23,10 @@ const modes = uniq('mode')
 const mean = (tool, staged, mode) =>
   results.find(
     (r) =>
-      r.parameters.tool === tool && r.parameters.staged === staged && r.parameters.mode === mode,
-  )?.mean
+      r.parameters.tool.value === tool
+      && r.parameters.staged.value === staged
+      && r.parameters.mode.value === mode,
+  )?.summary.time_wall_clock.mean
 
 const line = (cells) => `| ${cells.join(' | ')} |`
 const out = [
@@ -35,12 +37,11 @@ const out = [
   ),
 ]
 
+const runs = results[0].measurements.length
 const repoFiles = uniq('repo-files')
   .map((n) => Number(n).toLocaleString('en-US'))
   .join(', ')
 out.push('')
-out.push(
-  `${modes.join(' / ')}. ${repoFiles}-file repo, no-op task, ${results[0].times.length} runs.`,
-)
+out.push(`${modes.join(' / ')}. ${repoFiles}-file repo, no-op task, ${runs} runs.`)
 
 console.log(out.join('\n'))

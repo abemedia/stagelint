@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/abemedia/stagelint/compare/v0.2.2...v0.2.3) - 2026-11-10
+
+### Other
+
+- *(deps)* bump json5 from 1.3.4 to 1.3.7 ([#134](https://github.com/abemedia/stagelint/pull/134))
+- *(deps)* bump globset from 0.4.20 to 0.4.21 ([#130](https://github.com/abemedia/stagelint/pull/130))
+- add package keywords and categories ([#132](https://github.com/abemedia/stagelint/pull/132))
+
 ## [0.2.2](https://github.com/abemedia/stagelint/compare/v0.2.1...v0.2.2) - 2026-10-29
 
 ### Other
